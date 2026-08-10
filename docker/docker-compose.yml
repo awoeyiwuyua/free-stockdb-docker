@@ -1,0 +1,63 @@
+# free-stockdb 极空间 Q4 Docker 部署
+#
+# 用法：
+#   首次部署见 docker/README.md。核心命令：
+#     1. 首次同步数据：  docker compose --profile sync run --rm stockdb-sync
+#     2. 启动服务：      docker compose up -d stockdb
+#     3. 查看日志：      docker compose logs -f stockdb
+#     4. 日常增量更新：  停 stockdb -> 重复步骤1 -> 启动 stockdb（见 README）
+#
+# 数据持久化（升级/重建容器不丢数据）：
+#   ./data  全市场行情库（日K/分钟K/tick），必须持久化
+#   ./mydb  私有数据库（发行包内置目录）
+#   ./log   运行日志（stockdb.log）
+#
+# 端口：宿主机 7899 -> 容器 7899（局域网内通过 http://<NAS_IP>:7899 访问）
+
+services:
+  stockdb:
+    image: ghcr.io/awoeyiwuyua/free-stockdb:0.3.1
+    container_name: stockdb
+    restart: unless-stopped
+    ports:
+      - "7899:7899"
+    volumes:
+      - ./data:/data
+      - ./mydb:/mydb
+      - ./log:/opt/stockdb/log
+    environment:
+      TZ: Asia/Shanghai
+    # 可选：如需自定义同步源或额外服务端参数
+    #  - STOCKDB_SYNC_CONFIG=/data/sync_url.txt
+    #  - STOCKDB_EXTRA_ARGS=
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- 'http://127.0.0.1:7899/?cmd=get&t=股票代码' >/dev/null 2>&1 || exit 1"]
+      interval: 60s
+      timeout: 10s
+      retries: 5
+      start_period: 15s
+    networks:
+      - stockdb-net
+    # 未来扩展位（本版不启用，需求浮现后再加）：
+    #   - webui：自建前端服务容器，只调 7899 HTTP API（见 README「后续扩展」）
+    #   - ai-mcp：把官方 ai_mcp 或本仓库 scripts/stockdb_mcp_server.py 容器化
+
+  # 一次性同步任务：docker compose --profile sync run --rm stockdb-sync
+  # 同步必须停服务（官方 DATA_SOURCE.md 要求），增量同步可反复运行
+  stockdb-sync:
+    image: ghcr.io/awoeyiwuyua/free-stockdb:0.3.1
+    container_name: stockdb-sync
+    profiles: ["sync"]
+    volumes:
+      - ./data:/data
+      - ./mydb:/mydb
+    environment:
+      TZ: Asia/Shanghai
+    command: ["/opt/stockdb/sync.sh"]
+    restart: "no"
+    networks:
+      - stockdb-net
+
+networks:
+  stockdb-net:
+    driver: bridge

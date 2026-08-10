@@ -1,0 +1,4 @@
+# docker 化本地产物（NAS 端运行时生成，不入库）
+docker/data/
+docker/mydb/
+docker/log/
