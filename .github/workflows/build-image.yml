@@ -26,7 +26,8 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}   # ghcr.io/awoeyiwuyua/free-stockdb
+  # 固定包名，避免随仓库名漂移（fork 仓库名带 -docker 后缀时也不会改变）
+  IMAGE_NAME: free-stockdb
 
 jobs:
   build-and-push:
