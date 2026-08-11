@@ -74,6 +74,9 @@ docker build -t ghcr.io/awoeyiwuyua/free-stockdb:0.3.1 .
    curl "http://<NAS_IP>:7899/?cmd=get&t=日k:600633:20260810" # 应返回日K
    docker compose ps                                        # stockdb 状态应为 running(healthy)
    ```
+   webui 管理台（行情查询 + 一键同步）：浏览器打开 `http://<NAS_IP>:18080`
+   （若 18080 被占用，改 `docker-compose.yml` 里 `18080:8080` 的宿主端口即可，
+   容器内 8080 不变）。
 
 ### 4. 本地 ZCode 接入
 本机 `scripts/stockdb_mcp_server.py`（只读 MCP，连 `STOCKDB_HOST:7899`）：
