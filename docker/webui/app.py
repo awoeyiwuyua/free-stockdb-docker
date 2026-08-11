@@ -208,6 +208,25 @@ def data_latest_date() -> str | None:
     return max(dates) if dates else None
 
 
+def mirror_latest_date() -> str | None:
+    """镜像源（a.123128.xyz 网页）标注的最新数据日期。
+
+    镜像源是 LevelDB 文件镜像（HTTP + manifest），无行情 API，但它首页明文标注
+    「数据更新至:YYYY-MM-DD」。抓该日期可判断「本地落后是同步未跑 vs 镜像未发布」。
+    可配置 MIRROR_PAGE_URL 覆盖（内网映射/镜像源变更时）。
+    """
+    import urllib.request, re
+    url = os.environ.get("MIRROR_PAGE_URL", "https://a.123128.xyz/")
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            html = resp.read().decode("utf-8", "replace")
+        m = re.search(r"数据更新至:(\d{4}-\d{2}-\d{2})", html)
+        return m.group(1) if m else None
+    except Exception:
+        return None
+
+
 def load_watchlist() -> list[str]:
     if not WATCHLIST_FILE.exists():
         return []
@@ -242,33 +261,42 @@ def _workday_lag(today, latest_dt) -> int:
 def health_status() -> dict:
     """数据健康度：用工作日计数判定落后（跨周末不误报），盘前宽容。
 
-    状态：
-      ok    —— 数据已到最近交易日（周六/周日查周五数据=ok；交易日盘中查昨日数据=ok）
-      warn  —— 落后 1 个交易日
-      stale —— 落后 2 个及以上交易日，建议同步
+    联动镜像源日期：mirror = 镜像网页标注的最新数据日期。
+    - 本地落后但镜像已更新 → 提示"可同步"
+    - 本地落后且镜像未更新 → 提示"镜像尚未发布"，避免误判同步坏了
     """
     latest = data_latest_date()
+    mirror = mirror_latest_date()
     if not latest:
-        return {"latest": None, "lag_days": None, "status": "unknown", "note": "无法获取数据最新日期"}
+        return {"latest": None, "lag_days": None, "mirror": mirror,
+                "status": "unknown", "note": "无法获取数据最新日期"}
     try:
         from datetime import datetime as dt
         latest_dt = dt.strptime(latest, "%Y%m%d").date()
         today = dt.now().date()
         lag = _workday_lag(today, latest_dt)
         if lag == 0:
-            return {"latest": latest, "lag_days": 0, "status": "ok",
+            return {"latest": latest, "lag_days": 0, "mirror": mirror, "status": "ok",
                     "note": f"数据最新 {latest}（已是最新交易日）"}
         if lag == 1:
             # 交易日盘中/盘前：今日数据要等收盘后同步，属正常
             if today.weekday() < 5 and dt.now().hour < 16:
-                return {"latest": latest, "lag_days": 0, "status": "ok",
+                return {"latest": latest, "lag_days": 0, "mirror": mirror, "status": "ok",
                         "note": f"数据至 {latest}（今日待收盘后同步）"}
-            return {"latest": latest, "lag_days": 1, "status": "warn",
-                    "note": f"数据落后 1 个交易日（{latest}）"}
-        return {"latest": latest, "lag_days": lag, "status": "stale",
-                "note": f"数据落后 {lag} 个交易日（{latest}），建议立即同步"}
+        # 落后 1+ 交易日：看镜像是否已更新
+        if mirror:
+            mirror_norm = mirror.replace("-", "")
+            if mirror_norm > latest:
+                note = f"本地 {latest}，镜像已至 {mirror}——可同步"
+            else:
+                note = f"本地 {latest}，镜像尚未发布新数据（{mirror}）"
+        else:
+            note = f"数据落后 {lag} 个交易日（{latest}），建议立即同步"
+        return {"latest": latest, "lag_days": lag, "mirror": mirror,
+                "status": "stale", "note": note}
     except Exception as exc:
-        return {"latest": latest, "lag_days": None, "status": "unknown", "note": f"健康度计算失败: {exc}"}
+        return {"latest": latest, "lag_days": None, "mirror": mirror,
+                "status": "unknown", "note": f"健康度计算失败: {exc}"}
 
 
 # ==================== 大盘指数快照 ====================
