@@ -73,51 +73,101 @@ def append_history(entry: dict) -> None:
         log(f"  ⚠️ 同步历史写入失败: {exc}")
 
 
+def _default_schedule() -> dict:
+    return {"enabled": False, "times": ["15:30"], "last_trigger": None, "next_trigger": None}
+
+
+def _normalize_times(times) -> list[str]:
+    """校验并规范化时间点列表（HH:MM，去重、排序、只留合法值）。"""
+    result = []
+    seen = set()
+    for t in times or []:
+        t = str(t).strip()
+        try:
+            datetime.strptime(t, "%H:%M")
+        except ValueError:
+            continue
+        if t not in seen:
+            seen.add(t)
+            result.append(t)
+    return sorted(result)
+
+
 def load_schedule() -> dict:
+    """读定时配置；兼容旧格式 {enabled, time} → 迁移为 {enabled, times:[time]}。"""
     if not SCHEDULE_FILE.exists():
-        return {"enabled": False, "time": "15:30"}
+        return _default_schedule()
     try:
         data = json.loads(SCHEDULE_FILE.read_text(encoding="utf-8"))
-        return {
-            "enabled": bool(data.get("enabled")),
-            "time": str(data.get("time") or "15:30"),
-            "last_run": str(data.get("last_run") or ""),
-            "last_exit": data.get("last_exit"),
-        }
     except Exception:
-        return {"enabled": False, "time": "15:30"}
+        return _default_schedule()
+    times = data.get("times")
+    if not isinstance(times, list):  # 旧格式迁移：单 time 字段
+        times = [str(data.get("time") or "15:30")]
+    last = data.get("last_trigger")
+    if not isinstance(last, dict):
+        last = None
+    return {
+        "enabled": bool(data.get("enabled")),
+        "times": _normalize_times(times),
+        "last_trigger": last,
+        "next_trigger": compute_next_trigger(_normalize_times(times)),
+    }
 
 
-def save_schedule(enabled: bool, time_str: str) -> dict:
-    cfg = {"enabled": bool(enabled), "time": str(time_str)}
+def save_schedule(enabled: bool, times) -> dict:
+    """保存定时配置（保留 last_trigger，不因改配置而清空触发记录）。"""
+    cfg = {"enabled": bool(enabled), "times": _normalize_times(times)}
+    if not cfg["times"]:
+        raise RuntimeError("至少需要一个合法时间点（HH:MM）")
     try:
-        # 保留已有执行元信息（last_run/last_exit），不因保存配置而清空
+        old = {}
         if SCHEDULE_FILE.exists():
             try:
                 old = json.loads(SCHEDULE_FILE.read_text(encoding="utf-8"))
-                if isinstance(old, dict):
-                    for k in ("last_run", "last_exit"):
-                        if k in old:
-                            cfg[k] = old[k]
             except Exception:
-                pass
+                old = {}
+        if isinstance(old, dict) and isinstance(old.get("last_trigger"), dict):
+            cfg["last_trigger"] = old["last_trigger"]
+        cfg["next_trigger"] = compute_next_trigger(cfg["times"])
         SCHEDULE_FILE.write_text(json.dumps(cfg, ensure_ascii=False, indent=1), encoding="utf-8")
     except Exception as exc:
         raise RuntimeError(f"定时配置写入失败: {exc}")
     return cfg
 
 
-def save_schedule_meta(**kwargs) -> None:
-    """记录最近一次定时触发的执行结果（last_run/last_exit），落盘可回看。"""
+def _mark_schedule_triggered(key: str) -> None:
+    """记录某时间点已触发（防同一天重复触发），落盘。"""
     try:
-        if SCHEDULE_FILE.exists():
-            data = json.loads(SCHEDULE_FILE.read_text(encoding="utf-8"))
-        else:
-            data = {}
-        data.update(kwargs)
-        SCHEDULE_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+        cfg = load_schedule()
+        cfg["last_trigger"] = {"key": key, "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "exit": None}
+        cfg["next_trigger"] = compute_next_trigger(cfg["times"])
+        SCHEDULE_FILE.write_text(json.dumps(cfg, ensure_ascii=False, indent=1), encoding="utf-8")
+    except Exception as exc:
+        log(f"⏰ 定时触发标记失败: {exc}")
+
+
+def _update_schedule_trigger_exit(exit_code) -> None:
+    """run_sync 结束后回填最近一次定时触发的 exit 码。"""
+    try:
+        cfg = load_schedule()
+        if cfg["last_trigger"] and cfg["last_trigger"].get("exit") is None:
+            cfg["last_trigger"]["exit"] = exit_code
+            SCHEDULE_FILE.write_text(json.dumps(cfg, ensure_ascii=False, indent=1), encoding="utf-8")
     except Exception:
         pass
+
+
+def compute_next_trigger(times: list[str], now=None) -> str | None:
+    """计算最近的下一次触发时间（今天剩余 or 明天），返回如 '今天 16:05' / '明天 15:30'。"""
+    if not times:
+        return None
+    now = now or datetime.now()
+    today_hm = now.strftime("%H:%M")
+    for t in times:
+        if t > today_hm:
+            return f"今天 {t}"
+    return f"明天 {times[0]}"
 
 
 def parse_sync_counts(stdout: str) -> dict:
@@ -459,8 +509,7 @@ def run_sync(hot: bool = True, trigger: str = "manual") -> None:
                 "data_latest": data_latest_date(),
             })
             if _sync_state.get("trigger") == "scheduled":
-                save_schedule_meta(last_run=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                                   last_exit=_sync_state.get("exit_code"))
+                _update_schedule_trigger_exit(_sync_state.get("exit_code"))
         except Exception:
             pass
         _sync_state["running"] = False
@@ -487,22 +536,35 @@ def tail_log(n: int = 200) -> str:
 
 # ==================== 定时自动同步 ====================
 def scheduler_loop() -> None:
-    """后台定时线程：每 30s 检查一次定时配置，到点触发热更新同步（记录触发日志）。"""
+    """后台定时线程：每 30s 检查定时配置，到点触发热更新同步。
+
+    触发判定（比"精确等于"健壮）：
+      对每个配置时间点 t：当前分钟 >= t 且 今天该点还没触发过（key=today+t）→ 触发。
+    即使某次轮询落在 t 分钟之后，只要当天未触发过且未到第二天，仍会触发；
+    触发后 key 落盘（容器重启不重复触发）。
+    """
     global _scheduler_alive
-    last_fired = ""
     while True:
         _scheduler_alive = True  # 心跳：页面据此判断定时功能是否正常
         try:
             cfg = load_schedule()
-            if cfg["enabled"] and not _sync_state["running"]:
-                now_str = datetime.now().strftime("%H:%M")
-                if now_str == cfg["time"] and now_str != last_fired:
-                    last_fired = now_str
-                    log(f"⏰ 定时同步触发（{cfg['time']}）——stockdb 保持运行，热更新")
-                    threading.Thread(target=run_sync, kwargs={"hot": True, "trigger": "scheduled"},
-                                     daemon=True).start()
-                elif now_str != cfg["time"]:
-                    last_fired = ""
+            if cfg["enabled"] and cfg["times"] and not _sync_state["running"]:
+                now = datetime.now()
+                today_key = now.strftime("%Y-%m-%d")
+                now_hm = now.strftime("%H:%M")
+                fired_key = (cfg["last_trigger"] or {}).get("key", "")
+                for t in cfg["times"]:
+                    key = f"{today_key} {t}"
+                    # now 已过 t 且今天 t 点尚未触发 → 触发
+                    if now_hm >= t and key != fired_key:
+                        _mark_schedule_triggered(key)
+                        log(f"⏰ 定时同步触发（{t}）——stockdb 保持运行，热更新")
+                        threading.Thread(
+                            target=run_sync,
+                            kwargs={"hot": True, "trigger": "scheduled"},
+                            daemon=True,
+                        ).start()
+                        break
         except Exception as exc:
             log(f"⏰ 定时线程异常: {exc}")
         time.sleep(30)
@@ -767,14 +829,16 @@ font-size:15px;padding:8px 18px;cursor:pointer}
       <span id="syncMsg" class="hint">热更新=服务保持运行直接增量同步；严格模式=停服后同步</span>
     </div>
   </div>
-  <div class="card"><div class="k">定时自动同步</div>
-    <div class="actions" style="margin-top:8px">
-      <label class="hint"><input type="checkbox" id="schEnabled"> 启用每日定时（热更新）</label>
+  <div class="card"><div class="k">定时自动同步（热更新，多时间点）</div>
+    <div style="margin-top:8px;display:flex;gap:8px;align-items:center">
+      <label class="hint"><input type="checkbox" id="schEnabled" onchange="saveScheduleNow()"> 启用</label>
       <input type="time" id="schTime" value="15:30">
-      <button onclick="saveSchedule()" style="background:#334155;color:#e2e8f0">保存</button>
+      <button onclick="addSchTime()" style="background:#334155;color:#e2e8f0">添加时间点</button>
+      <span id="schTimes" style="display:flex;gap:6px;flex-wrap:wrap"></span>
       <span id="schMsg" class="hint"></span>
     </div>
-    <div class="hint" style="margin-top:6px" id="schLast"></div>
+    <div class="hint" style="margin-top:8px" id="schNext"></div>
+    <div class="hint" style="margin-top:4px" id="schLast"></div>
   </div>
   <div class="card"><div class="k">同步历史（最近 30 次）</div>
     <table><thead><tr><th>时间</th><th>触发</th><th>模式</th><th>结果</th><th>下载</th><th>验证</th><th>耗时</th><th>数据最新</th></tr></thead>
@@ -818,19 +882,58 @@ async function refresh(){
     d.className='dot '+(cs.status==='running'?'ok':(cs.ok?'err':'warn'));
     // 同步页：健康度 + 定时调度器 + 磁盘
     loadHealth();
-    document.getElementById('cSched').innerHTML='<span style="color:'+(s.scheduler_alive?'var(--ok)':'var(--err)')+'">'+(s.scheduler_alive?'运行中':'未运行')+'</span>'+(s.schedule&&s.schedule.enabled?' ｜ 每日 '+s.schedule.time:'');
+    const schedInfo=s.schedule||{};
+    document.getElementById('cSched').innerHTML='<span style="color:'+(s.scheduler_alive?'var(--ok)':'var(--err)')+'">'+(s.scheduler_alive?'运行中':'未运行')+'</span>'+(schedInfo.enabled&&schedInfo.times?' ｜ 每日 '+schedInfo.times.join('、'):'');
     if(s.disk&&s.disk.total_gb!=null)document.getElementById('cDisk').textContent=s.disk.used_gb+' / '+s.disk.total_gb+' GB';
     const b=document.getElementById('syncBtn2');if(b)b.disabled=s.sync_running;
     document.getElementById('syncMsg').textContent=s.sync_running?'同步进行中，请勿重复点击…':'热更新=服务保持运行直接增量同步；严格模式=停服后同步';
-    if(s.schedule){
-      document.getElementById('schEnabled').checked=s.schedule.enabled;
-      document.getElementById('schTime').value=s.schedule.time;
-      const last=s.schedule.last_run?'上次定时触发 '+s.schedule.last_run+(s.schedule.last_exit===0?' ✅':' ❌ 退出码 '+s.schedule.last_exit):'';
-      const sl=document.getElementById('schLast');if(sl)sl.textContent=last||'';
-    }
+    renderSchTimes(schedInfo);
     const lg=await j('/api/log?n=100');document.getElementById('log').textContent=lg.log;
     loadWatchlist();loadHistory();
   }catch(e){document.getElementById('log').textContent='状态刷新失败: '+e}
+}
+let _schRendered="";  // 避免 4s 轮询重复渲染/自动保存
+function renderSchTimes(sch){
+  const el=document.getElementById('schTimes');
+  if(!el)return;
+  document.getElementById('schEnabled').checked=sch.enabled;
+  const times=sch.times||[];
+  if(JSON.stringify(times)!==_schRendered){
+    _schRendered=JSON.stringify(times);
+    el.innerHTML=times.map(t=>'<span style="background:#0f172a;border:1px solid var(--line);border-radius:6px;padding:2px 8px;font-size:13px">'+esc(t)+' <a href="#" onclick="rmSchTime(\''+t+'\',event);return false" style="color:var(--err);text-decoration:none">✕</a></span>').join('')||'<span class="hint">（无时间点）</span>';
+  }
+  // 下次 / 上次触发
+  const nxt=document.getElementById('schNext'),lst=document.getElementById('schLast');
+  if(nxt)nxt.textContent=sch.enabled?(sch.next_trigger?'下次触发：'+sch.next_trigger:'（时间点已过，明天触发）'):'定时未启用';
+  if(lst){
+    const l=sch.last_trigger;
+    lst.textContent=l?('上次定时触发 '+l.ts+' ｜ '+(l.exit===0?'✅ 成功':'❌ 退出码 '+l.exit)):'';
+  }
+}
+function schTimeChanged(){
+  const times=[...document.querySelectorAll('#schTimes span')].map(s=>s.textContent.replace(/✕.*/,'').trim()).filter(t=>/^\d{2}:\d{2}$/.test(t));
+  saveScheduleNow();
+}
+function addSchTime(){
+  const t=document.getElementById('schTime').value;
+  if(!t){document.getElementById('schMsg').textContent='请选择时间';return;}
+  const cur=[...(document.getElementById('schTimes').textContent.match(/\d{2}:\d{2}/g)||[]),t];
+  document.getElementById('schTime').value='';
+  saveScheduleNow([...new Set(cur)]);
+}
+function rmSchTime(t,ev){
+  ev.preventDefault();
+  const cur=(document.getElementById('schTimes').textContent.match(/\d{2}:\d{2}/g)||[]).filter(x=>x!==t);
+  saveScheduleNow(cur);
+}
+async function saveScheduleNow(times){
+  const enabled=document.getElementById('schEnabled').checked;
+  const t=(times||(document.getElementById('schTimes').textContent.match(/\d{2}:\d{2}/g)||[]));
+  try{
+    const r=await j('/api/schedule?action=save&enabled='+enabled+'&times='+encodeURIComponent(t.join(',')));
+    document.getElementById('schMsg').textContent=r.msg||'已保存';
+    document.getElementById('schNext').textContent=r.schedule&&r.schedule.next_trigger?'下次触发：'+r.schedule.next_trigger:'';
+  }catch(e){document.getElementById('schMsg').textContent='保存失败: '+e;}
 }
 async function loadHealth(){
   try{
@@ -885,14 +988,6 @@ async function doSync(){
   const opt={method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({hot:hot})};
   try{const r=await j('/api/sync',opt);document.getElementById('syncMsg').textContent=r.msg;}
   catch(e){document.getElementById('syncMsg').textContent='启动失败: '+e;}
-}
-async function saveSchedule(){
-  const enabled=document.getElementById('schEnabled').checked;
-  const time=document.getElementById('schTime').value;
-  try{
-    const r=await j('/api/schedule?action=save&enabled='+enabled+'&time='+encodeURIComponent(time));
-    document.getElementById('schMsg').textContent=r.msg||(r.schedule&&r.schedule.enabled?'已启用，每日 '+r.schedule.time+' 自动热更新':'已关闭定时');
-  }catch(e){document.getElementById('schMsg').textContent='保存失败: '+e;}
 }
 async function doQuery(){
   const q=document.getElementById('qtype').value;
@@ -1044,14 +1139,16 @@ class Handler(BaseHTTPRequestHandler):
         q = parse_qs(urlparse(self.path).query)
         if q.get("action", [""])[0] == "save":
             enabled = q.get("enabled", ["false"])[0].lower() == "true"
-            time_str = q.get("time", ["15:30"])[0]
+            raw_times = q.get("times", []) or [q.get("time", ["15:30"])[0]]  # 兼容单 time
+            # times 可能是 "15:30,16:05" 一个字符串，按逗号拆分
+            times = [t for part in raw_times for t in str(part).split(",")]
             try:
-                datetime.strptime(time_str, "%H:%M")
-            except ValueError:
-                self._send(400, json.dumps({"msg": "时间格式应为 HH:MM"}))
+                cfg = save_schedule(enabled, times)
+            except RuntimeError as exc:
+                self._send(400, json.dumps({"msg": str(exc)}))
                 return
-            cfg = save_schedule(enabled, time_str)
-            self._send(200, json.dumps({"msg": "已保存定时配置", "schedule": cfg}))
+            msg = "已保存：每日 " + "、".join(cfg["times"]) + " 自动热更新" if cfg["enabled"] else "已关闭定时"
+            self._send(200, json.dumps({"msg": msg, "schedule": cfg}))
             return
         self._send(200, json.dumps({"schedule": load_schedule()}))
 
