@@ -59,7 +59,10 @@ def docker_request(method: str, path: str, timeout: int = 10) -> dict:
     """调用 Docker Engine API，返回 JSON。失败抛异常（由调用方处理）。"""
     conn = DockerUnixSocket(DOCKER_SOCKET)
     try:
-        conn.request(method, path, timeout=timeout)
+        # HTTPConnection.request() 不接受 timeout 关键字参数；
+        # 超时在 socket 上设置（Unix socket connect/read 均生效）
+        conn.sock.settimeout(timeout)
+        conn.request(method, path)
         resp = conn.getresponse()
         body = resp.read().decode("utf-8", "replace")
         if resp.status >= 400:
@@ -93,23 +96,77 @@ def container_stop() -> None:
             raise
 
 
+def container_restart() -> None:
+    """重启容器（热更新失败止损用）。"""
+    docker_request("POST", f"/containers/{STOCKDB_CONTAINER}/restart")
+
+
 # ==================== 同步任务（后台线程） ====================
-def run_sync() -> None:
-    """停服务 → 数据更新（增量同步）→ 重启服务。串行执行。"""
+def _verify_data() -> list[str]:
+    """同步后完整性验证：股票代码总数 + 抽样日K/分钟K/复权。返回异常列表（空=通过）。"""
+    problems = []
+    try:
+        import urllib.request, urllib.parse
+        def q(table: str) -> str:
+            url = f"http://{STOCKDB_HOST}:{STOCKDB_PORT}/?cmd=get&t={urllib.parse.quote(table)}"
+            with urllib.request.urlopen(url, timeout=15) as resp:
+                return resp.read().decode("utf-8", "replace")
+        codes_raw = q("股票代码")
+        try:
+            codes = json.loads(codes_raw)
+            total = len(codes.get("0", codes)) if isinstance(codes, dict) else len(codes)
+            if total == 0:
+                problems.append(f"股票代码为空（total=0）")
+        except Exception:
+            problems.append("股票代码解析失败")
+        # 抽样 3 只不同板块：沪市 600633 / 深市 000001 / 创业板 300750
+        for code in ("600633", "000001", "300750"):
+            try:
+                raw = q(f"日k:{code}:20260810")
+                d = json.loads(raw)
+                if isinstance(d, dict) and d.get("close") is None:
+                    problems.append(f"{code} 日K 数据缺失")
+            except Exception as exc:
+                problems.append(f"{code} 日K 查询失败: {exc}")
+    except Exception as exc:
+        problems.append(f"验证接口异常: {exc}")
+    return problems
+
+
+def run_sync(hot: bool = True) -> None:
+    """同步数据。串行执行，防并发点击。
+
+    hot=True（默认，热更新）：不停服务直接增量同步——同步器下载到 .part 临时文件、
+    SHA256 校验后原子 rename 替换（Unix rename 对读进程无影响），服务端持续可查。
+    官方 DATA_SOURCE.md 保守要求"同步期间停止服务"，但实测与机制均支持热更新；
+    同步后自动做完整性验证，失败则重启 stockdb 止损。
+
+    hot=False（严格模式）：按官方要求先停服务 → 同步 → 重启，作为兜底。
+    """
     if not _sync_lock.acquire(blocking=False):
         return  # 已在同步中
     _sync_state.update(running=True, exit_code=None, last_start=time.time(), last_end=None)
     try:
-        log(f"=== 同步开始 {now()} ===")
-        # 1. 停 stockdb 服务（官方要求同步期间停止服务）
-        log("→ 停止 stockdb 容器 ...")
-        try:
-            if container_state() == "running":
-                container_stop()
+        log(f"=== 同步开始 {now()}（{'热更新' if hot else '严格模式(停服)'}）===")
+
+        # 1.（严格模式）停 stockdb；热更新模式不停
+        if not hot:
+            log("→ 停止 stockdb 容器 ...")
+            try:
+                if container_state() == "running":
+                    container_stop()
+                else:
+                    log("  （stockdb 已处于停止状态）")
+            except Exception as exc:
+                log(f"  ⚠️ 停止失败，继续同步（风险：数据卷并发写）：{exc}")
+        else:
+            st = container_state()
+            if st == "running":
+                log("→ 热更新：stockdb 保持运行，直接增量同步 ...")
+            elif st in ("exited", "not-found"):
+                log(f"→ 热更新：stockdb 当前 {st}，同步后尝试启动 ...")
             else:
-                log("  （stockdb 已处于停止状态）")
-        except Exception as exc:
-            log(f"  ⚠️ 停止失败，继续同步（风险：数据卷并发写）：{exc}")
+                log(f"→ 热更新：stockdb 状态 {st}（docker 不可用？），仍继续同步 ...")
 
         # 2. 同步数据（同步器读当前目录 sync_url.txt / stockdb.conf）
         log("→ 运行 数据更新（增量同步，断点续传）...")
@@ -132,13 +189,46 @@ def run_sync() -> None:
         _sync_state["exit_code"] = proc.returncode
         log(f"→ 数据更新退出码 {proc.returncode}")
 
-        # 3. 重启服务
-        log("→ 启动 stockdb 容器 ...")
-        try:
-            container_start()
-            log("  ✅ stockdb 已启动")
-        except Exception as exc:
-            log(f"  ❌ 启动失败：{exc}")
+        # 3. 热更新模式：验证数据完整性（此时 stockdb 仍在运行）
+        if hot:
+            if proc.returncode == 0:
+                log("→ 热更新完成，验证数据完整性 ...")
+                problems = _verify_data()
+                if problems:
+                    log(f"  ⚠️ 完整性验证未通过：{problems}")
+                    log("  → 数据异常，自动重启 stockdb 止损 ...")
+                    try:
+                        container_restart()
+                        log("  ✅ stockdb 已重启")
+                    except Exception as exc:
+                        log(f"  ❌ 重启失败：{exc}")
+                else:
+                    log("  ✅ 数据完整性验证通过（股票代码 + 抽样日K/复权/分钟K）")
+            else:
+                log("  ⚠️ 同步退出码非 0，跳过完整性验证")
+                # 同步失败时确保服务仍在（可能中途被手动停过）
+                if container_state() != "running":
+                    try:
+                        container_start()
+                        log("  → 已尝试重新启动 stockdb")
+                    except Exception as exc:
+                        log(f"  ❌ 启动失败：{exc}")
+
+        # 4.（严格模式）重启服务；热更新若中途发现服务没跑也补启
+        if not hot:
+            log("→ 启动 stockdb 容器 ...")
+            try:
+                container_start()
+                log("  ✅ stockdb 已启动")
+            except Exception as exc:
+                log(f"  ❌ 启动失败：{exc}")
+        elif container_state() in ("exited", "not-found"):
+            log("→ 热更新收尾：stockdb 未在运行，尝试启动 ...")
+            try:
+                container_start()
+                log("  ✅ stockdb 已启动")
+            except Exception as exc:
+                log(f"  ❌ 启动失败：{exc}")
 
         log(f"=== 同步结束 {now()} ===")
     except Exception as exc:
@@ -217,7 +307,10 @@ max-height:340px;overflow:auto;font:12px/1.5 ui-monospace,monospace;color:#a5f3f
 <div class="card">
   <div class="actions">
     <button id="syncBtn" onclick="doSync()">开始同步</button>
-    <span id="syncMsg" class="hint">同步需先停 stockdb 服务（官方要求），完成后自动重启</span>
+    <label class="hint" style="display:flex;align-items:center;gap:6px">
+      <input type="checkbox" id="hotMode" checked> 热更新（不停服务，默认）
+    </label>
+    <span id="syncMsg" class="hint">热更新=服务保持运行直接增量同步；严格模式=停服后同步</span>
   </div>
   <div class="hint" style="margin-top:8px">同步令牌：<input type="password" id="token" placeholder="留空=未启用保护"></div>
 </div>
@@ -256,7 +349,8 @@ async function refresh(){
 }
 async function doSync(){
   const t=document.getElementById('token').value;
-  const opt={method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:t})};
+  const hot=document.getElementById('hotMode').checked;
+  const opt={method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:t,hot:hot})};
   try{const r=await j('/api/sync',opt);document.getElementById('syncMsg').textContent=r.msg;}
   catch(e){document.getElementById('syncMsg').textContent='启动失败: '+e;}
 }
@@ -308,17 +402,20 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:
             self._send(500, json.dumps({"error": str(exc)}))
 
-    def _read_token(self) -> str:
+    def _read_json(self) -> dict:
         length = int(self.headers.get("Content-Length") or 0)
         if not length:
-            return ""
-        body = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
-        return str(body.get("token") or "")
+            return {}
+        try:
+            return json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+        except json.JSONDecodeError:
+            return {}
 
     def _token_ok(self) -> bool:
         if not WEBUI_TOKEN:
             return True
-        return self._read_token() == WEBUI_TOKEN
+        body = self._read_json()
+        return str(body.get("token") or "") == WEBUI_TOKEN
 
     def _status(self):
         state = container_state()
@@ -359,8 +456,11 @@ class Handler(BaseHTTPRequestHandler):
         if _sync_state["running"]:
             self._send(200, json.dumps({"msg": "同步已在运行中"}))
             return
-        threading.Thread(target=run_sync, daemon=True).start()
-        self._send(200, json.dumps({"msg": "同步已启动，日志将实时刷新"}))
+        body = self._read_json()
+        hot = bool(body.get("hot", True))  # 默认热更新；前端可传 hot=false 走严格模式
+        threading.Thread(target=run_sync, kwargs={"hot": hot}, daemon=True).start()
+        mode = "热更新" if hot else "严格模式(停服)"
+        self._send(200, json.dumps({"msg": f"已启动{mode}同步，日志将实时刷新"}))
 
 
 def main():
