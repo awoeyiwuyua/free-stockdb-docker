@@ -397,6 +397,643 @@ def _classify_code(code: str) -> str:
     return "other"
 
 
+# ==================== 市场研究：基础因子（纯计算，不复权日K） ====================
+# 因子定义（与 UI 说明一致）：
+#   1. 20 日动量   mom20 = close[-1] / close[-21] - 1          （需 ≥21 根）
+#   2. 20 日波动率 vol20 = std(最近 20 个日收益率) * sqrt(250) （需 ≥21 根）
+#   3. 5/20 日量比 vr520 = mean(vol[-5:]) / mean(vol[-20:])   （需 ≥20 根，均量 > 0）
+#   4. 60 日回撤   dd60  = close[-1] / max(high[-60:]) - 1     （需 ≥60 根）
+# 使用不复权日K；数据不足时因子为 None（不参与排名）。
+
+
+def _factor_mom20(bars: list[dict]) -> float | None:
+    if len(bars) < 21:
+        return None
+    try:
+        c0 = float(bars[-1]["close"])
+        c21 = float(bars[-21]["close"])
+        if c21 <= 0:
+            return None
+        return c0 / c21 - 1.0
+    except (KeyError, TypeError, ValueError, ZeroDivisionError):
+        return None
+
+
+def _factor_vol20(bars: list[dict]) -> float | None:
+    if len(bars) < 21:
+        return None
+    try:
+        closes = [float(b["close"]) for b in bars[-21:]]
+        rets = []
+        for i in range(1, len(closes)):
+            if closes[i - 1] <= 0:
+                return None
+            rets.append(closes[i] / closes[i - 1] - 1.0)
+        if len(rets) < 20:
+            return None
+        mean = sum(rets) / len(rets)
+        var = sum((r - mean) ** 2 for r in rets) / len(rets)
+        return (var ** 0.5) * (250.0 ** 0.5)
+    except (KeyError, TypeError, ValueError, ZeroDivisionError):
+        return None
+
+
+def _factor_vr520(bars: list[dict]) -> float | None:
+    if len(bars) < 20:
+        return None
+    try:
+        vols = [float(b.get("volume") or 0) for b in bars[-20:]]
+        v5 = sum(vols[-5:]) / 5.0
+        v20 = sum(vols) / 20.0
+        if v20 <= 0:
+            return None  # 零成交量防御
+        return v5 / v20
+    except (KeyError, TypeError, ValueError, ZeroDivisionError):
+        return None
+
+
+def _factor_dd60(bars: list[dict]) -> float | None:
+    if len(bars) < 60:
+        return None
+    try:
+        c0 = float(bars[-1]["close"])
+        hi = max(float(b["high"]) for b in bars[-60:])
+        if hi <= 0:
+            return None
+        return c0 / hi - 1.0
+    except (KeyError, TypeError, ValueError, ZeroDivisionError):
+        return None
+
+
+def compute_factors(bars: list[dict]) -> dict:
+    """单只标的全套基础因子（不复权日K）。返回 {mom20, vol20, vr520, dd60}。"""
+    return {"mom20": _factor_mom20(bars), "vol20": _factor_vol20(bars),
+            "vr520": _factor_vr520(bars), "dd60": _factor_dd60(bars)}
+
+
+def percentile_rank(value: float | None, ordered_values: list[float], higher_is_better: bool = True) -> float | None:
+    """value 在 ordered_values 中的百分位排名（0~100，含两端）。
+
+    按值排序后取位次 / 总数 * 100；higher_is_better=False（如波动率/回撤）
+    时按低者高排名（位次取反）。value=None 或列表为空 → None。
+    """
+    if value is None or not ordered_values:
+        return None
+    try:
+        vals = [float(v) for v in ordered_values if v is not None]
+        if not vals:
+            return None
+        n = len(vals)
+        if higher_is_better:
+            rank = sum(1 for v in vals if v <= value)
+        else:
+            rank = sum(1 for v in vals if v >= value)
+        return round(rank / n * 100.0, 1)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
+
+
+def add_percentiles(stock: dict, field: str, ordered: list[float], higher_better: bool) -> None:
+    """给单股结果附加 {field}_pct 百分位。"""
+    stock[f"{field}_pct"] = percentile_rank(stock.get(field), ordered, higher_better)
+
+
+def ma(values: list[float], n: int) -> float | None:
+    if len(values) < n:
+        return None
+    s = values[-n:]
+    if any(v is None for v in s):
+        return None
+    try:
+        return sum(s) / n
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
+
+
+# ==================== 市场研究：市场状态聚合 ====================
+def _bar_date(b: dict) -> int:
+    try:
+        return int(b.get("date") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def market_summary_from_stocks(stock_results: list[dict], target_date: str | None = None) -> dict:
+    """从全市场扫描结果（每只股票含 bars 的衍生字段）聚合「市场状态」。
+
+    stock_results 元素：{code, type, date, pct_chg, close, ma20, amount, prev_amount,
+                         is_high20/is_low20, daily}；无当日数据的股票 date=None。
+    target_date：目标交易日（8位）。只统计 date==target_date 的记录计入当日涨跌/MA20/新高新低，
+    其余（无数据/停牌/旧日期）全部计入 na——避免停牌股用历史最后一天的行情冒充当日涨跌。
+    温度 = 上涨家数占比40% + 站上MA20占比40% + (20日新高占比-新低占比)20%，各分项归一化 0~100。
+    """
+    from datetime import datetime as _dt
+    up = down = flat = na = 0
+    above_ma20 = 0
+    high20c = low20c = 0
+    pcts: list[float] = []
+    total_amount = 0.0
+    prev_total = 0.0
+    data_date = None
+    daily: dict[int, dict] = {}
+    for r in stock_results:
+        # 历史宽度贡献：所有有 daily 的股票都累加（近 20 日每日占比）
+        for d, c in (r.get("daily") or {}).items():
+            daily.setdefault(int(d), {"up": 0, "down": 0, "flat": 0, "above": 0,
+                                      "amount": 0.0, "high20": 0, "low20": 0, "n": 0})
+            agg = daily[int(d)]
+            for k in ("up", "down", "flat", "above", "high20", "low20"):
+                agg[k] += int(c.get(k) or 0)
+            agg["n"] += 1
+            try:
+                agg["amount"] += float(c.get("amount") or 0)
+            except (TypeError, ValueError):
+                pass
+        # 当日统计：仅 date==target_date 计入涨跌/MA20/新高新低；其余为 na
+        date = r.get("date")
+        if not date:
+            na += 1
+            continue
+        if target_date is not None and str(date) != str(target_date):
+            na += 1
+            continue
+        if data_date is None or date > data_date:
+            data_date = date
+        pct = r.get("pct_chg")
+        if pct is None:
+            na += 1
+        elif pct > 0:
+            up += 1
+        elif pct < 0:
+            down += 1
+        else:
+            flat += 1
+        if pct is not None:
+            try:
+                pcts.append(float(pct))
+            except (TypeError, ValueError):
+                pass
+        close = r.get("close")
+        ma20 = r.get("ma20")
+        if close is not None and ma20 is not None:
+            try:
+                if float(close) > float(ma20):
+                    above_ma20 += 1
+            except (TypeError, ValueError):
+                pass
+        if r.get("is_high20"):
+            high20c += 1
+        if r.get("is_low20"):
+            low20c += 1
+        try:
+            total_amount += float(r.get("amount") or 0)
+            prev_total += float(r.get("prev_amount") or 0)
+        except (TypeError, ValueError):
+            pass
+    total_data = up + down + flat
+    up_ratio = up / total_data if total_data else 0.0
+    ma20_ratio = above_ma20 / total_data if total_data else 0.0
+    highlow_raw = (high20c - low20c) / total_data if total_data else 0.0
+    highlow_score = max(-1.0, min(1.0, highlow_raw))
+    temperature = round(up_ratio * 40 + ma20_ratio * 40 + ((highlow_score + 1) / 2) * 20, 1)
+    # 20 日宽度历史（按交易日排序）
+    width_hist = []
+    for d in sorted(daily):
+        agg = daily[d]
+        n = agg["n"]
+        width_hist.append({
+            "date": str(d),
+            "up_ratio": round(agg["up"] / n, 4) if n else None,
+            "ma20_ratio": round(agg["above"] / n, 4) if n else None,
+            "high20": agg["high20"],
+            "low20": agg["low20"],
+            "amount": round(agg["amount"], 1),
+        })
+    return {
+        "schema_version": RESEARCH_SCHEMA,
+        "date": str(data_date) if data_date else None,
+        "up": up, "down": down, "flat": flat, "na": na, "total": total_data,
+        "up_ratio": round(up_ratio, 4),
+        "median_pct": _median(pcts),
+        "total_amount": round(total_amount, 1),
+        "amount_change": round((total_amount / prev_total - 1.0) * 100, 2) if prev_total > 0 else None,
+        "ma20_above": above_ma20,
+        "ma20_ratio": round(ma20_ratio, 4),
+        "high20": high20c, "low20": low20c,
+        "temperature": temperature,
+        "temp_components": {
+            "up_ratio": round(up_ratio * 40, 1),      # 上涨家数占比 40%
+            "ma20_ratio": round(ma20_ratio * 40, 1),  # 站上 MA20 占比 40%
+            "highlow": round(((highlow_score + 1) / 2) * 20, 1),  # 新高-新低 20%
+        },
+        "width_hist": width_hist[-20:],  # 最近 20 个交易日
+        "generated_at": _dt.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
+def _median(vals: list[float]) -> float | None:
+    if not vals:
+        return None
+    s = sorted(vals)
+    n = len(s)
+    return s[n // 2] if n % 2 else round((s[n // 2 - 1] + s[n // 2]) / 2, 4)
+
+
+def stock_research_row(code: str, name: str, kind: str, bars: list[dict],
+                       daily: dict | None = None) -> dict:
+    """从单股日K生成研究行（含因子、最新行情、20日宽度贡献、MA20/新高新低）。
+
+    bars 需按日期升序（kline 扫描保证）。daily 为可选近20日贡献（供市场聚合）。
+    """
+    factors = compute_factors(bars)
+    close = float(bars[-1].get("close")) if bars and bars[-1].get("close") is not None else None
+    pct = float(bars[-1].get("pct_chg")) if bars and bars[-1].get("pct_chg") is not None else None
+    date = _bar_date(bars[-1]) if bars else None
+    amount = float(bars[-1].get("amount") or 0) if bars else 0.0
+    prev_amount = float(bars[-2].get("amount") or 0) if len(bars) > 1 else 0.0
+    closes = [float(b.get("close")) for b in bars if b.get("close") is not None]
+    ma20v = ma(closes, 20)
+    highs = [float(b.get("high")) for b in bars if b.get("high") is not None]
+    lows = [float(b.get("low")) for b in bars if b.get("low") is not None]
+    # 20 日新高/新低口径：当日 high 创前 19 日最高 → 新高；当日 low 创前 19 日最低 → 新低
+    hi_t = float(bars[-1]["high"]) if bars and bars[-1].get("high") is not None else None
+    lo_t = float(bars[-1]["low"]) if bars and bars[-1].get("low") is not None else None
+    prev_highs = highs[-20:-1] if len(highs) >= 20 else highs[:-1]
+    prev_lows = lows[-20:-1] if len(lows) >= 20 else lows[:-1]
+    is_high20 = bool(prev_highs and hi_t is not None and hi_t >= max(prev_highs))
+    is_low20 = bool(prev_lows and lo_t is not None and lo_t <= min(prev_lows))
+    return {
+        "code": code, "name": name, "type": kind,
+        "date": date, "close": close, "pct_chg": pct,
+        "amount": round(amount, 1), "prev_amount": round(prev_amount, 1),
+        "ma20": ma20v, "is_high20": is_high20, "is_low20": is_low20,
+        "daily": daily or {},
+        **factors,
+    }
+
+
+# ==================== 市场研究：本地缓存与后台构建 ====================
+# 缓存目录：DATA_DIR/webui_cache/。页面请求只读缓存，全市场计算在后台线程分批执行。
+# 缓存文件均带 schema_version，原子写入（临时文件 + os.replace）。
+RESEARCH_SCHEMA = 2  # v2：dd60 百分位方向 higher=True、新高/新低改 high/low 口径、target_date 聚合过滤
+RESEARCH_CACHE_DIR = DATA_DIR / "webui_cache"
+MARKET_SNAP = "market_snapshot_{date}.json"
+FACTOR_SNAP = "factor_snapshot_{date}.json"
+BUILD_STATUS_FILE = RESEARCH_CACHE_DIR / "build_status.json"
+FACTOR_META = {  # 因子 → {标题, 方向(高者好?), 公式说明}
+    "mom20": {"label": "20 日动量", "higher": True, "formula": "close[-1] / close[-21] - 1（需≥21根）"},
+    "vol20": {"label": "20 日波动率", "higher": False, "formula": "std(最近20个日收益率) × √250（需≥21根）"},
+    "vr520": {"label": "5/20 日量比", "higher": True, "formula": "近5日均量 / 近20日均量（需≥20根，均量>0）"},
+    # dd60 取值 (-1, 0]，越接近 0 回撤越小越"好" → 值越大分位越高（higher=True）
+    "dd60": {"label": "60 日回撤", "higher": True, "formula": "close[-1] / max(high[-60:]) - 1（需≥60根，越接近0回撤越小）"},
+}
+
+_research_build_lock = threading.Lock()  # 防重入：同一时间只允许一个构建任务
+_research_build = {  # 内存构建状态（与 build_status.json 同步落盘）
+    "state": "idle", "date": None, "total": 0, "processed": 0, "current_code": None,
+    "started_at": None, "finished_at": None, "last_duration_sec": None,
+    "last_date": None, "error": None,
+}
+
+
+def _atomic_write_json(path: Path, obj) -> None:
+    """原子写 JSON：临时文件 + os.replace，避免读者读到半写文件。"""
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(obj, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _write_build_status() -> None:
+    try:
+        RESEARCH_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        _atomic_write_json(BUILD_STATUS_FILE, _research_build)
+    except Exception:
+        pass
+
+
+def _load_build_status() -> dict:
+    try:
+        if BUILD_STATUS_FILE.exists():
+            d = json.loads(BUILD_STATUS_FILE.read_text(encoding="utf-8"))
+            if isinstance(d, dict):
+                return d
+    except Exception:
+        pass
+    return dict(_research_build)
+
+
+def _latest_cache_file(prefix: str) -> Path | None:
+    """返回缓存目录下最新日期的缓存文件（按文件名 YYYYMMDD 排序）。"""
+    try:
+        if not RESEARCH_CACHE_DIR.exists():
+            return None
+        files = [p for p in RESEARCH_CACHE_DIR.iterdir()
+                 if p.is_file() and p.name.startswith(prefix)]
+        if not files:
+            return None
+        return max(files, key=lambda p: p.name)
+    except Exception:
+        return None
+
+
+def _load_snapshot(prefix: str) -> dict | None:
+    """读取最新一份可用快照（按日期降序，跳过损坏/schema 不符的文件）。
+
+    单个最新文件损坏不会导致整体不可用——回退到上一份有效缓存。
+    """
+    try:
+        if not RESEARCH_CACHE_DIR.exists():
+            return None
+        files = [p for p in RESEARCH_CACHE_DIR.iterdir()
+                 if p.is_file() and p.name.startswith(prefix)]
+    except Exception:
+        return None
+    files.sort(key=lambda p: p.name, reverse=True)  # 最新在前
+    for f in files:
+        try:
+            d = json.loads(f.read_text(encoding="utf-8"))
+            if isinstance(d, dict) and d.get("schema_version") == RESEARCH_SCHEMA:
+                return d
+        except Exception:
+            continue
+    return None
+
+
+def _fetch_bars(code: str, months: int = 4) -> list[dict]:
+    """拉取单标的近 months 个月不复权日K（升序）。复用 vals 前缀通配。"""
+    import urllib.request, urllib.parse
+    from datetime import datetime as _dt, timedelta as _td
+    today = _dt.now()
+    start = (today - _td(days=months * 31)).strftime("%Y%m%d")
+    end = today.strftime("%Y%m%d")
+    rows: list[dict] = []
+    for prefix in _month_prefixes(start, end):
+        try:
+            url = f"http://{STOCKDB_HOST}:{STOCKDB_PORT}/?cmd=vals&t={urllib.parse.quote(f'日k:{code}:{prefix}*')}"
+            with urllib.request.urlopen(url, timeout=15) as resp:
+                data = json.loads(resp.read().decode("utf-8", "replace"))
+            rows.extend(r for r in data if isinstance(r, dict))
+        except Exception:
+            continue
+    rows.sort(key=_bar_date)
+    return rows
+
+
+def _stock_name(bars: list[dict], code: str) -> str:
+    for b in reversed(bars):
+        n = b.get("name")
+        if n:
+            return str(n)
+    return code
+
+
+def _run_research_build(date_target: str) -> None:
+    """全市场扫描 + 因子计算 + 聚合，写入缓存。由 _start_research_build 以线程调用。"""
+    t0 = time.time()
+    _research_build.update(state="building", date=date_target, total=0, processed=0,
+                           current_code=None, error=None, started_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    _write_build_status()
+    import urllib.request, urllib.parse
+    try:
+        # 1. 代码列表 + 分类（排除 other：LOF/REITs/B股；含股票与 ETF）
+        url = f"http://{STOCKDB_HOST}:{STOCKDB_PORT}/?cmd=get&t={urllib.parse.quote('股票代码')}"
+        with urllib.request.urlopen(url, timeout=20) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+        codes: list[str] = []
+        if isinstance(data, dict):
+            for group in data.values():
+                if isinstance(group, list):
+                    codes.extend(str(c) for c in group)
+        codes = sorted({c for c in codes if _classify_code(c) in ("stock", "etf")})
+        _research_build["total"] = len(codes)
+        _write_build_status()
+
+        def scan_one(code: str):
+            bars = _fetch_bars(code)
+            if not bars:
+                # 无当日数据/停牌/无历史：返回占位行（date=None → 市场聚合计入 na）
+                return {"code": code, "name": code, "type": _classify_code(code), "date": None,
+                        "pct_chg": None, "close": None, "amount": 0.0, "prev_amount": 0.0,
+                        "ma20": None, "is_high20": False, "is_low20": False, "daily": {},
+                        "mom20": None, "vol20": None, "vr520": None, "dd60": None}
+            # 近20日宽度贡献（用于市场聚合）
+            daily = {}
+            closes = [float(b["close"]) for b in bars if b.get("close") is not None]
+            highs = [float(b["high"]) for b in bars if b.get("high") is not None]
+            lows = [float(b["low"]) for b in bars if b.get("low") is not None]
+            for i in range(max(0, len(bars) - 20), len(bars)):
+                b = bars[i]
+                d = _bar_date(b)
+                c = float(b.get("close") or 0)
+                try:
+                    pct = float(b.get("pct_chg")) if b.get("pct_chg") is not None else None
+                except (TypeError, ValueError):
+                    pct = None
+                up = 1 if (pct or 0) > 0 else 0
+                down = 1 if (pct or 0) < 0 else 0
+                flat = 1 if pct == 0 else 0
+                above = 0
+                idx = i
+                # MA20 含当日（与 stock_research_row 的最新 MA20 口径一致：取当日及其前 19 根）
+                if idx >= 19:
+                    ma20v = sum(closes[idx - 19:idx + 1]) / 20
+                    above = 1 if c > ma20v else 0
+                # 20 日新高/新低：当日 high/low 创前 19 日极值（不含当日）
+                hi_t = float(b.get("high")) if b.get("high") is not None else None
+                lo_t = float(b.get("low")) if b.get("low") is not None else None
+                prev_highs = highs[max(0, i - 19):i]
+                prev_lows = lows[max(0, i - 19):i]
+                is_high = bool(prev_highs and hi_t is not None and hi_t >= max(prev_highs))
+                is_low = bool(prev_lows and lo_t is not None and lo_t <= min(prev_lows))
+                daily[d] = {"up": up, "down": down, "flat": flat, "above": above,
+                            "high20": 1 if is_high else 0,
+                            "low20": 1 if is_low else 0,
+                            "amount": float(b.get("amount") or 0)}
+            row = stock_research_row(code, _stock_name(bars, code),
+                                     _classify_code(code), bars, daily)
+            return row
+
+        results: list[dict] = []
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            futures = {}
+            for c in codes:
+                futures[ex.submit(scan_one, c)] = c
+            done = 0
+            for fut in futures:
+                try:
+                    row = fut.result()
+                    if row:
+                        results.append(row)
+                except Exception:
+                    pass
+                done += 1
+                if done % 50 == 0:
+                    _research_build["processed"] = done
+                    _write_build_status()
+        _research_build["processed"] = len(codes)
+        _write_build_status()
+
+        # 1.5 构建结果校验：代码列表非空 + 有效行情比例达标 + 聚合日期有效，
+        # 否则判失败并保留旧缓存（不写新文件，前端继续用上一份）。
+        if not codes:
+            raise RuntimeError("股票代码列表为空（stockdb 不可用或返回异常），保留旧缓存")
+        # 有效行情 = 有当日数据（date 非空）；占位行不算有效
+        valid = sum(1 for r in results if r.get("date"))
+        if valid < max(10, int(len(codes) * 0.5)):
+            raise RuntimeError(f"有效行情过少（{valid}/{len(codes)}），中止构建以保留旧缓存")
+
+        # 2. 聚合市场状态（仅普通股票；只统计 date==target_date 的记录）
+        stock_rows = [r for r in results if r.get("type") == "stock"]
+        summary = market_summary_from_stocks(stock_rows, target_date=date_target)
+        if not summary.get("date"):
+            raise RuntimeError("市场快照无有效数据日期，中止构建以保留旧缓存")
+
+        # 3. 全市场因子百分位（股票+ETF 各自独立排名）
+        for f in FACTOR_META:
+            pool_stock = [r[f] for r in results if r.get("type") == "stock"]
+            pool_etf = [r[f] for r in results if r.get("type") == "etf"]
+            for r in results:
+                pool = pool_stock if r.get("type") == "stock" else pool_etf
+                add_percentiles(r, f, pool, FACTOR_META[f]["higher"])
+
+        # 4. 落盘（原子写）
+        RESEARCH_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        factor_payload = {
+            "schema_version": RESEARCH_SCHEMA, "date": summary["date"],
+            "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "factors": FACTOR_META,
+            "codes": [{k: r[k] for k in ("code", "name", "type", "close", "pct_chg",
+                                         "mom20", "mom20_pct", "vol20", "vol20_pct",
+                                         "vr520", "vr520_pct", "dd60", "dd60_pct")}
+                      for r in results if r.get("date")],  # 排除无行情占位行
+        }
+        _atomic_write_json(RESEARCH_CACHE_DIR / FACTOR_SNAP.format(date=summary["date"]), factor_payload)
+        _atomic_write_json(RESEARCH_CACHE_DIR / MARKET_SNAP.format(date=summary["date"]), summary)
+        # 清理旧日期缓存（只保留最新一份）
+        for p in RESEARCH_CACHE_DIR.iterdir():
+            if p.is_file() and (p.name.startswith("market_snapshot_") or p.name.startswith("factor_snapshot_")) \
+                    and summary["date"] not in p.name:
+                try:
+                    p.unlink()
+                except Exception:
+                    pass
+
+        _research_build.update(state="done", last_date=summary["date"], error=None,
+                               last_duration_sec=round(time.time() - t0, 1),
+                               finished_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                               current_code=None)
+        _write_build_status()
+    except Exception as exc:
+        _research_build.update(state="failed", error=str(exc)[:300],
+                               finished_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        _write_build_status()
+        log(f"📊 市场因子构建失败: {exc}")
+
+
+def _start_research_build() -> bool:
+    """启动一次后台构建（防重入）。返回是否启动成功。"""
+    if not _research_build_lock.acquire(blocking=False):
+        return False
+
+    def _wrapper(date_target: str):
+        try:
+            _run_research_build(date_target)
+        finally:
+            _research_build_lock.release()
+
+    try:
+        date_target = data_latest_date() or ""
+        threading.Thread(target=_wrapper, args=(date_target,), daemon=True).start()
+        return True
+    except Exception:
+        _research_build_lock.release()
+        return False
+
+
+def invalidate_research_cache(reason: str = "数据更新") -> None:
+    """数据更新后使旧缓存失效并启动重算（同步成功时调用）。"""
+    log(f"📊 市场因子缓存失效（{reason}），后台重算启动")
+    _start_research_build()
+
+
+def research_check_loop() -> None:
+    """后台守护：缓存缺失 / 落后于本地数据日期 / 无有效 schema（口径升级后旧缓存）时重建。"""
+    while True:
+        try:
+            st = research_status()
+            need = (st.get("stale")
+                    or (st.get("data_date") and not st.get("cache_generated_at")))
+            if need:
+                _start_research_build()
+        except Exception:
+            pass
+        time.sleep(60)
+
+
+def research_status() -> dict:
+    """研究功能状态：结合内存状态与缓存文件。"""
+    st = dict(_research_build)
+    st["cache_date"] = None
+    st["cache_generated_at"] = None
+    f = _latest_cache_file("factor_snapshot_")
+    if f:
+        st["cache_date"] = f.name.replace("factor_snapshot_", "").replace(".json", "")
+        try:
+            st["cache_generated_at"] = _load_snapshot("factor_snapshot_").get("generated_at")
+        except Exception:
+            pass
+    st["data_date"] = data_latest_date()
+    st["stale"] = bool(st.get("cache_date") and st.get("data_date")
+                       and st["cache_date"] < st["data_date"])
+    # 服务重启后内存态为 idle，但存在有效缓存 → 归一到 done（缓存仍可用）
+    if st["state"] == "idle" and st.get("cache_date"):
+        st["state"] = "done"
+        st["last_date"] = st["cache_date"]
+    return st
+
+
+def research_market() -> dict:
+    """市场状态快照（读缓存，构建中返回上一份有效缓存或降级状态）。"""
+    snap = _load_snapshot("market_snapshot_")
+    if snap:
+        return snap
+    return {"schema_version": RESEARCH_SCHEMA, "date": None, "error": "暂无市场快照",
+            "building": _research_build["state"] == "building"}
+
+
+def research_factors(factor: str = "mom20", scope: str = "stock", order: str = "desc",
+                     limit: int = 50, q: str = "") -> dict:
+    """因子排行榜（读缓存 + 内存过滤排序，不扫全市场）。"""
+    if factor not in FACTOR_META:
+        return {"error": f"未知因子 {factor}"}
+    if scope not in ("stock", "etf"):
+        return {"error": f"未知范围 {scope}"}
+    if order not in ("desc", "asc"):
+        return {"error": f"未知排序 {order}"}
+    limit = max(1, min(int(limit), 200))
+    snap = _load_snapshot("factor_snapshot_")
+    if not snap:
+        return {"error": "暂无因子数据（首次构建中或失败）", "date": None}
+    rows = [r for r in snap["codes"] if r.get("type") == scope]
+    if q:
+        q = str(q).strip().lower()
+        rows = [r for r in rows if q in r["code"].lower() or q in str(r.get("name") or "").lower()]
+    meta = snap.get("factors") or FACTOR_META
+    # 空值不参与排序
+    rows = [r for r in rows if r.get(factor) is not None]
+    rev = order == "desc"
+    rows.sort(key=lambda r: r[factor], reverse=rev)
+    # 排名：同值并列序号
+    for i, r in enumerate(rows[:limit]):
+        r = dict(r)
+        r["rank"] = i + 1
+        rows[i] = r
+    return {"date": snap.get("date"), "factor": factor, "scope": scope, "order": order,
+            "limit": limit, "total": len(rows), "meta": meta,
+            "rows": rows[:limit]}
+
+
 def code_stats() -> dict:
     """全市场标的数量，股票 / ETF 分开统计（其余归 other），并返回查询延迟 ms。
 
@@ -873,6 +1510,9 @@ def run_sync(hot: bool = True, trigger: str = "manual", retry: bool = False) -> 
             })
             if _sync_state.get("trigger", "").startswith("scheduled"):
                 _update_schedule_trigger_exit(_sync_state.get("exit_code"), retry=retry)
+            # 同步成功后使市场研究缓存失效并后台重算（仅当数据确实更新）
+            if _sync_state.get("exit_code") == 0:
+                invalidate_research_cache(reason="同步成功")
         except Exception:
             pass
         _sync_state["running"] = False
@@ -1315,6 +1955,42 @@ tr.hr-row:hover{background:rgba(56,189,248,.04)}
 .info-grid .it{display:flex;justify-content:space-between;gap:12px;font-size:13px}
 .info-grid .it .lk{color:var(--muted)}
 
+/* 市场研究 */
+.badge-st{padding:2px 10px;border-radius:10px;font-size:12px;background:var(--panel2);color:var(--muted);margin-left:8px}
+.badge-st.b-building{color:var(--brand)}
+.badge-st.b-ok{color:var(--ok)}
+.badge-st.b-fail{color:var(--err)}
+.ms-top{display:flex;gap:28px;flex-wrap:wrap;align-items:flex-start}
+.ms-temp{min-width:160px}
+.ms-temp-val{font-size:46px;font-weight:800;line-height:1.1;font-variant-numeric:tabular-nums}
+.ms-temp .lbl{font-size:12px;color:var(--muted);margin-top:6px}
+.ms-stats{flex:1;display:grid;grid-template-columns:repeat(auto-fill,minmax(118px,1fr));gap:10px;min-width:260px}
+.ms-st .lbl{font-size:12px;color:var(--muted);margin-bottom:2px}
+.ms-st .v{font-size:15px;font-weight:700}
+.bcharts{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+@media(max-width:760px){.bcharts{grid-template-columns:1fr}}
+.bcharts>div{min-width:0}   /* 防 ECharts 撑破网格容器（移动端整页溢出） */
+.bcharts .bchart{width:100%;height:250px}
+.filters{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px}
+.filters input[type=text]{width:150px}
+.ftable-wrap{overflow-x:auto}
+.ftable-wrap table td{cursor:pointer}
+.ftable-wrap table tr.hr-row:hover{background:rgba(56,189,248,.05)}
+.f-cards{display:none}
+@media(max-width:760px){.f-cards{display:block}.ftable-wrap table{display:none}}
+.f-card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:10px 12px;margin:8px 0;cursor:pointer}
+.f-card:hover{border-color:var(--brand)}
+.f-card .r1{display:flex;justify-content:space-between;align-items:center}
+.f-card .r2{display:flex;gap:10px;color:var(--muted);font-size:12px;flex-wrap:wrap;margin-top:4px}
+.rs-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:10px;margin-top:12px}
+.rs-it .lbl{font-size:12px;color:var(--muted);margin-bottom:2px}
+.rs-it .v{font-size:14px;font-weight:600}
+.rs-kline{margin-top:16px}
+.rs-trend{margin-top:16px}
+#tchart{width:100%;height:200px}
+.rs-err{color:var(--warn);font-size:13px}
+.rs-kctl{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:8px}
+
 pre{background:#0A0F1C;border:1px solid var(--line);border-radius:10px;padding:12px;
 max-height:340px;overflow:auto;font:12px/1.5 ui-monospace,monospace;color:#A5D8F8}
 .actions{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
@@ -1332,8 +2008,7 @@ color:var(--text);padding:8px 10px;border-radius:8px;width:220px}
   <div class="brand"><span id="statusDot" class="dot"></span> stockdb</div>
   <div class="brand-status" id="brandStatus">加载中…</div>
   <nav class="tabs">
-    <button class="tab-btn active" data-tab="overview" onclick="showTab('overview',this)">概览</button>
-    <button class="tab-btn" data-tab="market" onclick="showTab('market',this)">行情</button>
+    <button class="tab-btn active" data-tab="research" onclick="showTab('research',this)">市场研究</button>
     <button class="tab-btn" data-tab="sync" onclick="showTab('sync',this)">数据同步</button>
     <button class="tab-btn" data-tab="system" onclick="showTab('system',this)">系统</button>
   </nav>
@@ -1341,43 +2016,90 @@ color:var(--text);padding:8px 10px;border-radius:8px;width:220px}
 <div class="wrap">
 <div id="toast"></div>
 
-<!-- 概览：大盘 + 自选股 -->
-<div id="tab-overview" class="tab-panel active">
-  <div class="card"><div class="card-title">概览</div><div class="metrics">
-    <div class="m"><div class="lbl">大盘指数</div><div class="row" id="idxRow" style="gap:14px"><span class="hint">…</span></div></div>
-    <div class="m"><div class="lbl">自选股（点代码看K线）</div><div class="row" id="wlRow" style="gap:14px"><span class="hint">…</span></div></div>
+<!-- 市场研究：①市场状态 ②宽度趋势 ③因子排行 ④个股研究 + 自选股 -->
+<div id="tab-research" class="tab-panel active">
+  <div class="card"><div class="card-title">市场状态 <span class="hint" style="font-weight:normal">（本地数据 · 仅普通股票）</span><span class="badge-st" id="msBuild">…</span></div>
+    <div class="ms-top">
+      <div class="ms-temp">
+        <div class="ms-temp-val" id="msTemp">—</div>
+        <div class="lbl">市场温度 <span id="tempHelp" style="cursor:help;color:var(--muted)" title="上涨家数占比40% + 站上MA20占比40% + (20日新高占比-新低占比)20%，各分项归一化0~100。仅描述市场状态，不构成买卖建议。">ⓘ</span></div>
+      </div>
+      <div class="ms-stats" id="msStats"></div>
+    </div>
+    <div class="hint" id="msNote" style="margin-top:10px"></div>
   </div>
-  <div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap">
-    <input type="text" id="wlAdd" placeholder="加自选，如 600633,000967" style="width:280px">
-    <button class="btn-ghost" onclick="addWatch()">加入自选</button>
-    <span id="wlMsg" class="hint"></span>
-  </div></div>
-</div>
 
-<!-- 行情：K线图 + 原始查询 -->
-<div id="tab-market" class="tab-panel">
-  <div class="card"><div class="card-title">K 线图</div>
-    <div style="display:flex;gap:8px;margin:8px 0;flex-wrap:wrap;align-items:center">
-      <input type="text" id="kcode" value="600633" placeholder="股票代码" style="width:120px">
-      <select id="kfreq"><option value="day">日K</option><option value="minute">分钟K</option></select>
-      <select id="kadj"><option value="none">不复权</option><option value="qfq">前复权</option><option value="hfq">后复权</option></select>
-      <select id="kmonths"><option value="1">近1月</option><option value="3" selected>近3月</option><option value="6">近6月</option><option value="12">近1年</option></select>
-      <button onclick="loadKline()">加载</button>
-      <label class="hint"><input type="checkbox" id="kma" checked> MA5/20</label>
+  <div class="card"><div class="card-title">市场宽度趋势 <span class="hint" style="font-weight:normal">（最近 20 个交易日）</span></div>
+    <div class="bcharts">
+      <div><div class="lbl">上涨占比 vs 站上 MA20 占比</div><div class="bchart" id="wchart1"></div></div>
+      <div><div class="lbl">成交额 · 20 日新高/新低</div><div class="bchart" id="wchart2"></div></div>
     </div>
-    <div id="kchart"></div>
   </div>
-  <div class="card"><div class="card-title">行情原始查询（代理 stockdb HTTP API）</div>
-    <div style="display:flex;gap:8px;margin:8px 0;flex-wrap:wrap">
-      <select id="qtype">
-        <option value="股票代码">股票代码</option>
-        <option value="日k:600633:20260810">日K 示例</option>
-        <option value="分钟k:600633:20260810140000">分钟K 示例</option>
-        <option value="复权:600633:2026*">复权 示例</option>
+
+  <div class="card"><div class="card-title">因子排行榜 <span class="hint" style="font-weight:normal" id="fMeta"></span></div>
+    <div class="filters">
+      <select id="fFactor">
+        <option value="mom20">20 日动量</option>
+        <option value="vol20">20 日波动率</option>
+        <option value="vr520">5/20 日量比</option>
+        <option value="dd60">60 日回撤</option>
       </select>
-      <button class="btn-ghost" onclick="doQuery()">查询</button>
+      <select id="fScope"><option value="stock">全部股票</option><option value="etf">ETF</option></select>
+      <select id="fOrder"><option value="desc">从高到低</option><option value="asc">从低到高</option></select>
+      <select id="fLimit"><option value="20">20</option><option value="50" selected>50</option><option value="100">100</option></select>
+      <input type="text" id="fSearch" placeholder="代码 / 名称搜索">
+      <button class="btn-ghost btn-sm" onclick="loadFactors(true)">查询</button>
+      <button class="btn-ghost btn-sm" onclick="rebuildResearch()">重新计算</button>
+      <span class="hint" id="fStatus"></span>
     </div>
-    <pre id="qres">（查询结果）</pre>
+    <div class="ftable-wrap">
+      <table><thead><tr><th>排名</th><th>代码</th><th>名称</th><th id="fThVal">因子值</th><th>分位</th><th>涨跌幅</th><th>收盘</th><th>20日动量</th><th>20日波动率</th></tr></thead>
+      <tbody id="fBody"><tr><td colspan="9" class="hint">（加载中…）</td></tr></tbody></table>
+      <div class="f-cards" id="fCards"></div>
+    </div>
+  </div>
+
+  <div class="card"><div class="card-title">个股研究</div>
+    <div class="filters" style="margin-bottom:0">
+      <input type="text" id="rsCode" placeholder="6 位代码" style="width:120px">
+      <button class="btn-ghost btn-sm" onclick="loadStock()">加载</button>
+      <span class="hint" id="rsMsg"></span>
+    </div>
+    <div id="rsEmpty" class="hint" style="margin-top:10px">输入代码或点击排行榜记录加载个股研究。</div>
+    <div id="rsDetail" style="display:none">
+      <div class="metrics" style="gap:8px">
+        <div class="m"><div class="lbl">代码 / 名称</div><div class="v" id="rsName" style="font-size:15px">—</div></div>
+        <div class="m"><div class="lbl">最新交易日</div><div class="v" id="rsDate" style="font-size:15px">—</div></div>
+        <div class="m"><div class="lbl">收盘 / 涨跌幅</div><div class="v" id="rsPx" style="font-size:15px">—</div></div>
+        <div class="m"><div class="lbl">成交量 / 成交额</div><div class="v" id="rsVol" style="font-size:15px">—</div></div>
+      </div>
+      <div class="rs-grid" id="rsFactors"></div>
+      <div class="rs-kline"><div class="lbl">日 K 线（不复权）</div>
+        <div class="rs-kctl">
+          <select id="rsMonths">
+            <option value="1">近1月</option>
+            <option value="3" selected>近3月</option>
+            <option value="6">近6月</option>
+            <option value="12">近12月</option>
+          </select>
+          <button class="btn-ghost btn-sm" onclick="renderStockKline()">刷新</button>
+          <label class="hint"><input type="checkbox" id="rsMA" checked> MA5/20/60</label>
+        </div>
+        <div id="kchart" style="height:420px"></div>
+      </div>
+      <div class="rs-trend"><div class="lbl">因子走势（近 60 日：20 日动量 / 20 日波动率）</div>
+        <div id="tchart"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card"><div class="card-title">自选股 <span class="hint" style="font-weight:normal">（点代码跳转个股研究）</span></div>
+    <div class="row" id="wlRow" style="gap:14px"><span class="hint">…</span></div>
+    <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">
+      <input type="text" id="wlAdd" placeholder="加自选，如 600633,000967" style="width:260px">
+      <button class="btn-ghost" onclick="addWatch()">加入自选</button>
+      <span id="wlMsg" class="hint"></span>
+    </div>
   </div>
 </div>
 
@@ -1491,6 +2213,21 @@ color:var(--text);padding:8px 10px;border-radius:8px;width:220px}
     </div>
     <pre id="containerLog" style="display:none;margin-top:10px">（加载中…）</pre>
   </div>
+  <div class="card"><div class="card-title">开发工具 <span class="hint" style="font-weight:normal">（行情原始查询，代理 stockdb HTTP API）</span></div>
+    <details>
+      <summary class="hint" style="cursor:pointer">展开原始查询</summary>
+      <div style="display:flex;gap:8px;margin:10px 0;flex-wrap:wrap">
+        <select id="qtype">
+          <option value="股票代码">股票代码</option>
+          <option value="日k:600633:20260810">日K 示例</option>
+          <option value="分钟k:600633:20260810140000">分钟K 示例</option>
+          <option value="复权:600633:2026*">复权 示例</option>
+        </select>
+        <button class="btn-ghost btn-sm" onclick="doQuery()">查询</button>
+      </div>
+      <pre id="qres">（查询结果）</pre>
+    </details>
+  </div>
 </div>
 </div>
 <script src="/static/echarts.min.js"></script>
@@ -1520,7 +2257,10 @@ function showTab(name,btn){
   document.querySelectorAll('.tab-panel').forEach(p=>p.classList.remove('active'));
   (btn||document.querySelector('[data-tab="'+name+'"]')).classList.add('active');
   $('tab-'+name).classList.add('active');
-  if(name==='market'&&kchart)kchart.resize();
+  if(name==='research'){
+    loadResearchOnce();
+    if(kchart)kchart.resize();
+  }
   refresh(true); // 切页立即按当前页刷新
 }
 
@@ -1536,7 +2276,7 @@ async function refresh(force){
   _refreshing=true;
   try{
     const s=await j('/api/status');
-    const active=document.querySelector('.tab-panel.active')?.id||'tab-overview';
+    const active=document.querySelector('.tab-panel.active')?.id||'tab-research';
     const h=(active==='tab-sync'||active==='tab-system')?await j('/api/health'):null;
     if(h)_healthCache=h;
     // 顶部状态：优先用本次 health，否则用最近缓存；缓存也没有时以 data_latest 降级判定
@@ -1549,7 +2289,9 @@ async function refresh(force){
     $('statusDot').className='dot '+topColor;
     const up=s.data_latest?('数据更新至 '+String(s.data_latest).slice(4,6)+'-'+String(s.data_latest).slice(6,8)):'数据未同步';
     $('brandStatus').textContent=topSt+' · '+up;
-    if(active==='tab-sync'){
+    if(active==='tab-research'){
+      loadResearchOnce();   // 首次进入/页面初始加载时加载市场研究（_rsLoaded 防重复）
+    }else if(active==='tab-sync'){
       renderHero(s,h||{});
       renderSchView(s.schedule||{});
       renderDataOverview(s);
@@ -1561,8 +2303,6 @@ async function refresh(force){
     }else if(active==='tab-system'){
       renderSystem(s);
       loadHistory();
-    }else if(active==='tab-overview'){
-      loadWatchlist();
     }
   }catch(e){
     $('log').textContent='状态刷新失败: '+e;$('log').style.display='block';
@@ -1797,12 +2537,9 @@ function renderSystem(s){
 async function loadWatchlist(){
   try{
     const w=await j('/api/watchlist');
-    const idx=w.indices||[],wl=w.quotes||[];
-    const irow=$('idxRow');
-    if(idx.length)irow.innerHTML=idx.map(x=>'<div><div class="k">'+esc(x.name)+'</div><div class="v" style="'+pctCls(x.pct_chg)+'">'+fmtPrice(x.close)+' <span style="font-size:12px">'+fmtPct(x.pct_chg)+'</span></div></div>').join('');
-    else irow.innerHTML='<span class="hint">（指数数据未取到）</span>';
+    const wl=w.quotes||[];
     const wrow=$('wlRow');
-    if(wl.length)wrow.innerHTML=wl.map(x=>'<div style="cursor:pointer" onclick="showKline(\''+x.code+'\')"><div class="k">'+esc(x.name)+' '+esc(x.code)+'</div><div class="v" style="'+pctCls(x.pct_chg)+'">'+fmtPrice(x.close)+' <span style="font-size:12px">'+fmtPct(x.pct_chg)+'</span></div></div>').join('');
+    if(wl.length)wrow.innerHTML=wl.map(x=>'<div style="cursor:pointer" onclick="loadStockByCode(\''+x.code+'\')"><div class="k">'+esc(x.name)+' '+esc(x.code)+'</div><div class="v" style="'+pctCls(x.pct_chg)+'">'+fmtPrice(x.close)+' <span style="font-size:12px">'+fmtPct(x.pct_chg)+'</span></div></div>').join('');
     else wrow.innerHTML='<span class="hint">（空，下方添加自选）</span>';
   }catch(e){}
 }
@@ -1822,44 +2559,268 @@ async function doQuery(){
   const r=await fetch('/api/query?t='+encodeURIComponent(q));
   $('qres').textContent=await r.text();
 }
-let kchart=null;
-function showKline(code){$('kcode').value=code;loadKline()}
-function ma(data,n){return data.map((v,i)=>i<n-1?null:+((data.slice(i-n+1,i+1).reduce((a,b)=>a+b,0)/n).toFixed(3)))}
-async function loadKline(){
-  const code=$('kcode').value.trim(),freq=$('kfreq').value,adj=$('kadj').value,months=$('kmonths').value;
-  try{
-    const d=await j('/api/klines?code='+code+'&freq='+freq+'&months='+months+'&adj='+adj);
-    const rows=d.rows||[];
-    if(!rows.length){$('qres').textContent='（该区间无K线数据）';return}
-    const dates=rows.map(r=>String(r.date)),closes=rows.map(r=>+r.close);
-    const kd=rows.map(r=>[+r.open,+r.close,+r.low,+r.high]);
-    const showMA=$('kma').checked;
-    const series=[
-      {name:'K线',type:'candlestick',data:kd,
-       itemStyle:{color:'#F87171',color0:'#4ADE80',borderColor:'#F87171',borderColor0:'#4ADE80'}},
-      {name:'成交量',type:'bar',xAxisIndex:1,yAxisIndex:1,
-       data:rows.map(r=>r.volume||0),itemStyle:{color:'#38BDF8'}}
-    ];
-    if(showMA&&freq==='day'){
-      series.push({name:'MA5',type:'line',data:ma(closes,5),smooth:true,showSymbol:false,lineStyle:{width:1,color:'#FBBF24'}});
-      series.push({name:'MA20',type:'line',data:ma(closes,20),smooth:true,showSymbol:false,lineStyle:{width:1,color:'#A78BFA'}});
-    }
-    if(!kchart)kchart=echarts.init($('kchart'),'dark');
-    kchart.setOption({
-      backgroundColor:'transparent',
-      title:{text:code+' '+(freq==='day'?'日K':'分钟K')+(adj!=='none'?(adj==='qfq'?' 前复权':' 后复权'):''),left:8,top:4,textStyle:{fontSize:13,color:'#8FA2BC'}},
-      tooltip:{trigger:'axis',axisPointer:{type:'cross'}},
-      legend:{right:8,top:4,textStyle:{color:'#8FA2BC',fontSize:11}},
-      grid:[{left:60,right:16,top:34,height:'62%'},{left:60,right:16,top:'72%',height:'18%'}],
-      xAxis:[{type:'category',data:dates,axisLine:{lineStyle:{color:'#1E2C45'}}},
-             {type:'category',gridIndex:1,data:dates,axisLabel:{show:false},axisLine:{lineStyle:{color:'#1E2C45'}}}],
-      yAxis:[{scale:true,splitLine:{lineStyle:{color:'#162238'}}},
-             {gridIndex:1,splitNumber:2,axisLabel:{show:false},splitLine:{show:false}}],
-      dataZoom:[{type:'inside',xAxisIndex:[0,1],start:40,end:100}],
-      series
-    });
-  }catch(e){$('qres').textContent='K线加载失败: '+e}
+
+// ==================== 市场研究 ====================
+let _rsLoaded=false,_rsMarketLoaded=false,_rsFactorLoaded=false;
+let _rsStatusTimer=null;
+const FACTOR_LABEL={mom20:'20 日动量',vol20:'20 日波动率',vr520:'5/20 日量比',dd60:'60 日回撤'};
+let _stockRows=[];   // 当前排行数据（供搜索/联动）
+
+function loadResearchOnce(){
+  if(_rsLoaded){return}
+  _rsLoaded=true;
+  loadWatchlist();
+  loadResearchStatus();
+  loadResearchMarket();
+  loadFactors();
+  _rsStatusTimer=setInterval(loadResearchStatus,8000); // 构建中轮询状态
 }
+
+async function loadResearchStatus(){
+  try{
+    const st=await j('/api/research/status');
+    const b=$('msBuild');
+    const map={
+      building:['正在计算 '+st.processed+'/'+(st.total||'?')+(st.current_code?' · '+st.current_code:''),'b-building'],
+      done:['可用（'+(st.last_date||st.cache_date||'')+'）'+(st.last_duration_sec!=null?' · 上次计算 '+st.last_duration_sec+'s':''),'b-ok'],
+      failed:['计算失败：'+(st.error||'')+' — 点「重新计算」重试','b-fail'],
+      idle:['等待数据',''],
+    };
+    const m=map[st.state]||['…',''];
+    if(b){b.textContent=m[0];b.className='badge-st '+m[1]}
+    const fs=$('fStatus');
+    if(fs){
+      if(st.state==='building')fs.textContent='因子数据构建中，排行榜稍后自动刷新';
+      else if(st.state==='failed')fs.textContent='上次计算失败，排行榜为空';
+    }
+    // 构建完成刷新：cache_date 或 generated_at 变化（同日手动重建也触发）→ 重载市场/因子并重渲染图表
+    const cacheSig = st.cache_date + (st.cache_generated_at||'');
+    if(st.cache_date && cacheSig!==_rsKnownSig){
+      _rsKnownSig=cacheSig;
+      if(_rsBuildSeen){
+        loadResearchMarket();
+        loadFactors();
+        renderWidthCharts(marketLast||{});
+      }
+    }
+    if(st.state==='building')_rsBuildSeen=true;
+  }catch(e){}
+}
+let _rsKnownSig=null,_rsBuildSeen=false,marketLast=null;
+
+async function loadResearchMarket(){
+  try{
+    const m=await j('/api/research/market');
+    marketLast=m;
+    if(m.error){$('msStats').innerHTML='<span class="hint">'+esc(m.error)+'</span>';$('msTemp').textContent='—';$('msNote').textContent='';return}
+    renderMarket(m);
+    if(!_rsMarketLoaded){_rsMarketLoaded=true;renderWidthCharts(m)}
+  }catch(e){}
+}
+function renderMarket(m){
+  $('msTemp').textContent=(m.temperature!=null?m.temperature:'—');
+  const upc=m.up_ratio!=null?Math.round(m.up_ratio*100):null;
+  const mac=m.ma20_ratio!=null?Math.round(m.ma20_ratio*100):null;
+  const hi20=m.high20||0,lo20=m.low20||0;
+  $('msStats').innerHTML=`
+    <div class="ms-st"><div class="lbl">数据日期</div><div class="v">${m.date?fmtYMD(m.date):'—'}</div></div>
+    <div class="ms-st"><div class="lbl">上涨 / 下跌 / 平盘</div><div class="v">${m.up||0} / ${m.down||0} / ${m.flat||0}<span style="font-size:12px;color:var(--muted)"> · 停牌/无数据 ${m.na||0}</span></div></div>
+    <div class="ms-st"><div class="lbl">涨跌幅中位数</div><div class="v">${fmtPct(m.median_pct)}</div></div>
+    <div class="ms-st"><div class="lbl">全市场成交额</div><div class="v">${fmtAmount(m.total_amount)}</div></div>
+    <div class="ms-st"><div class="lbl">成交额变化</div><div class="v" style="color:${(m.amount_change||0)>0?'var(--ok)':(m.amount_change||0)<0?'var(--err)':'var(--text)'}">${m.amount_change!=null?fmtPct(m.amount_change):'—'}</div></div>
+    <div class="ms-st"><div class="lbl">站上 MA20</div><div class="v">${m.ma20_above||0} <span style="font-size:12px;color:var(--muted)">${mac!=null?mac+'%':''}</span></div></div>
+    <div class="ms-st"><div class="lbl">20 日新高 / 新低</div><div class="v">${hi20} / ${lo20}</div></div>`;
+  const tc=m.temp_components||{};
+  $('msNote').innerHTML='<span class="hint">温度构成：上涨家数占比 <b style="color:var(--text)">'+(tc.up_ratio!=null?tc.up_ratio:'—')+'</b>（40%） ｜ 站上 MA20 <b style="color:var(--text)">'+(tc.ma20_ratio!=null?tc.ma20_ratio:'—')+'</b>（40%） ｜ 20日新高-新低 <b style="color:var(--text)">'+(tc.highlow!=null?tc.highlow:'—')+'</b>（20%）　·　范围：普通股票，停牌/无数据不计入涨跌比例。仅描述市场状态，不构成买卖建议。</span>';
+}
+function fmtAmount(v){
+  if(v==null)return '—';
+  if(v>=1e12)return (v/1e12).toFixed(2)+' 万亿';
+  if(v>=1e8)return (v/1e8).toFixed(1)+' 亿';
+  if(v>=1e4)return (v/1e4).toFixed(0)+' 万';
+  return String(v);
+}
+function renderWidthCharts(m){
+  const hist=m.width_hist||[];
+  if(!hist.length){$('wchart1').innerHTML='<span class="hint">（暂无宽度历史）</span>';$('wchart2').innerHTML='';return}
+  const dates=hist.map(x=>String(x.date).slice(4));
+  const c1=echarts.init($('wchart1'),'dark');c1.clear();
+  window._wchart1=c1;
+  c1.setOption({
+    backgroundColor:'transparent',
+    tooltip:{trigger:'axis'},
+    legend:{right:4,top:0,textStyle:{color:'#8FA2BC',fontSize:11}},
+    grid:{left:44,right:12,top:28,bottom:22},
+    xAxis:{type:'category',data:dates,axisLabel:{color:'#8FA2BC',fontSize:10}},
+    yAxis:{type:'value',max:1,axisLabel:{formatter:v=>(v*100)+'%',color:'#8FA2BC',fontSize:10},splitLine:{lineStyle:{color:'#162238'}}},
+    series:[
+      {name:'上涨占比',type:'line',data:hist.map(x=>x.up_ratio),smooth:true,showSymbol:false,lineStyle:{width:1.5,color:'#F87171'}},
+      {name:'站上MA20',type:'line',data:hist.map(x=>x.ma20_ratio),smooth:true,showSymbol:false,lineStyle:{width:1.5,color:'#38BDF8'}}
+    ]
+  });
+  const c2=echarts.init($('wchart2'),'dark');c2.clear();
+  window._wchart2=c2;
+  c2.setOption({
+    backgroundColor:'transparent',
+    tooltip:{trigger:'axis'},
+    legend:{right:4,top:0,textStyle:{color:'#8FA2BC',fontSize:11}},
+    grid:[{left:50,right:12,top:28,height:'55%'},{left:50,right:12,top:'72%',height:'22%'}],
+    xAxis:[{type:'category',data:dates,axisLabel:{color:'#8FA2BC',fontSize:10}},
+           {type:'category',gridIndex:1,data:dates,axisLabel:{show:false}}],
+    yAxis:[{type:'value',axisLabel:{formatter:v=>v>=1e8?((v/1e8)+'亿'):v,color:'#8FA2BC',fontSize:10},splitLine:{lineStyle:{color:'#162238'}}},
+           {gridIndex:1,type:'value',splitLine:{show:false},axisLabel:{color:'#8FA2BC',fontSize:10}}],
+    series:[
+      {name:'成交额',type:'bar',data:hist.map(x=>x.amount),itemStyle:{color:'#38BDF8',opacity:.7}},
+      {name:'20日新高',type:'line',xAxisIndex:1,yAxisIndex:1,data:hist.map(x=>x.high20),showSymbol:false,lineStyle:{width:1,color:'#22C55E'}},
+      {name:'20日新低',type:'line',xAxisIndex:1,yAxisIndex:1,data:hist.map(x=>x.low20),showSymbol:false,lineStyle:{width:1,color:'#EF4444'}}
+    ]
+  });
+}
+
+async function loadFactors(){
+  _rsFactorLoaded=true;
+  const factor=$('fFactor').value,scope=$('fScope').value,order=$('fOrder').value;
+  const limit=$('fLimit').value,q=$('fSearch').value.trim();
+  try{
+    const d=await j('/api/research/factors?factor='+factor+'&scope='+scope+'&order='+order+'&limit='+limit+(q?'&q='+encodeURIComponent(q):''));
+    if(d.error){$('fBody').innerHTML='<tr><td colspan="9" class="hint">'+esc(d.error)+'</td></tr>';$('fCards').innerHTML='';return}
+    _stockRows=d.rows||[];
+    $('fThVal').textContent='因子值（'+(FACTOR_LABEL[factor]||factor)+'）';
+    const meta=d.meta&&d.meta[factor];
+    $('fMeta').textContent=meta?('公式：'+meta.formula):'';
+    $('fStatus').textContent='数据日期 '+d.date+' · 共 '+(d.total||0)+' 只';
+    const rows=d.rows||[];
+    $('fBody').innerHTML=rows.map((r,i)=>factorRow(r,i)).join('')||'<tr><td colspan="9" class="hint">（无匹配结果）</td></tr>';
+    $('fCards').innerHTML=rows.map(factorCard).join('')||'<div class="hint">（无匹配结果）</div>';
+  }catch(e){$('fBody').innerHTML='<tr><td colspan="9" class="hint">加载失败: '+esc(e)+'</td></tr>'}
+}
+function fmtNum(v,n){return v==null?'—':Number(v).toFixed(n!=null?n:2)}
+function fmtPctShort(v){return v==null?'—':(v>0?'+':'')+(v*100).toFixed(2)+'%'}
+function factorRow(r,i){
+  const f=$('fFactor').value;
+  const val=f==='vr520'?fmtNum(r[f],2):fmtPctShort(r[f]);
+  const pct=r[f+'_pct'];
+  return `<tr class="hr-row" onclick="loadStockByCode('${r.code}')">
+    <td>${r.rank!=null?r.rank:i+1}</td><td>${esc(r.code)}</td><td>${esc(r.name)}</td>
+    <td style="font-weight:700">${val}</td>
+    <td>${pct!=null?Math.round(pct)+'%':'—'}</td>
+    <td style="color:${(r.pct_chg||0)>0?'var(--ok)':(r.pct_chg||0)<0?'var(--err)':'var(--muted)'}">${fmtPct(r.pct_chg)}</td>
+    <td>${fmtNum(r.close)}</td>
+    <td>${fmtPctShort(r.mom20)}</td>
+    <td>${fmtNum(r.vol20!=null?r.vol20*100:null,1)+'%'}</td></tr>`;
+}
+function factorCard(r){
+  const f=$('fFactor').value;
+  const val=f==='vr520'?fmtNum(r[f],2):fmtPctShort(r[f]);
+  return `<div class="f-card" onclick="loadStockByCode('${r.code}')">
+    <div class="r1"><span style="font-weight:700">${r.rank!=null?r.rank:i+1}. ${esc(r.name)} ${esc(r.code)}</span><span style="font-weight:700;color:var(--brand)">${val}</span></div>
+    <div class="r2"><span>分位 ${r[f+'_pct']!=null?Math.round(r[f+'_pct'])+'%':'—'}</span><span style="color:${(r.pct_chg||0)>0?'var(--ok)':(r.pct_chg||0)<0?'var(--err)':'var(--muted)'}">${fmtPct(r.pct_chg)}</span><span>收盘 ${fmtNum(r.close)}</span></div>
+  </div>`;
+}
+function rebuildResearch(){
+  if(!confirm('重新计算全市场因子？（后台执行，可能耗时数分钟）'))return;
+  try{
+    j('/api/research/rebuild',{method:'POST'}).then(r=>{toast(r.msg||'已启动');loadResearchStatus()});
+  }catch(e){toast('启动失败: '+e)}
+}
+
+// 个股研究
+function loadStockByCode(code){
+  $('rsCode').value=code;
+  $('rsMsg').textContent='';
+  const det=$('rsDetail');det.style.display='block';
+  $('rsEmpty').style.display='none';
+  const el=$('rsDetail').closest('.card');
+  if(el)el.scrollIntoView({behavior:'smooth',block:'start'});
+  loadStock();
+}
+async function loadStock(){
+  const code=$('rsCode').value.trim();
+  if(!code||!/^\d{6}$/.test(code)){$('rsMsg').textContent='请输入 6 位代码';return}
+  $('rsMsg').textContent='加载中…';
+  try{
+    const d=await j('/api/research/stock?code='+code);
+    if(d.error){$('rsMsg').textContent=d.error;return}
+    $('rsMsg').textContent='';
+    renderStock(d);
+  }catch(e){$('rsMsg').textContent='加载失败: '+e}
+}
+function renderStock(d){
+  $('rsName').textContent=d.name+' '+d.code;
+  $('rsDate').textContent=fmtYMD(d.date);
+  $('rsPx').innerHTML=fmtNum(d.close)+' <span style="color:'+pctCls(d.pct_chg)+';font-size:13px">'+fmtPct(d.pct_chg)+'</span>';
+  $('rsVol').textContent=(d.volume!=null?fmtAmount(d.volume)+' / ':'—')+(d.amount!=null?fmtAmount(d.amount):'');
+  const f=d.factors||{},p=d.percentiles||{};
+  const items=[
+    ['20 日动量',fmtPctShort(f.mom20),p.mom20_pct],
+    ['20 日波动率',f.vol20!=null?(f.vol20*100).toFixed(1)+'%':'—',p.vol20_pct],
+    ['5/20 日量比',fmtNum(f.vr520,2),p.vr520_pct],
+    ['60 日回撤',fmtPctShort(f.dd60),p.dd60_pct],
+  ];
+  $('rsFactors').innerHTML=items.map(([l,v,pc])=>`<div class="rs-it"><div class="lbl">${l}</div><div class="v">${v}<span class="hint" style="font-size:11px">${pc!=null?' 分位 '+Math.round(pc)+'%':'（分位计算中）'}</span></div></div>`).join('');
+  window._rsStock={code:d.code,trend:d.trend||[],klines:d.klines||[]};
+  renderStockKline();
+  renderTrend();
+}
+let kchart=null;
+function renderStockKline(){
+  if(!window._rsStock)return;
+  const rows=window._rsStock.klines||[];
+  const months=parseInt($('rsMonths').value||'3');
+  const cut=rows.length-months*21;
+  const k=rows.slice(Math.max(0,cut));
+  if(!k.length){return}
+  const dates=k.map(r=>String(r.date)),closes=k.map(r=>+r.close);
+  const kd=k.map(r=>[+r.open,+r.close,+r.low,+r.high]);
+  const showMA=$('rsMA').checked;
+  const series=[
+    {name:'K线',type:'candlestick',data:kd,
+     itemStyle:{color:'#F87171',color0:'#4ADE80',borderColor:'#F87171',borderColor0:'#4ADE80'}},
+    {name:'成交量',type:'bar',xAxisIndex:1,yAxisIndex:1,data:k.map(r=>r.volume||0),itemStyle:{color:'#38BDF8'}}
+  ];
+  if(showMA){
+    series.push({name:'MA5',type:'line',data:ma(closes,5),smooth:true,showSymbol:false,lineStyle:{width:1,color:'#FBBF24'}});
+    series.push({name:'MA20',type:'line',data:ma(closes,20),smooth:true,showSymbol:false,lineStyle:{width:1,color:'#A78BFA'}});
+    series.push({name:'MA60',type:'line',data:ma(closes,60),smooth:true,showSymbol:false,lineStyle:{width:1,color:'#8FA2BC'}});
+  }
+  if(!kchart)kchart=echarts.init($('kchart'),'dark');
+  kchart.setOption({
+    backgroundColor:'transparent',
+    title:{text:window._rsStock.code+' 日K（不复权）',left:8,top:4,textStyle:{fontSize:13,color:'#8FA2BC'}},
+    tooltip:{trigger:'axis',axisPointer:{type:'cross'}},
+    legend:{right:8,top:4,textStyle:{color:'#8FA2BC',fontSize:11}},
+    grid:[{left:56,right:14,top:34,height:'60%'},{left:56,right:14,top:'74%',height:'18%'}],
+    xAxis:[{type:'category',data:dates,axisLine:{lineStyle:{color:'#1E2C45'}}},
+           {type:'category',gridIndex:1,data:dates,axisLabel:{show:false},axisLine:{lineStyle:{color:'#1E2C45'}}}],
+    yAxis:[{scale:true,splitLine:{lineStyle:{color:'#162238'}}},
+           {gridIndex:1,splitNumber:2,axisLabel:{show:false},splitLine:{show:false}}],
+    dataZoom:[{type:'inside',xAxisIndex:[0,1],start:30,end:100}],
+    series
+  });
+}
+let _tchart=null;
+function renderTrend(){
+  if(!window._rsStock)return;
+  const t=window._rsStock.trend||[];
+  if(!t.length)return;
+  const dates=t.map(x=>String(x.date).slice(4));
+  if(!_tchart)_tchart=echarts.init($('tchart'),'dark');
+  _tchart.setOption({
+    backgroundColor:'transparent',
+    tooltip:{trigger:'axis'},
+    legend:{right:4,top:0,textStyle:{color:'#8FA2BC',fontSize:11}},
+    grid:{left:44,right:12,top:26,bottom:22},
+    xAxis:{type:'category',data:dates,axisLabel:{color:'#8FA2BC',fontSize:10}},
+    yAxis:[{type:'value',scale:true,axisLabel:{color:'#8FA2BC',fontSize:10},splitLine:{lineStyle:{color:'#162238'}}},
+           {type:'value',scale:true,axisLabel:{color:'#8FA2BC',fontSize:10},splitLine:{show:false}}],
+    series:[
+      {name:'20日动量',type:'line',data:t.map(x=>x.mom20),showSymbol:false,lineStyle:{width:1.5,color:'#38BDF8'}},
+      {name:'20日波动率',type:'line',yAxisIndex:1,data:t.map(x=>x.vol20),showSymbol:false,lineStyle:{width:1.5,color:'#F59E0B'}}
+    ]
+  });
+}
+function ma(data,n){return data.map((v,i)=>i<n-1?null:+((data.slice(i-n+1,i+1).reduce((a,b)=>a+b,0)/n).toFixed(3)))}
+
 function fmtUptime(iso){
   try{
     const s=new Date(iso),t=Date.now();
@@ -1886,6 +2847,12 @@ async function toggleContainerLogs(){
   }catch(e){pre.textContent='读取失败: '+e}
 }
 setInterval(()=>{if($('syncProgress')&&$('syncProgress').style.display==='block'&&window._syncStarted){$('progElapsed').textContent='已运行 '+fmtDur(Date.now()/1000-window._syncStarted)}},1000);
+window.addEventListener('resize',()=>{
+  if(window._wchart1)window._wchart1.resize();
+  if(window._wchart2)window._wchart2.resize();
+  if(kchart)kchart.resize();
+  if(_tchart)_tchart.resize();
+});
 refresh();setInterval(()=>refresh(),4000);
 </script></body></html>"""
 
@@ -1927,6 +2894,14 @@ class Handler(BaseHTTPRequestHandler):
                 self._query()
             elif path == "/api/container/logs":
                 self._container_logs()
+            elif path == "/api/research/status":
+                self._research_status()
+            elif path == "/api/research/market":
+                self._research_market()
+            elif path == "/api/research/factors":
+                self._research_factors()
+            elif path == "/api/research/stock":
+                self._research_stock()
             else:
                 self._send(404, json.dumps({"error": "not found"}))
         except Exception as exc:
@@ -1952,6 +2927,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._sync()
             elif path == "/api/container/restart":
                 self._container_restart()
+            elif path == "/api/research/rebuild":
+                self._research_rebuild()
             else:
                 self._send(404, json.dumps({"error": "not found"}))
         except Exception as exc:
@@ -2056,6 +3033,93 @@ class Handler(BaseHTTPRequestHandler):
     def _health(self):
         self._send(200, json.dumps(health_status(), ensure_ascii=False))
 
+    # ---- 市场研究 API ----
+    def _research_status(self):
+        self._send(200, json.dumps(research_status(), ensure_ascii=False))
+
+    def _research_market(self):
+        self._send(200, json.dumps(research_market(), ensure_ascii=False))
+
+    def _research_factors(self):
+        q = parse_qs(urlparse(self.path).query)
+        factor = q.get("factor", ["mom20"])[0]
+        scope = q.get("scope", ["stock"])[0]
+        order = q.get("order", ["desc"])[0]
+        limit = q.get("limit", ["50"])[0]
+        search = q.get("q", [""])[0]
+        try:
+            limit_i = int(limit)
+        except (TypeError, ValueError):
+            limit_i = 50
+        result = research_factors(factor, scope, order, limit_i, search)
+        code = 200 if "error" not in result else 400
+        self._send(code, json.dumps(result, ensure_ascii=False))
+
+    def _research_stock(self):
+        q = parse_qs(urlparse(self.path).query)
+        code = q.get("code", [""])[0].strip()
+        if not code or not (code.isdigit() and len(code) == 6):
+            self._send(400, json.dumps({"error": "缺少或非法 code（需 6 位数字）"}))
+            return
+        # 个股研究：直连 stockdb 实时查询（单股，快），不依赖全市场缓存
+        import urllib.request, urllib.parse
+        from datetime import datetime as _dt, timedelta as _td
+        today = _dt.now()
+        months = _month_prefixes((today - _td(days=190)).strftime("%Y%m%d"),
+                                 today.strftime("%Y%m%d"))
+        rows = []
+        for prefix in months:
+            try:
+                url = f"http://{STOCKDB_HOST}:{STOCKDB_PORT}/?cmd=vals&t={urllib.parse.quote(f'日k:{code}:{prefix}*')}"
+                with urllib.request.urlopen(url, timeout=15) as resp:
+                    data = json.loads(resp.read().decode("utf-8", "replace"))
+                rows.extend(r for r in data if isinstance(r, dict))
+            except Exception:
+                continue
+        if not rows:
+            self._send(404, json.dumps({"error": f"未找到 {code} 的日K数据"}, ensure_ascii=False))
+            return
+        rows.sort(key=_bar_date)
+        bars = rows[-140:]  # 最近约 7 个月，足够 60 日回撤
+        factors = compute_factors(bars)
+        name = _stock_name(bars, code)
+        close = bars[-1].get("close")
+        pct = bars[-1].get("pct_chg")
+        latest_date = _bar_date(bars[-1])
+        # 最新日K明细（K线图表用）
+        krows = [{"date": b.get("date"), "open": b.get("open"), "close": b.get("close"),
+                  "high": b.get("high"), "low": b.get("low"), "volume": b.get("volume")}
+                 for b in bars]
+        # 因子走势（近60日 20日动量 / 20日波动率）
+        trend = []
+        for i in range(max(0, len(bars) - 60), len(bars)):
+            seg = bars[:i + 1]
+            trend.append({"date": bars[i].get("date"),
+                          "mom20": _factor_mom20(seg), "vol20": _factor_vol20(seg)})
+        # 全市场分位（读因子缓存；构建中则返回 None）
+        snap = _load_snapshot("factor_snapshot_")
+        pcts = {}
+        if snap:
+            for r in snap["codes"]:
+                if r.get("code") == code:
+                    pcts = {"mom20_pct": r.get("mom20_pct"), "vol20_pct": r.get("vol20_pct"),
+                            "vr520_pct": r.get("vr520_pct"), "dd60_pct": r.get("dd60_pct")}
+                    break
+        self._send(200, json.dumps({
+            "code": code, "name": name, "date": str(latest_date), "close": close,
+            "pct_chg": pct, "volume": bars[-1].get("volume"),
+            "amount": bars[-1].get("amount"),
+            "factors": factors, "percentiles": pcts,
+            "klines": krows, "trend": trend,
+        }, ensure_ascii=False))
+
+    def _research_rebuild(self):
+        if _research_build["state"] == "building":
+            self._send(200, json.dumps({"msg": "正在计算中，已忽略重复请求"}))
+            return
+        started = _start_research_build()
+        self._send(200, json.dumps({"msg": "已启动重新计算" if started else "计算任务已在运行中"}))
+
     def _watchlist(self):
         q = parse_qs(urlparse(self.path).query)
         action = q.get("action", [""])[0]
@@ -2129,6 +3193,7 @@ def main():
     print(f"stockdb: {STOCKDB_HOST}:{STOCKDB_PORT} | container: {STOCKDB_CONTAINER} | data: {DATA_DIR}",
           file=sys.stderr)
     threading.Thread(target=scheduler_loop, daemon=True).start()
+    threading.Thread(target=research_check_loop, daemon=True).start()
     ThreadingHTTPServer(("0.0.0.0", LISTEN_PORT), Handler).serve_forever()
 
 
