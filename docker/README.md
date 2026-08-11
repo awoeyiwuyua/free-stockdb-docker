@@ -12,7 +12,7 @@ NAS 拉取时自动匹配自身 CPU 架构。
 | 文件 | 作用 |
 |------|------|
 | `Dockerfile` | 多阶段：下载官方发布包 + SHA256 校验 + 静态二进制打包进 alpine |
-| `docker-compose.yml` | `stockdb` 服务（常驻）+ `stockdb-sync`（一次性增量同步，sync profile） |
+| `docker-compose.yml` | `stockdb` 服务（常驻）+ `stockdb-sync`（一次性增量同步，sync profile）+ `webui/`（自建管理台，行情查询+一键同步） |
 | `stockdb.conf` | 容器内配置模板：`server.ip: 0.0.0.0`（默认 127.0.0.1，容器内必须改才能映射）；pidfile/log 绝对路径落 `/data` 卷；首次启动拷到 `/data/stockdb.conf` 供编辑 |
 | `entrypoint.sh` | 容器入口：切到 `/data` 可写卷 → 拷贝 conf/sync_url 模板 → 以绝对路径 conf 启动 `stockdb`（发行版要求 `stockdb /path/to/conf`） |
 | `sync.sh` | 同步封装：切到 `/data` → 读 `/data/sync_url.txt` 数据源 → 运行 `数据更新` 增量同步 |
@@ -45,12 +45,25 @@ docker build -t ghcr.io/awoeyiwuyua/free-stockdb:0.3.1 .
 ### 3. 极空间部署
 1. 极空间 Docker → 项目 → 新建 → 上传/粘贴 `docker-compose.yml`，项目目录建议 `/vol1/docker/stockdb/`
 2. compose 会在项目目录下自动创建 `data/`、`mydb/`、`log/` 子目录（数据持久化）
-3. **首次同步数据**（断点续传，一次可能数 GB，需较长时间，可反复运行）：
+3. **首次同步数据**（断点续传，一次可能数 GB，需较长时间，可反复运行）——二选一：
+
+   **A. 有主机终端**（SSH / Docker 项目终端，同步须停服务）：
    ```bash
+   docker compose stop stockdb
    docker compose --profile sync run --rm stockdb-sync
-   # 重复运行，直到输出不再出现新的下载文件为止
+   docker compose start stockdb
    ```
-4. 启动服务：
+
+   **B. 无主机终端（只有图形界面）——容器 sync-first 模式（推荐给极空间）**：
+   - 极空间 Docker → 项目 → stockdb 容器 → **编辑环境变量**，加 `STOCKDB_SYNC_FIRST=1`
+   - **重启容器**：容器启动时先自动增量同步（此时服务未起，满足"同步须停服务"），
+     同步完成后自动启动服务
+   - 首次同步数 GB：**同步期间容器显示"运行中"但端口未监听属正常**，耐心等待；
+     中途中断可再次重启续传
+   - 同步完成后可删除该变量（或保留：每次重启都自动增量同步，数据保持最新，
+     只是启动多花几分钟）
+
+4. 启动服务（方式 A 已含；方式 B 重启容器即完成同步+启动）：
    ```bash
    docker compose up -d stockdb
    ```
@@ -112,9 +125,9 @@ docker compose pull && docker compose up -d
 
 ## 后续扩展（本版不启用，需求浮现后再加）
 
-- **Web UI**：官方 `数据网页版.html`（改 `API_BASE` 指向 `http://<NAS_IP>:7899/`）或自建前端，做成独立容器只调 7899，与 stockdb 解耦
 - **AI MCP 容器化**：官方 `调用方式/ai_mcp/stockdb_full_mcp.py`（需容器带 Python + pybao C 扩展），或继续用本仓库 `scripts/stockdb_mcp_server.py`（HTTP 只读，NAS 部署后改 `STOCKDB_HOST` 即可，无需容器化）
-- **定时同步**：极空间计划任务，或容器内 cron（需在镜像里加 cron 包）
+- **webui 增强**：当前 webui 是纯标准库最小版（状态+同步+查询代理）；如需 K 线图表/多周期视图，在 `docker/webui/app.py` 的页面里扩展（ECharts 静态引入即可，无需后端框架）
+- **定时同步**：极空间计划任务，或 webui 内加定时（后续版本）
 
 ## 风险与备忘
 

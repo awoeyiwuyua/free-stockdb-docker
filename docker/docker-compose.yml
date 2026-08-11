@@ -27,9 +27,11 @@ services:
       - ./log:/opt/stockdb/log
     environment:
       TZ: Asia/Shanghai
-    # 可选：如需自定义同步源或额外服务端参数
+      # 极空间无终端场景：把下面这行取消注释并设为 1，容器启动时会先增量同步
+      # 再启动服务（首次部署/日常更新数据 = 界面改这里 + 重启容器）：
+      # STOCKDB_SYNC_FIRST: "1"
+    # 可选：自定义同步源或额外参数
     #  - STOCKDB_SYNC_CONFIG=/data/sync_url.txt
-    #  - STOCKDB_EXTRA_ARGS=
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- 'http://127.0.0.1:7899/?cmd=get&t=股票代码' >/dev/null 2>&1 || exit 1"]
       interval: 60s
@@ -55,6 +57,28 @@ services:
       TZ: Asia/Shanghai
     command: ["/opt/stockdb/sync.sh"]
     restart: "no"
+    networks:
+      - stockdb-net
+
+  # webui 管理台：行情查询 + 一键同步（挂载 docker socket 以操控 stockdb 容器）
+  # 极空间无终端时，日常更新数据 = 浏览器打开 http://<NAS_IP>:8080 点「开始同步」
+  webui:
+    image: ghcr.io/awoeyiwuyua/free-stockdb-webui:0.1.0
+    container_name: stockdb-webui
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/data
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      TZ: Asia/Shanghai
+      STOCKDB_HOST: stockdb
+      STOCKDB_PORT: "7899"
+      STOCKDB_CONTAINER: stockdb
+      # WEBUI_TOKEN: 设置后网页「开始同步」需填写令牌（局域网部署可不设）
+    depends_on:
+      - stockdb
     networks:
       - stockdb-net
 
