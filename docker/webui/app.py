@@ -39,7 +39,8 @@ LISTEN_PORT = int(os.environ.get("WEBUI_PORT", "8080"))
 
 # 同步线程状态
 _sync_lock = threading.Lock()
-_sync_state = {"running": False, "exit_code": None, "last_start": None, "last_end": None}
+_sync_state = {"running": False, "exit_code": None, "last_start": None, "last_end": None,
+               "phase": "idle"}  # phase: idle/stopping/syncing/verifying/restarting/done
 _last_sync_stdout: str = ""          # 最近一次同步的 stdout（供解析下载/删除数）
 _last_verify_result: str | None = None  # 最近一次完整性验证结果（pass/fail/跳过）
 _scheduler_alive = False             # 定时线程心跳（每次循环更新时间戳）
@@ -74,7 +75,46 @@ def append_history(entry: dict) -> None:
 
 
 def _default_schedule() -> dict:
-    return {"enabled": False, "times": ["15:30"], "last_trigger": None, "next_trigger": None}
+    return {"enabled": False, "times": ["15:30"], "trading_only": True,
+            "last_trigger": None, "next_trigger": None}
+
+
+# ==================== A 股交易日历（休市日表，数据截至 2026 年） ====================
+# 来源：exchange_calendars 的 XSHG 日历（https://github.com/gerrymanoim/exchange_calendars）
+# 取值规则：每个年份「周一~周五但非交易日」的日期（官方调休安排：春节/国庆/元旦/清明/五一/端午/中秋，
+# 以及部分周六周日调休补班的 0 个或 1 个非交易日，均已折算进工作日的缺失）。
+# 提取脚本：docker/webui/scripts/extract_xshg_holidays.py（仅维护期使用，不随 webui 运行）。
+# 注意：XSHG 日历发布滞后（2027 官方安排通常 2026 年底公布），未收录年份按"工作日=交易日"处理，
+# 数据截至年份后请在日志提示更新。
+XSHG_HOLIDAYS: dict[str, set[str]] = {
+    "2024": {"01-01", "02-09", "02-12", "02-13", "02-14", "02-15", "02-16",
+             "04-04", "04-05", "05-01", "05-02", "05-03", "06-10", "09-16", "09-17",
+             "10-01", "10-02", "10-03", "10-04", "10-07"},
+    "2025": {"01-01", "01-28", "01-29", "01-30", "01-31", "02-03", "02-04",
+             "04-04", "05-01", "05-02", "05-05", "06-02",
+             "10-01", "10-02", "10-03", "10-06", "10-07", "10-08"},
+    "2026": {"01-01", "01-02", "02-16", "02-17", "02-18", "02-19", "02-20", "02-23",
+             "04-06", "05-01", "05-04", "05-05", "06-19", "09-25",
+             "10-01", "10-02", "10-05", "10-06", "10-07"},
+}
+XSHG_HOLIDAYS_THROUGH = "2026-12-31"  # 休市表覆盖到的最后日期（用于到期提示）
+
+
+def is_trading_day(d=None) -> bool:
+    """A 股交易日判定：工作日 且 非休市表内日期。
+
+    未收录年份（休市表覆盖后）按"工作日=交易日"处理，并在日志提示更新。
+    供定时同步跳过周末/法定节假日触发用。
+    """
+    from datetime import datetime as _dt
+    d = d or _dt.now().date()
+    if d.weekday() >= 5:  # 周六/周日
+        return False
+    holidays = XSHG_HOLIDAYS.get(str(d.year))
+    if holidays is None:
+        log(f"⚠️ A股休市表未收录 {d.year} 年（数据截至 {XSHG_HOLIDAYS_THROUGH}），请更新 XSHG_HOLIDAYS")
+        return True  # 未知年份：工作日即视为交易日
+    return d.strftime("%m-%d") not in holidays
 
 
 def _normalize_times(times) -> list[str]:
@@ -94,7 +134,7 @@ def _normalize_times(times) -> list[str]:
 
 
 def load_schedule() -> dict:
-    """读定时配置；兼容旧格式 {enabled, time} → 迁移为 {enabled, times:[time]}。"""
+    """读定时配置；兼容旧格式 {enabled, time} → 迁移为 {enabled, times:[time], trading_only}。"""
     if not SCHEDULE_FILE.exists():
         return _default_schedule()
     try:
@@ -110,14 +150,16 @@ def load_schedule() -> dict:
     return {
         "enabled": bool(data.get("enabled")),
         "times": _normalize_times(times),
+        "trading_only": bool(data.get("trading_only", True)),
         "last_trigger": last,
         "next_trigger": compute_next_trigger(_normalize_times(times)),
     }
 
 
-def save_schedule(enabled: bool, times) -> dict:
+def save_schedule(enabled: bool, times, trading_only: bool = True) -> dict:
     """保存定时配置（保留 last_trigger，不因改配置而清空触发记录）。"""
-    cfg = {"enabled": bool(enabled), "times": _normalize_times(times)}
+    cfg = {"enabled": bool(enabled), "times": _normalize_times(times),
+           "trading_only": bool(trading_only)}
     if not cfg["times"]:
         raise RuntimeError("至少需要一个合法时间点（HH:MM）")
     try:
@@ -136,23 +178,26 @@ def save_schedule(enabled: bool, times) -> dict:
     return cfg
 
 
-def _mark_schedule_triggered(key: str) -> None:
+def _mark_schedule_triggered(key: str, retry: bool = False) -> None:
     """记录某时间点已触发（防同一天重复触发），落盘。"""
     try:
         cfg = load_schedule()
-        cfg["last_trigger"] = {"key": key, "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "exit": None}
+        cfg["last_trigger"] = {"key": key, "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                               "exit": None, "retry": bool(retry)}
         cfg["next_trigger"] = compute_next_trigger(cfg["times"])
         SCHEDULE_FILE.write_text(json.dumps(cfg, ensure_ascii=False, indent=1), encoding="utf-8")
     except Exception as exc:
         log(f"⏰ 定时触发标记失败: {exc}")
 
 
-def _update_schedule_trigger_exit(exit_code) -> None:
-    """run_sync 结束后回填最近一次定时触发的 exit 码。"""
+def _update_schedule_trigger_exit(exit_code, retry: bool = False) -> None:
+    """run_sync 结束后回填最近一次定时触发的 exit 码（retry 记录随 last_trigger 保留）。"""
     try:
         cfg = load_schedule()
         if cfg["last_trigger"] and cfg["last_trigger"].get("exit") is None:
             cfg["last_trigger"]["exit"] = exit_code
+            if retry:
+                cfg["last_trigger"]["retry"] = True
             SCHEDULE_FILE.write_text(json.dumps(cfg, ensure_ascii=False, indent=1), encoding="utf-8")
     except Exception:
         pass
@@ -188,7 +233,12 @@ def parse_sync_counts(stdout: str) -> dict:
 
 
 def data_latest_date() -> str | None:
-    """数据最新交易日：查上证指数日K，取最大日期（近3月前缀，跨年安全）。"""
+    """全市场行情最新交易日（8位）：取平安银行 000001 日K 最大日期。
+
+    000001 每交易日都有行情，是可靠的"数据同步到哪天"探针；数据源本身
+    不含指数表，这里不代表上证指数点位（概览页大盘指数另行处理）。
+    近 3 月前缀通配，跨年安全。
+    """
     import urllib.request, urllib.parse
     from datetime import datetime as dt, timedelta
     today = dt.now()
@@ -344,17 +394,24 @@ def container_state() -> dict:
     """返回 stockdb 容器状态详情。
 
     {ok, status, note}：ok=False 表示 docker socket 不可用（热更新无法停/启容器）。
+    image/started 供系统页展示；查询失败时保持 None。
     """
     try:
         info = docker_request("GET", f"/containers/{STOCKDB_CONTAINER}/json")
     except FileNotFoundError:
-        return {"ok": False, "status": "unknown", "note": "docker socket 未挂载（/var/run/docker.sock 不可达），无法停/启容器"}
+        return {"ok": False, "status": "unknown", "note": "docker socket 未挂载（/var/run/docker.sock 不可达），无法停/启容器",
+                "image": None, "started": None}
     except PermissionError:
-        return {"ok": False, "status": "unknown", "note": "docker socket 权限不足，无法操控容器"}
+        return {"ok": False, "status": "unknown", "note": "docker socket 权限不足，无法操控容器",
+                "image": None, "started": None}
     except Exception as exc:
-        return {"ok": False, "status": "unknown", "note": f"docker 查询失败: {exc}"}
+        return {"ok": False, "status": "unknown", "note": f"docker 查询失败: {exc}",
+                "image": None, "started": None}
     st = info.get("State", {}).get("Status", "unknown")
-    return {"ok": True, "status": st, "note": ""}
+    cfg = info.get("Config", {}) or {}
+    started = (info.get("State", {}) or {}).get("StartedAt") or None
+    return {"ok": True, "status": st, "note": "",
+            "image": cfg.get("Image") or None, "started": started}
 
 
 def container_start() -> None:
@@ -375,16 +432,63 @@ def container_restart() -> None:
     docker_request("POST", f"/containers/{STOCKDB_CONTAINER}/restart")
 
 
+def container_logs(tail: int = 150) -> str:
+    """读取 stockdb 容器日志尾部。
+
+    Docker Engine logs API 默认返回多路复用帧（8 字节头 + payload），需解帧；
+    JSON 日志则返回纯文本行。返回去帧后的日志文本。
+    """
+    raw = docker_request("GET", f"/containers/{STOCKDB_CONTAINER}/logs?stdout=1&stderr=1&tail={tail}")
+    if not isinstance(raw, str):
+        raise RuntimeError("docker logs 返回非文本")
+    if isinstance(raw, str) and not raw:
+        return ""
+    data = raw.encode("utf-8", "replace")
+    out = bytearray()
+    i = 0
+    n = len(data)
+    try:
+        while i + 8 <= n:
+            if data[i] > 2:  # 非帧头（0/1/2），按纯文本处理
+                out.extend(data[i:])
+                break
+            size = int.from_bytes(data[i + 4:i + 8], "big")
+            i += 8
+            out.extend(data[i:i + size])
+            i += size
+        if i < n and data[i] <= 2 and i + 8 > n:  # 尾部残帧
+            out.extend(data[i:])
+    except Exception:
+        pass
+    text = bytes(out).decode("utf-8", "replace")
+    return "\n".join(line for line in text.splitlines() if line.strip())
+
+
 # ==================== 同步任务（后台线程） ====================
-def _verify_data() -> list[str]:
-    """同步后完整性验证：股票代码总数 + 抽样日K/分钟K/复权。返回异常列表（空=通过）。"""
+def _verify_data(expected_date: str | None = None) -> list[str]:
+    """同步后完整性验证。
+
+    expected_date：同步前抓取的全市场最新交易日（8位）。同步后抽样股票的
+    最新 bar 日期须 ≥ expected_date 才算同步生效——镜像停在旧日期时不会误报，
+    也不会随时间推移退化成"验证某一天有没有数据"。
+    返回异常列表（空=通过）。
+    """
     problems = []
     try:
         import urllib.request, urllib.parse
+        from datetime import datetime as _dt, timedelta as _td
+        today = _dt.now()
+        months = _month_prefixes(
+            (today - _td(days=95)).strftime("%Y%m%d"), today.strftime("%Y%m%d")
+        )
         def q(table: str) -> str:
             url = f"http://{STOCKDB_HOST}:{STOCKDB_PORT}/?cmd=get&t={urllib.parse.quote(table)}"
             with urllib.request.urlopen(url, timeout=15) as resp:
                 return resp.read().decode("utf-8", "replace")
+        def vals(table: str) -> list:
+            url = f"http://{STOCKDB_HOST}:{STOCKDB_PORT}/?cmd=vals&t={urllib.parse.quote(table)}"
+            with urllib.request.urlopen(url, timeout=15) as resp:
+                return json.loads(resp.read().decode("utf-8", "replace"))
         codes_raw = q("股票代码")
         try:
             codes = json.loads(codes_raw)
@@ -394,12 +498,18 @@ def _verify_data() -> list[str]:
         except Exception:
             problems.append("股票代码解析失败")
         # 抽样 3 只不同板块：沪市 600633 / 深市 000001 / 创业板 300750
+        exp = int(expected_date or 0)
         for code in ("600633", "000001", "300750"):
             try:
-                raw = q(f"日k:{code}:20260810")
-                d = json.loads(raw)
-                if isinstance(d, dict) and d.get("close") is None:
-                    problems.append(f"{code} 日K 数据缺失")
+                dates = []
+                for prefix in months:
+                    for row in vals(f"日k:{code}:{prefix}*"):
+                        if isinstance(row, dict) and row.get("date"):
+                            dates.append(int(row["date"]))
+                if not dates:
+                    problems.append(f"{code} 日K 无数据")
+                elif exp and max(dates) < exp:
+                    problems.append(f"{code} 最新 {max(dates)}，早于同步前基准 {exp}（同步未生效）")
             except Exception as exc:
                 problems.append(f"{code} 日K 查询失败: {exc}")
     except Exception as exc:
@@ -407,7 +517,7 @@ def _verify_data() -> list[str]:
     return problems
 
 
-def run_sync(hot: bool = True, trigger: str = "manual") -> None:
+def run_sync(hot: bool = True, trigger: str = "manual", retry: bool = False) -> None:
     """同步数据。串行执行，防并发点击。
 
     hot=True（默认，热更新）：不停服务直接增量同步——同步器下载到 .part 临时文件、
@@ -417,21 +527,31 @@ def run_sync(hot: bool = True, trigger: str = "manual") -> None:
 
     hot=False（严格模式）：按官方要求先停服务 → 同步 → 重启，作为兜底。
 
-    trigger=manual|scheduled：记录触发来源（手动按钮 / 定时线程），
-    写入同步历史，便于回看"某次同步是不是定时自动跑的"。
+    trigger=manual|scheduled|scheduled-retry：记录触发来源（手动按钮 / 定时线程 /
+    定时失败后的自动重试），写入同步历史，便于回看"某次同步是不是定时自动跑的"。
     """
     if not _sync_lock.acquire(blocking=False):
         return  # 已在同步中
     _sync_state.update(running=True, exit_code=None, last_start=time.time(), last_end=None,
-                       trigger=trigger)
+                       trigger=trigger, phase="stopping" if not hot else "syncing")
     global _last_sync_stdout, _last_verify_result
     _last_sync_stdout = ""
     _last_verify_result = None
     try:
-        log(f"=== 同步开始 {now()}（{'热更新' if hot else '严格模式(停服)'}｜{'定时' if trigger == 'scheduled' else '手动'}）===")
+        log(f"=== 同步开始 {now()}（{'热更新' if hot else '严格模式(停服)'}｜{'定时' if trigger.startswith('scheduled') else '手动'}{'·重试' if retry else ''}）===")
+
+        # 0. 同步前抓全市场最新交易日（作为同步后验证基准）
+        before_date = None
+        try:
+            before_date = data_latest_date()
+            if before_date:
+                log(f"→ 同步前数据最新交易日：{before_date}")
+        except Exception:
+            pass
 
         # 1.（严格模式）停 stockdb；热更新模式不停
         if not hot:
+            _sync_state["phase"] = "stopping"
             log("→ 停止 stockdb 容器 ...")
             try:
                 if container_state().get("status") == "running":
@@ -450,6 +570,7 @@ def run_sync(hot: bool = True, trigger: str = "manual") -> None:
                 log(f"→ 热更新：stockdb 状态 {st['status']}（{st['note']}），仍继续同步 ...")
 
         # 2. 同步数据（同步器读当前目录 sync_url.txt / stockdb.conf）
+        _sync_state["phase"] = "syncing"
         log("→ 运行 数据更新（增量同步，断点续传）...")
         cfg = DATA_DIR / "sync_url.txt"
         if not cfg.exists():
@@ -474,8 +595,9 @@ def run_sync(hot: bool = True, trigger: str = "manual") -> None:
         # 3. 热更新模式：验证数据完整性（此时 stockdb 仍在运行）
         if hot:
             if proc.returncode == 0:
+                _sync_state["phase"] = "verifying"
                 log("→ 热更新完成，验证数据完整性 ...")
-                problems = _verify_data()
+                problems = _verify_data(before_date)
                 if problems:
                     _last_verify_result = "fail"
                     log(f"  ⚠️ 完整性验证未通过：{problems}")
@@ -501,6 +623,7 @@ def run_sync(hot: bool = True, trigger: str = "manual") -> None:
 
         # 4.（严格模式）重启服务；热更新若中途发现服务没跑也补启
         if not hot:
+            _sync_state["phase"] = "restarting"
             log("→ 启动 stockdb 容器 ...")
             try:
                 container_start()
@@ -508,6 +631,7 @@ def run_sync(hot: bool = True, trigger: str = "manual") -> None:
             except Exception as exc:
                 log(f"  ❌ 启动失败：{exc}")
         elif container_state().get("status") in ("exited", "not-found"):
+            _sync_state["phase"] = "restarting"
             log("→ 热更新收尾：stockdb 未在运行，尝试启动 ...")
             try:
                 container_start()
@@ -536,12 +660,13 @@ def run_sync(hot: bool = True, trigger: str = "manual") -> None:
                 if _sync_state.get("last_start") else None,
                 "data_latest": data_latest_date(),
             })
-            if _sync_state.get("trigger") == "scheduled":
-                _update_schedule_trigger_exit(_sync_state.get("exit_code"))
+            if _sync_state.get("trigger", "").startswith("scheduled"):
+                _update_schedule_trigger_exit(_sync_state.get("exit_code"), retry=retry)
         except Exception:
             pass
         _sync_state["running"] = False
         _sync_state["last_end"] = time.time()
+        _sync_state["phase"] = "done"
         _sync_lock.release()
 
 
@@ -570,6 +695,12 @@ def scheduler_loop() -> None:
       对每个配置时间点 t：当前分钟 >= t 且 今天该点还没触发过（key=today+t）→ 触发。
     即使某次轮询落在 t 分钟之后，只要当天未触发过且未到第二天，仍会触发；
     触发后 key 落盘（容器重启不重复触发）。
+
+    trading_only（默认开）：非交易日不触发。严格交易日判定见 is_trading_day()
+    （工作日排除 A 股法定休市；周末直接跳过）。休市日当天到点仅日志说明，不触发。
+
+    失败自动重试：定时同步退出码非 0 时，安排一次补触发（约 10 分钟后），
+    当日每个时间点最多重试一次；重试仍失败则不再重试，历史可查（trigger=定时·重试）。
     """
     global _scheduler_alive
     while True:
@@ -581,9 +712,11 @@ def scheduler_loop() -> None:
                 today_key = now.strftime("%Y-%m-%d")
                 now_hm = now.strftime("%H:%M")
                 fired_key = (cfg["last_trigger"] or {}).get("key", "")
+                if cfg["trading_only"] and not is_trading_day(now.date()):
+                    # 非交易日：仍推进 next_trigger 展示，但不触发
+                    continue
                 for t in cfg["times"]:
                     key = f"{today_key} {t}"
-                    # now 已过 t 且今天 t 点尚未触发 → 触发
                     if now_hm >= t and key != fired_key:
                         _mark_schedule_triggered(key)
                         log(f"⏰ 定时同步触发（{t}）——stockdb 保持运行，热更新")
@@ -593,6 +726,20 @@ def scheduler_loop() -> None:
                             daemon=True,
                         ).start()
                         break
+                # 失败自动重试：上次定时触发 exit!=0 且未重试 → 补一次（10 分钟后）
+                if not _sync_state["running"]:
+                    lt = cfg.get("last_trigger") or {}
+                    if (lt.get("exit") not in (None, 0) and lt.get("key", "").startswith(today_key)
+                            and not lt.get("retry")):
+                        retry_key = f"{today_key} RETRY"
+                        if lt.get("key") != retry_key:
+                            log(f"↻ 定时同步上次失败（exit={lt.get('exit')}），安排 10 分钟后自动重试 ...")
+                            _mark_schedule_triggered(retry_key, retry=True)
+                            threading.Thread(
+                                target=lambda: (time.sleep(600),
+                                                run_sync(hot=True, trigger="scheduled-retry", retry=True)),
+                                daemon=True,
+                            ).start()
         except Exception as exc:
             log(f"⏰ 定时线程异常: {exc}")
         time.sleep(30)
@@ -717,15 +864,25 @@ def apply_adjust(rows: list[dict], adj_map: dict[int, float], mode: str) -> list
 
 
 def latest_quotes(codes: list[str]) -> list[dict]:
-    """批量获取股票最新交易日行情（name/close/pct_chg/date）。"""
+    """批量获取股票最新交易日行情（name/close/pct_chg/date）。
+
+    近 3 月前缀通配（复用 _month_prefixes），跨年/跨月不失效。
+    """
     import urllib.request, urllib.parse
+    from datetime import datetime as _dt, timedelta as _td
+    today = _dt.now()
+    start = (today - _td(days=95)).strftime("%Y%m%d")
+    end = today.strftime("%Y%m%d")
+    prefixes = _month_prefixes(start, end)
     quotes = []
     for code in codes:
         try:
-            url = f"http://{STOCKDB_HOST}:{STOCKDB_PORT}/?cmd=vals&t={urllib.parse.quote(f'日k:{code}:2026*')}"
-            with urllib.request.urlopen(url, timeout=12) as resp:
-                data = json.loads(resp.read().decode("utf-8", "replace"))
-            rows = [r for r in data if isinstance(r, dict) and r.get("date")]
+            rows = []
+            for prefix in prefixes:
+                url = f"http://{STOCKDB_HOST}:{STOCKDB_PORT}/?cmd=vals&t={urllib.parse.quote(f'日k:{code}:{prefix}*')}"
+                with urllib.request.urlopen(url, timeout=12) as resp:
+                    data = json.loads(resp.read().decode("utf-8", "replace"))
+                rows.extend(r for r in data if isinstance(r, dict) and r.get("date"))
             if not rows:
                 continue
             latest = max(rows, key=lambda r: int(r.get("date") or 0))
@@ -851,6 +1008,7 @@ font-size:15px;padding:8px 18px;cursor:pointer}
   <div class="card">
     <div class="actions">
       <button id="syncBtn2" onclick="doSync()">开始同步</button>
+      <span id="phaseBadge" class="badge b-skip" style="display:none"></span>
       <label class="hint" style="display:flex;align-items:center;gap:6px">
         <input type="checkbox" id="hotMode" checked> 热更新（不停服务，默认）
       </label>
@@ -858,8 +1016,9 @@ font-size:15px;padding:8px 18px;cursor:pointer}
     </div>
   </div>
   <div class="card"><div class="k">定时自动同步（热更新，多时间点）</div>
-    <div style="margin-top:8px;display:flex;gap:8px;align-items:center">
+    <div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
       <label class="hint"><input type="checkbox" id="schEnabled" onchange="saveScheduleNow()"> 启用</label>
+      <label class="hint"><input type="checkbox" id="schTrading" onchange="saveScheduleNow()"> 仅交易日</label>
       <input type="time" id="schTime" value="15:30">
       <button onclick="addSchTime()" style="background:#334155;color:#e2e8f0">添加时间点</button>
       <span id="schTimes" style="display:flex;gap:6px;flex-wrap:wrap"></span>
@@ -867,21 +1026,31 @@ font-size:15px;padding:8px 18px;cursor:pointer}
     </div>
     <div class="hint" style="margin-top:8px" id="schNext"></div>
     <div class="hint" style="margin-top:4px" id="schLast"></div>
+    <div class="hint" style="margin-top:2px" id="schToday"></div>
   </div>
   <div class="card"><div class="k">同步历史（最近 30 次）</div>
+    <div id="histStats" class="hint" style="margin-bottom:6px"></div>
     <table><thead><tr><th>时间</th><th>触发</th><th>模式</th><th>结果</th><th>下载</th><th>验证</th><th>耗时</th><th>数据最新</th></tr></thead>
     <tbody id="histBody"><tr><td colspan="8" class="hint">（暂无历史）</td></tr></tbody></table>
   </div>
   <div class="card"><div class="k">同步日志（自动刷新）</div><pre id="log">（暂无）</pre></div>
 </div>
 
-<!-- 系统：容器/数据源 状态判断 -->
+<!-- 系统：容器/数据源 状态判断 + 运维动作 -->
 <div id="tab-system" class="tab-panel">
   <div class="card"><div class="metrics">
     <div class="m"><div class="lbl">stockdb 容器</div><div class="val" id="cState" style="font-size:15px">…</div></div>
+    <div class="m"><div class="lbl">镜像</div><div class="val" id="cImage" style="font-size:13px">…</div></div>
+    <div class="m"><div class="lbl">运行时长</div><div class="val" id="cUptime" style="font-size:13px">…</div></div>
     <div class="m"><div class="lbl">数据源</div><div class="val" id="cSource" style="font-size:13px">…</div></div>
   </div>
-  <div class="hint" style="margin-top:8px" id="cStateNote">…</div></div>
+  <div class="hint" style="margin-top:8px" id="cStateNote">…</div>
+  <div class="actions" style="margin-top:12px;gap:10px">
+    <button onclick="restartContainer()" style="background:#334155;color:#e2e8f0">重启 stockdb</button>
+    <button onclick="toggleContainerLogs()" style="background:#334155;color:#e2e8f0">查看容器日志</button>
+    <span id="containerMsg" class="hint"></span>
+  </div>
+  <pre id="containerLog" style="margin-top:10px;display:none">（加载中…）</pre></div>
 </div>
 </div>
 <script src="/static/echarts.min.js"></script>
@@ -901,20 +1070,33 @@ function showTab(name,btn){
 async function refresh(){
   try{
     const s=await j('/api/status');
-    // 系统页：容器状态 + 数据源
+    // 系统页：容器状态 + 镜像 + 运行时长 + 数据源
     const cs=s.container||{};
     document.getElementById('cState').textContent=cs.status||'unknown';
+    document.getElementById('cImage').textContent=cs.image||'—';
+    document.getElementById('cUptime').textContent=cs.started?fmtUptime(cs.started):'—';
     document.getElementById('cStateNote').textContent=cs.note||(cs.ok?'':'docker 不可用，同步按钮将无法停/启容器');
     document.getElementById('cSource').textContent=s.source||'—';
     const d=document.getElementById('statusDot');
     d.className='dot '+(cs.status==='running'?'ok':(cs.ok?'err':'warn'));
-    // 同步页：健康度 + 定时调度器 + 磁盘
+    // 同步页：健康度 + 定时调度器 + 磁盘 + 阶段徽章
     loadHealth();
     const schedInfo=s.schedule||{};
     document.getElementById('cSched').innerHTML='<span style="color:'+(s.scheduler_alive?'var(--ok)':'var(--err)')+'">'+(s.scheduler_alive?'运行中':'未运行')+'</span>'+(schedInfo.enabled&&schedInfo.times?' ｜ 每日 '+schedInfo.times.join('、'):'');
     if(s.disk&&s.disk.total_gb!=null)document.getElementById('cDisk').textContent=s.disk.used_gb+' / '+s.disk.total_gb+' GB';
     const b=document.getElementById('syncBtn2');if(b)b.disabled=s.sync_running;
     document.getElementById('syncMsg').textContent=s.sync_running?'同步进行中，请勿重复点击…':'热更新=服务保持运行直接增量同步；严格模式=停服后同步';
+    const pb=document.getElementById('phaseBadge');
+    if(pb){
+      if(s.sync_running&&s.sync_phase!=='idle'){
+        pb.style.display='inline-block';
+        pb.className='badge '+(s.sync_phase==='verifying'?'b-ok':(s.sync_phase==='stopping'||s.sync_phase==='restarting')?'b-skip':'b-run');
+        pb.textContent=(PHASE_LABEL[s.sync_phase]||s.sync_phase)+'…';
+      }else pb.style.display='none';
+    }
+    const td=document.getElementById('schToday');
+    if(td)td.textContent=(schedInfo.enabled&&schedInfo.trading_only)?(s.trading_today?'今日为交易日，到点将自动同步':'今日非交易日（周末/休市），定时跳过')
+      :(schedInfo.enabled&&schedInfo.times?'（未限定交易日）':'');
     renderSchTimes(schedInfo);
     const lg=await j('/api/log?n=100');document.getElementById('log').textContent=lg.log;
     loadWatchlist();loadHistory();
@@ -925,6 +1107,7 @@ function renderSchTimes(sch){
   const el=document.getElementById('schTimes');
   if(!el)return;
   document.getElementById('schEnabled').checked=sch.enabled;
+  document.getElementById('schTrading').checked=sch.trading_only!==false;
   const times=sch.times||[];
   if(JSON.stringify(times)!==_schRendered){
     _schRendered=JSON.stringify(times);
@@ -935,7 +1118,7 @@ function renderSchTimes(sch){
   if(nxt)nxt.textContent=sch.enabled?(sch.next_trigger?'下次触发：'+sch.next_trigger:'（时间点已过，明天触发）'):'定时未启用';
   if(lst){
     const l=sch.last_trigger;
-    lst.textContent=l?('上次定时触发 '+l.ts+' ｜ '+(l.exit===0?'✅ 成功':'❌ 退出码 '+l.exit)):'';
+    lst.textContent=l?('上次定时触发 '+l.ts+' ｜ '+(l.exit===0?'✅ 成功':l.exit==null?'（进行中）':'❌ 退出码 '+l.exit)):'';
   }
 }
 function schTimeChanged(){
@@ -956,9 +1139,10 @@ function rmSchTime(t,ev){
 }
 async function saveScheduleNow(times){
   const enabled=document.getElementById('schEnabled').checked;
+  const trading=document.getElementById('schTrading').checked;
   const t=(times||(document.getElementById('schTimes').textContent.match(/\d{2}:\d{2}/g)||[]));
   try{
-    const r=await j('/api/schedule?action=save&enabled='+enabled+'&times='+encodeURIComponent(t.join(',')));
+    const r=await j('/api/schedule?action=save&enabled='+enabled+'&trading_only='+trading+'&times='+encodeURIComponent(t.join(',')));
     document.getElementById('schMsg').textContent=r.msg||'已保存';
     document.getElementById('schNext').textContent=r.schedule&&r.schedule.next_trigger?'下次触发：'+r.schedule.next_trigger:'';
   }catch(e){document.getElementById('schMsg').textContent='保存失败: '+e;}
@@ -998,11 +1182,24 @@ async function addWatch(){
 async function loadHistory(){
   try{
     const h=await j('/api/history');
+    const hist=h.history||[];
     const tb=document.getElementById('histBody');
-    if(!h.history.length){tb.innerHTML='<tr><td colspan="8" class="hint">（暂无历史）</td></tr>';return;}
-    tb.innerHTML=h.history.map(x=>`<tr>
+    const st=document.getElementById('histStats');
+    if(st){
+      if(hist.length){
+        const recent=hist.slice(0,7);
+        const ok=recent.filter(x=>x.exit_code===0).length;
+        const durs=recent.filter(x=>x.duration_sec!=null).map(x=>x.duration_sec);
+        const avg=durs.length?Math.round(durs.reduce((a,b)=>a+b,0)/durs.length):null;
+        const lastOk=hist.find(x=>x.exit_code===0);
+        st.textContent='近 7 次：成功 '+ok+' / '+recent.length+'，平均耗时 '+(avg==null?'—':avg+'s')
+          +(lastOk?'，最近成功 '+lastOk.ts:'')+(hist.length>7?'；更早记录请往下滚动日志/历史': '');
+      }else st.textContent='';
+    }
+    if(!hist.length){tb.innerHTML='<tr><td colspan="8" class="hint">（暂无历史）</td></tr>';return;}
+    tb.innerHTML=hist.map(x=>`<tr>
       <td>${esc(x.ts)}</td>
-      <td>${x.trigger==='scheduled'?'⏰定时':'手动'}</td>
+      <td>${x.trigger==='scheduled'?'⏰定时':x.trigger==='scheduled-retry'?'↻定时·重试':'手动'}</td>
       <td>${x.mode==='hot'?'热更新':'严格'}</td>
       <td>${x.exit_code===0?'✅':'❌ '+esc(x.exit_code)}</td>
       <td>${x.downloads==null?'—':x.downloads}</td>
@@ -1065,6 +1262,38 @@ async function loadKline(){
     });
   }catch(e){document.getElementById('qres').textContent='K线加载失败: '+e;}
 }
+// 系统页：容器运行时长 / 重启 / 日志
+const PHASE_LABEL={idle:'空闲',stopping:'停服中',syncing:'同步中',verifying:'验证中',restarting:'重启中',done:'完成'};
+function fmtUptime(iso){
+  try{
+    const s=new Date(iso),t=Date.now();
+    if(isNaN(s))return iso;
+    let sec=Math.floor((t-s.getTime())/1000);if(sec<0)sec=0;
+    const d=Math.floor(sec/86400),h=Math.floor(sec%86400/3600),m=Math.floor(sec%3600/60);
+    return (d>0?d+'天 ':'')+(h>0?h+'小时 ':'')+m+'分钟';
+  }catch(e){return iso}
+}
+async function restartContainer(){
+  if(!confirm('确定重启 stockdb 容器？重启期间行情服务会短暂中断。')){
+    document.getElementById('containerMsg').textContent='已取消';
+    return;
+  }
+  const m=document.getElementById('containerMsg');
+  try{const r=await j('/api/container/restart',{method:'POST'});m.textContent=r.msg||'已执行';}
+  catch(e){m.textContent='重启失败: '+e;}
+}
+async function toggleContainerLogs(){
+  const pre=document.getElementById('containerLog');
+  if(pre.style.display!=='none'){pre.style.display='none';return;}
+  pre.style.display='block';pre.textContent='（加载中…）';
+  const m=document.getElementById('containerMsg');
+  try{
+    const r=await j('/api/container/logs?tail=150');
+    pre.textContent=r.log||'（容器无日志输出）';
+    if(r.error)pre.textContent+='\n\n'+r.error;
+    m.textContent='';
+  }catch(e){pre.textContent='读取失败: '+e;}
+}
 refresh();setInterval(refresh,4000);
 </script></body></html>"""
 
@@ -1104,6 +1333,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._log()
             elif path == "/api/query":
                 self._query()
+            elif path == "/api/container/logs":
+                self._container_logs()
             else:
                 self._send(404, json.dumps({"error": "not found"}))
         except Exception as exc:
@@ -1127,6 +1358,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if path == "/api/sync":
                 self._sync()
+            elif path == "/api/container/restart":
+                self._container_restart()
             else:
                 self._send(404, json.dumps({"error": "not found"}))
         except Exception as exc:
@@ -1150,14 +1383,16 @@ class Handler(BaseHTTPRequestHandler):
                      if ln.strip() and not ln.strip().startswith("#")]
             src = lines[0] if lines else ""
         self._send(200, json.dumps({
-            "container": state,          # {ok, status, note}
+            "container": state,          # {ok, status, note, image, started}
             "source": src,
             "sync_running": _sync_state["running"],
+            "sync_phase": _sync_state.get("phase", "idle"),
             "exit_code": _sync_state["exit_code"],
             "data_latest": data_latest_date(),
             "schedule": load_schedule(),
             "disk": disk_usage(),
             "scheduler_alive": _scheduler_alive,
+            "trading_today": is_trading_day(),   # 定时是否会在今天触发（严格交易日）
         }, ensure_ascii=False))
 
     def _history(self):
@@ -1167,11 +1402,12 @@ class Handler(BaseHTTPRequestHandler):
         q = parse_qs(urlparse(self.path).query)
         if q.get("action", [""])[0] == "save":
             enabled = q.get("enabled", ["false"])[0].lower() == "true"
+            trading_only = q.get("trading_only", ["true"])[0].lower() != "false"
             raw_times = q.get("times", []) or [q.get("time", ["15:30"])[0]]  # 兼容单 time
             # times 可能是 "15:30,16:05" 一个字符串，按逗号拆分
             times = [t for part in raw_times for t in str(part).split(",")]
             try:
-                cfg = save_schedule(enabled, times)
+                cfg = save_schedule(enabled, times, trading_only)
             except RuntimeError as exc:
                 self._send(400, json.dumps({"msg": str(exc)}))
                 return
@@ -1250,6 +1486,30 @@ class Handler(BaseHTTPRequestHandler):
         threading.Thread(target=run_sync, kwargs={"hot": hot, "trigger": "manual"}, daemon=True).start()
         mode = "热更新" if hot else "严格模式(停服)"
         self._send(200, json.dumps({"msg": f"已启动{mode}同步（手动），日志将实时刷新"}))
+
+    def _container_logs(self):
+        """stockdb 容器日志尾部（系统页查看用）。无 docker 时降级提示。"""
+        tail = int(parse_qs(urlparse(self.path).query).get("tail", ["150"])[0])
+        try:
+            text = container_logs(tail)
+            self._send(200, json.dumps({"log": text}, ensure_ascii=False))
+        except FileNotFoundError:
+            self._send(200, json.dumps({"log": "", "error": "docker socket 未挂载，无法读取容器日志" }, ensure_ascii=False))
+        except Exception as exc:
+            self._send(200, json.dumps({"log": "", "error": f"读取失败: {exc}"}, ensure_ascii=False))
+
+    def _container_restart(self):
+        """重启 stockdb 容器（系统页按钮，前端已二次确认）。"""
+        if _sync_state["running"]:
+            self._send(200, json.dumps({"msg": "同步进行中，请勿重启容器"}))
+            return
+        try:
+            container_restart()
+            self._send(200, json.dumps({"msg": "已发送重启命令，容器状态将自动刷新"}))
+        except FileNotFoundError:
+            self._send(200, json.dumps({"msg": "docker socket 未挂载，无法重启容器（本地开发模式不可用）"}))
+        except Exception as exc:
+            self._send(200, json.dumps({"msg": f"重启失败: {exc}"}))
 
 
 def main():

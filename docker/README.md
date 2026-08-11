@@ -78,6 +78,32 @@ docker build -t ghcr.io/awoeyiwuyua/free-stockdb:0.3.1 .
    （若 18080 被占用，改 `docker-compose.yml` 里 `18080:8080` 的宿主端口即可，
    容器内 8080 不变）。
 
+### 3.5 本地迭代 webui（Mac 等有 python3 的机器）
+
+`webui` 是纯 Python 标准库单文件应用，读功能（行情/K线/健康度/自选/状态）可完全在本地开发调试：
+
+```bash
+docker/webui/dev.sh            # 默认直连 Tailscale 上极空间的 100.66.1.1:7899
+STOCKDB_HOST=192.168.1.5 ./docker/webui/dev.sh   # 指定其他 stockdb 实例
+WEBUI_PORT=18080 ./docker/webui/dev.sh           # 换本地端口
+# 浏览器打开 http://127.0.0.1:8080
+```
+
+- 本地数据（自选/历史/日志）落在 `docker/webui/.dev-data/`（已 gitignore），不碰 NAS 数据卷
+- docker 操控与同步依赖容器内 `/opt/stockdb/数据更新`，本地不挂载 docker socket，对应接口自动降级为"不可用"提示——这些改动需推到 NAS 重建 webui 镜像后验证
+- 改完 `app.py` 后 `docker compose up -d --build webui` 可重新构建（也可用 GH Actions / `docker build` 流程，见上文）
+
+**webui 功能速览**：
+
+| 页签 | 能力 |
+|------|------|
+| 概览 | 自选股快照（点击看 K 线）、加自选 |
+| 行情 | ECharts K 线（日K/分钟K/前复权/后复权/MA）、原始查询代理 |
+| 同步 | 数据健康度（联动镜像源日期）、热更新/严格同步、多时间点定时（**仅交易日**，A股休市表内嵌）、失败自动重试、同步阶段可视化（同步中/验证中/重启中）、历史统计（近7次成功率/平均耗时） |
+| 系统 | 容器状态/镜像/运行时长、重启 stockdb、容器日志查看 |
+
+> A股休市表（`app.py` 的 `XSHG_HOLIDAYS`）取自 [exchange_calendars](https://github.com/gerrymanoim/exchange_calendars) XSHG 日历，数据截至 2026 年；官方次年放假安排公布后，用 `docker/webui/scripts/extract_xshg_holidays.py` 重新提取更新（webui 运行时零依赖，判定不依赖外部服务）。
+
 ### 4. 本地 ZCode 接入
 本机 `scripts/stockdb_mcp_server.py`（只读 MCP，连 `STOCKDB_HOST:7899`）：
 ```bash

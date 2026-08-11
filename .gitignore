@@ -4,3 +4,7 @@ cpp/build/
 *.log
 *.pid
 *.part
+__pycache__/
+*.pyc
+.zcode/
+docker/webui/.dev-data/
