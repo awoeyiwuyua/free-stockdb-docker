@@ -998,15 +998,16 @@ font-size:15px;padding:8px 18px;cursor:pointer}
   </div>
 </div>
 
-<!-- 同步：健康度 + 按钮 + 定时 + 历史 + 日志 -->
+<!-- 同步：①数据库状态判断 ②手动同步 ③自动同步 + 历史 + 日志 -->
 <div id="tab-sync" class="tab-panel">
-  <div class="card"><div class="metrics">
-    <div class="m"><div class="lbl">数据健康度</div><div class="val" id="cLatest" style="font-size:13px">…</div></div>
-    <div class="m"><div class="lbl">定时调度器</div><div class="val" id="cSched" style="font-size:14px">…</div></div>
-    <div class="m"><div class="lbl">磁盘用量</div><div class="val" id="cDisk" style="font-size:14px">…</div></div>
-  </div></div>
-  <div class="card">
-    <div class="actions">
+  <div class="card"><div class="k">① 数据库状态</div>
+    <div class="metrics">
+      <div class="m"><div class="lbl">数据健康度</div><div class="val" id="cLatest" style="font-size:13px">…</div></div>
+      <div class="m"><div class="lbl">数据源</div><div class="val" id="cSource" style="font-size:12px">…</div></div>
+    </div>
+  </div>
+  <div class="card"><div class="k">② 手动同步</div>
+    <div class="actions" style="margin-top:8px">
       <button id="syncBtn2" onclick="doSync()">开始同步</button>
       <span id="phaseBadge" class="badge b-skip" style="display:none"></span>
       <label class="hint" style="display:flex;align-items:center;gap:6px">
@@ -1015,7 +1016,7 @@ font-size:15px;padding:8px 18px;cursor:pointer}
       <span id="syncMsg" class="hint">热更新=服务保持运行直接增量同步；严格模式=停服后同步</span>
     </div>
   </div>
-  <div class="card"><div class="k">定时自动同步（热更新，多时间点）</div>
+  <div class="card"><div class="k">③ 自动同步 <span id="cSched" style="font-weight:normal;font-size:12px"></span></div>
     <div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
       <label class="hint"><input type="checkbox" id="schEnabled" onchange="saveScheduleNow()"> 启用</label>
       <label class="hint"><input type="checkbox" id="schTrading" onchange="saveScheduleNow()"> 仅交易日</label>
@@ -1036,13 +1037,13 @@ font-size:15px;padding:8px 18px;cursor:pointer}
   <div class="card"><div class="k">同步日志（自动刷新）</div><pre id="log">（暂无）</pre></div>
 </div>
 
-<!-- 系统：容器/数据源 状态判断 + 运维动作 -->
+<!-- 系统：容器/磁盘/运维动作 -->
 <div id="tab-system" class="tab-panel">
   <div class="card"><div class="metrics">
     <div class="m"><div class="lbl">stockdb 容器</div><div class="val" id="cState" style="font-size:15px">…</div></div>
     <div class="m"><div class="lbl">镜像</div><div class="val" id="cImage" style="font-size:13px">…</div></div>
     <div class="m"><div class="lbl">运行时长</div><div class="val" id="cUptime" style="font-size:13px">…</div></div>
-    <div class="m"><div class="lbl">数据源</div><div class="val" id="cSource" style="font-size:13px">…</div></div>
+    <div class="m"><div class="lbl">磁盘用量</div><div class="val" id="cDisk" style="font-size:13px">…</div></div>
   </div>
   <div class="hint" style="margin-top:8px" id="cStateNote">…</div>
   <div class="actions" style="margin-top:12px;gap:10px">
