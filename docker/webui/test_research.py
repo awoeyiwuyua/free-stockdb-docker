@@ -238,6 +238,147 @@ class TestMarketAggregation(unittest.TestCase):
         self.assertIsNone(m["date"])
         self.assertEqual((m["up"], m["down"], m["na"]), (0, 0, 0))
 
+    def test_derived_breadth_and_liquidity(self):
+        daily = {}
+        for i in range(1, 22):
+            daily[20260700 + i] = {"up": 1 if i > 10 else 0, "down": 0 if i > 10 else 1,
+                                    "flat": 0, "above": 1, "amount": i * 100,
+                                    "high20": 1, "low20": 0}
+        row = self._row("000001", 20260721, 1.0, 10, 9, 2100, daily=daily,
+                        is_high20=True)
+        m = mod.market_summary_from_stocks([row], target_date="20260721")
+        self.assertEqual(m["derived"]["advance_decline_ratio"], None)
+        self.assertEqual(m["derived"]["breadth_gap_pp"], 0.0)
+        self.assertAlmostEqual(m["derived"]["amount_vs_prev5_pct"], 16.7, places=1)
+        self.assertAlmostEqual(m["derived"]["amount_vs_prev20_pct"], 100.0, places=1)
+        self.assertEqual(len(m["width_hist"]), 20)
+
+    def test_return_distribution(self):
+        values = [6, 3, 1, 0, -1, -3, -6, 10, -10]
+        rows = [self._row(str(i).zfill(6), 20260811, pct, 10, 9, 1)
+                for i, pct in enumerate(values)]
+        d = mod.market_return_distribution(rows, target_date="20260811")
+        counts = {row["key"]: row["count"] for row in d["buckets"]}
+        self.assertEqual(counts, {"ge5": 2, "up2_5": 1, "up0_2": 1, "flat": 1,
+                                  "down0_2": 1, "down2_5": 1, "le_neg5": 2})
+        self.assertEqual((d["large_up"], d["large_down"]), (1, 1))
+
+
+class TestSectorReview(unittest.TestCase):
+    def test_sector_strength(self):
+        rows = []
+        for i, pct in enumerate([3, 2, 1, -1, -2, -3]):
+            rows.append({"date": 20260811, "pct_chg": pct, "amount": 120,
+                         "prev_amount": 100, "industry": "电子" if i < 3 else "银行"})
+        result = mod.sector_strength(rows, target_date="20260811")
+        self.assertTrue(result["available"])
+        self.assertEqual(result["top"][0]["name"], "电子")
+        self.assertEqual(result["bottom"][0]["name"], "银行")
+        self.assertEqual(result["top"][0]["median_pct"], 2)
+        self.assertEqual(result["top"][0]["up_ratio"], 1.0)
+
+class TestSQLiteStorageAndBoards(unittest.TestCase):
+    def test_market_snapshot_transaction_and_normalized_tables(self):
+        import sqlite3
+        db_path = Path(tempfile.mkdtemp()) / "market.sqlite3"
+        rows = [{"code": "000001", "type": "stock", "date": 20260811,
+                 "pct_chg": 2.5, "close": 10, "ma20": 9, "amount": 120,
+                 "prev_amount": 100, "is_high20": True, "is_low20": False,
+                 "daily": {20260811: {"up": 1, "down": 0, "flat": 0, "above": 1,
+                                       "amount": 120, "high20": 1, "low20": 0}}}]
+        summary = mod.market_summary_from_stocks(rows, target_date="20260811")
+        summary["sectors"] = {"available": True, "mapped": 1, "unmapped": 0,
+            "rows": [{"name": "电子", "count": 1, "median_pct": 2.5,
+                      "up_ratio": 1.0, "amount": 120, "amount_change": 20.0}],
+            "top": [], "bottom": []}
+        mod.save_market_snapshot_db(summary, db_path)
+        loaded = mod.load_latest_market_snapshot_db(db_path)
+        self.assertEqual(loaded["date"], "20260811")
+        self.assertEqual(loaded["sectors"]["rows"][0]["name"], "电子")
+        conn = sqlite3.connect(db_path)
+        try:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM market_daily").fetchone()[0], 1)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM breadth_daily").fetchone()[0], 1)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM return_distribution_daily").fetchone()[0], 7)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM sector_daily").fetchone()[0], 1)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM methodology").fetchone()[0],
+                             len(mod.MARKET_METHODOLOGY))
+        finally:
+            conn.close()
+        status = mod.research_db_status(db_path)
+        self.assertTrue(status["ok"])
+        self.assertEqual(status["latest_date"], "20260811")
+
+    def test_same_date_replaces_distribution_in_one_snapshot(self):
+        import sqlite3
+        db_path = Path(tempfile.mkdtemp()) / "market.sqlite3"
+        summary = {"schema_version": mod.RESEARCH_SCHEMA, "date": "20260811",
+                   "generated_at": "2026-08-11 16:00:00", "derived": {}, "width_hist": [],
+                   "distribution": {"buckets": [{"key": "flat", "label": "平盘", "count": 1, "ratio": 1.0}]},
+                   "sectors": {"rows": []}, "methodology": mod.MARKET_METHODOLOGY}
+        mod.save_market_snapshot_db(summary, db_path)
+        summary["distribution"]["buckets"] = [{"key": "ge5", "label": "≥ +5%", "count": 2, "ratio": 1.0}]
+        mod.save_market_snapshot_db(summary, db_path)
+        conn = sqlite3.connect(db_path)
+        try:
+            self.assertEqual(conn.execute("SELECT bucket FROM return_distribution_daily").fetchall(), [("ge5",)])
+        finally:
+            conn.close()
+
+    def test_legacy_json_migrates_once_and_is_retained(self):
+        tmp = Path(tempfile.mkdtemp())
+        old_cache_dir, old_db_path = mod.RESEARCH_CACHE_DIR, mod.RESEARCH_DB_PATH
+        mod.RESEARCH_CACHE_DIR = tmp / "cache"
+        mod.RESEARCH_DB_PATH = tmp / "research" / "market.sqlite3"
+        mod.RESEARCH_CACHE_DIR.mkdir(parents=True)
+        legacy_path = mod.RESEARCH_CACHE_DIR / "market_snapshot_20260811.json"
+        legacy = {
+            "schema_version": 2,
+            "date": "20260811",
+            "generated_at": "2026-08-11 16:00:00",
+            "derived": {}, "width_hist": [],
+            "distribution": {"buckets": []},
+            "sectors": {"rows": []},
+            "methodology": mod.MARKET_METHODOLOGY,
+        }
+        legacy_path.write_text(json.dumps(legacy, ensure_ascii=False), encoding="utf-8")
+        try:
+            self.assertTrue(mod.migrate_legacy_market_snapshot())
+            loaded = mod.load_latest_market_snapshot_db()
+            self.assertEqual(loaded["date"], "20260811")
+            self.assertEqual(loaded["schema_version"], mod.RESEARCH_SCHEMA)
+            self.assertIn("sector_strength", loaded["methodology"])
+            self.assertTrue(legacy_path.exists())
+            self.assertFalse(mod.migrate_legacy_market_snapshot())
+        finally:
+            mod.RESEARCH_CACHE_DIR, mod.RESEARCH_DB_PATH = old_cache_dir, old_db_path
+
+    def test_sw1_board_bulk_response(self):
+        import urllib.request as ur
+
+        payload = [["板块:801080.SL", {"code": "801080.SL", "name": "电子",
+                    "category": "申万一级", "symbols": ["000001", "600000.SH"]}],
+                   ["板块:概念", {"code": "X", "name": "AI", "category": "概念",
+                    "symbols": ["000001"]}]]
+
+        class FakeResp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return json.dumps(payload, ensure_ascii=False).encode()
+
+        original = ur.urlopen
+        ur.urlopen = lambda *args, **kwargs: FakeResp()
+        try:
+            mapping = mod._fetch_sw1_industry_map()
+        finally:
+            ur.urlopen = original
+        self.assertEqual(mapping, {"000001": "电子", "600000": "电子"})
+
 
 class TestWatchlistData(unittest.TestCase):
     def test_high_low_uses_high_low(self):
@@ -287,10 +428,10 @@ class TestBuildWithPlaceholders(unittest.TestCase):
         self.assertEqual(len(rows), 3)
 
     def test_schema_bump_invalidates_old_cache(self):
-        # 口径升级后旧 schema 缓存不再被读取（RESEARCH_SCHEMA=2）
-        old = {"schema_version": 1, "date": "20260811"}  # 旧版本缓存
+        # SQLite 持久化升级后，旧 v3 市场快照不再被直接读取。
+        old = {"schema_version": 3, "date": "20260811"}
         self.assertNotEqual(old["schema_version"], mod.RESEARCH_SCHEMA)
-        self.assertEqual(mod.RESEARCH_SCHEMA, 2)
+        self.assertEqual(mod.RESEARCH_SCHEMA, 4)
 
     def test_factor_payload_excludes_placeholders(self):
         # 因子快照只保留 date 非空的行（占位行仅服务市场 na 统计）

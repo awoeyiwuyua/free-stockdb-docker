@@ -34,6 +34,7 @@ STOCKDB_PORT = int(os.environ.get("STOCKDB_PORT", "7899"))
 STOCKDB_CONTAINER = os.environ.get("STOCKDB_CONTAINER", "stockdb")
 DOCKER_SOCKET = os.environ.get("DOCKER_SOCKET", "/var/run/docker.sock")
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
+RESEARCH_DB_PATH = Path(os.environ.get("RESEARCH_DB_PATH", str(DATA_DIR / "market_research.sqlite3")))
 SYNC_LOG = DATA_DIR / "sync.log"
 LISTEN_PORT = int(os.environ.get("WEBUI_PORT", "8080"))
 
@@ -518,6 +519,102 @@ def _bar_date(b: dict) -> int:
         return 0
 
 
+def _safe_float(value) -> float | None:
+    try:
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _mean(values: list[float]) -> float | None:
+    return sum(values) / len(values) if values else None
+
+
+def _relative_to_average(current: float | None, history: list[float], n: int) -> float | None:
+    """当前值相对前 n 个有效观测均值的变化百分比：(current / mean(prev_n) - 1) × 100。"""
+    if current is None:
+        return None
+    base = _mean([float(v) for v in history[-n:] if v is not None])
+    if not base:
+        return None
+    return round((float(current) / base - 1.0) * 100, 1)
+
+
+def market_return_distribution(stock_results: list[dict], target_date: str | None = None) -> dict:
+    """当日个股涨跌幅分布；阈值使用实际 pct_chg 百分数，不把 ≥9.5% 猜成涨停。"""
+    values: list[float] = []
+    for row in stock_results:
+        if target_date is not None and str(row.get("date") or "") != str(target_date):
+            continue
+        pct = _safe_float(row.get("pct_chg"))
+        if pct is not None:
+            values.append(pct)
+    buckets = [
+        ("ge5", "≥ +5%", lambda x: x >= 5),
+        ("up2_5", "+2% ~ +5%", lambda x: 2 <= x < 5),
+        ("up0_2", "0 ~ +2%", lambda x: 0 < x < 2),
+        ("flat", "平盘", lambda x: x == 0),
+        ("down0_2", "0 ~ -2%", lambda x: -2 < x < 0),
+        ("down2_5", "-2% ~ -5%", lambda x: -5 < x <= -2),
+        ("le_neg5", "≤ -5%", lambda x: x <= -5),
+    ]
+    total = len(values)
+    rows = []
+    for key, label, match in buckets:
+        count = sum(1 for value in values if match(value))
+        rows.append({"key": key, "label": label, "count": count,
+                     "ratio": round(count / total, 4) if total else 0.0})
+    return {
+        "total": total,
+        "buckets": rows,
+        "large_up": sum(1 for x in values if x >= 9.5),
+        "large_down": sum(1 for x in values if x <= -9.5),
+    }
+
+
+def sector_strength(stock_results: list[dict], target_date: str | None = None) -> dict:
+    """按申万一级行业聚合等权涨跌中位数、上涨比例与成交额变化。"""
+    grouped: dict[str, list[dict]] = {}
+    unmapped = 0
+    for row in stock_results:
+        if target_date is not None and str(row.get("date") or "") != str(target_date):
+            continue
+        if _safe_float(row.get("pct_chg")) is None:
+            continue
+        industry = str(row.get("industry") or "").strip()
+        if not industry:
+            unmapped += 1
+            continue
+        grouped.setdefault(industry, []).append(row)
+    sectors = []
+    for name, rows in grouped.items():
+        pcts = [_safe_float(r.get("pct_chg")) for r in rows]
+        pcts = [x for x in pcts if x is not None]
+        amounts = [_safe_float(r.get("amount")) or 0.0 for r in rows]
+        prev_amounts = [_safe_float(r.get("prev_amount")) or 0.0 for r in rows]
+        up = sum(1 for x in pcts if x > 0)
+        total_amount = sum(amounts)
+        prev_amount = sum(prev_amounts)
+        sectors.append({
+            "name": name,
+            "count": len(pcts),
+            "median_pct": _median(pcts),
+            "up_ratio": round(up / len(pcts), 4) if pcts else None,
+            "amount": round(total_amount, 1),
+            "amount_change": round((total_amount / prev_amount - 1) * 100, 2) if prev_amount else None,
+        })
+    eligible = [s for s in sectors if s["count"] >= 3 and s["median_pct"] is not None]
+    eligible.sort(key=lambda s: s["median_pct"], reverse=True)
+    return {
+        "available": bool(eligible),
+        "mapped": sum(s["count"] for s in sectors),
+        "unmapped": unmapped,
+        "rows": eligible,
+        "top": eligible[:5],
+        "bottom": list(reversed(eligible[-5:])),
+    }
+
+
 def market_summary_from_stocks(stock_results: list[dict], target_date: str | None = None) -> dict:
     """从全市场扫描结果（每只股票含 bars 的衍生字段）聚合「市场状态」。
 
@@ -596,7 +693,7 @@ def market_summary_from_stocks(stock_results: list[dict], target_date: str | Non
     highlow_raw = (high20c - low20c) / total_data if total_data else 0.0
     highlow_score = max(-1.0, min(1.0, highlow_raw))
     temperature = round(up_ratio * 40 + ma20_ratio * 40 + ((highlow_score + 1) / 2) * 20, 1)
-    # 20 日宽度历史（按交易日排序）
+    # 21 日宽度历史用于计算“当日相对前 20 日”；对外图表仍只返回最近 20 日。
     width_hist = []
     for d in sorted(daily):
         agg = daily[d]
@@ -609,6 +706,22 @@ def market_summary_from_stocks(stock_results: list[dict], target_date: str | Non
             "low20": agg["low20"],
             "amount": round(agg["amount"], 1),
         })
+    current_hist = width_hist[-1] if width_hist else None
+    previous_hist = width_hist[:-1]
+    current_amount = current_hist.get("amount") if current_hist else total_amount
+    derived = {
+        "advance_decline_ratio": round(up / down, 3) if down else None,
+        "breadth_gap_pp": round((up_ratio - ma20_ratio) * 100, 1),
+        "up_change_1d_pp": round((up_ratio - previous_hist[-1]["up_ratio"]) * 100, 1)
+            if previous_hist and previous_hist[-1].get("up_ratio") is not None else None,
+        "up_change_5d_pp": round((up_ratio - previous_hist[-5]["up_ratio"]) * 100, 1)
+            if len(previous_hist) >= 5 and previous_hist[-5].get("up_ratio") is not None else None,
+        "ma20_change_1d_pp": round((ma20_ratio - previous_hist[-1]["ma20_ratio"]) * 100, 1)
+            if previous_hist and previous_hist[-1].get("ma20_ratio") is not None else None,
+        "amount_vs_prev5_pct": _relative_to_average(current_amount, [x["amount"] for x in previous_hist], 5),
+        "amount_vs_prev20_pct": _relative_to_average(current_amount, [x["amount"] for x in previous_hist], 20),
+        "net_high20": high20c - low20c,
+    }
     return {
         "schema_version": RESEARCH_SCHEMA,
         "date": str(data_date) if data_date else None,
@@ -626,6 +739,9 @@ def market_summary_from_stocks(stock_results: list[dict], target_date: str | Non
             "ma20_ratio": round(ma20_ratio * 40, 1),  # 站上 MA20 占比 40%
             "highlow": round(((highlow_score + 1) / 2) * 20, 1),  # 新高-新低 20%
         },
+        "derived": derived,
+        "distribution": market_return_distribution(stock_results, target_date),
+        "methodology": MARKET_METHODOLOGY,
         "width_hist": width_hist[-20:],  # 最近 20 个交易日
         "generated_at": _dt.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
@@ -672,12 +788,10 @@ def stock_research_row(code: str, name: str, kind: str, bars: list[dict],
     }
 
 
-# ==================== 市场研究：本地缓存与后台构建 ====================
-# 缓存目录：DATA_DIR/webui_cache/。页面请求只读缓存，全市场计算在后台线程分批执行。
-# 缓存文件均带 schema_version，原子写入（临时文件 + os.replace）。
-RESEARCH_SCHEMA = 2  # v2：dd60 百分位方向 higher=True、新高/新低改 high/low 口径、target_date 聚合过滤
+# ==================== 市场研究：SQLite + 因子缓存 + 后台构建 ====================
+# 市场复盘由 SQLite 持久化；现有因子排行榜仍保留 JSON 快照。全市场计算在后台线程执行。
+RESEARCH_SCHEMA = 4  # v4：市场复盘改由 WebUI SQLite 研究库统一持久化
 RESEARCH_CACHE_DIR = DATA_DIR / "webui_cache"
-MARKET_SNAP = "market_snapshot_{date}.json"
 FACTOR_SNAP = "factor_snapshot_{date}.json"
 BUILD_STATUS_FILE = RESEARCH_CACHE_DIR / "build_status.json"
 FACTOR_META = {  # 因子 → {标题, 方向(高者好?), 公式说明}
@@ -686,6 +800,14 @@ FACTOR_META = {  # 因子 → {标题, 方向(高者好?), 公式说明}
     "vr520": {"label": "5/20 日量比", "higher": True, "formula": "近5日均量 / 近20日均量（需≥20根，均量>0）"},
     # dd60 取值 (-1, 0]，越接近 0 回撤越小越"好" → 值越大分位越高（higher=True）
     "dd60": {"label": "60 日回撤", "higher": True, "formula": "close[-1] / max(high[-60:]) - 1（需≥60根，越接近0回撤越小）"},
+}
+MARKET_METHODOLOGY = {
+    "advance_decline_ratio": "上涨家数 / 下跌家数",
+    "breadth_gap_pp": "(上涨家数占比 - 站上MA20占比) × 100，单位：百分点",
+    "up_change_nd_pp": "当日上涨占比 - N个交易日前上涨占比，单位：百分点",
+    "amount_vs_prev_n_pct": "(当日成交额 / 此前N个交易日平均成交额 - 1) × 100；基准不含当日",
+    "return_distribution": "按个股实际pct_chg分为≥5%、2~5%、0~2%、平盘、0~-2%、-2~-5%、≤-5%",
+    "sector_strength": "申万一级行业；涨跌取有效成分股等权中位数，上涨比例=上涨数/有效数，量能变化=当日行业成交额/前日行业成交额-1",
 }
 
 _research_build_lock = threading.Lock()  # 防重入：同一时间只允许一个构建任务
@@ -701,6 +823,160 @@ def _atomic_write_json(path: Path, obj) -> None:
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(obj, ensure_ascii=False), encoding="utf-8")
     os.replace(tmp, path)
+
+
+def _open_research_db(path: Path | None = None):
+    import sqlite3
+    db_path = Path(path or RESEARCH_DB_PATH)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path), timeout=30)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA busy_timeout=30000")
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+
+def ensure_research_db(path: Path | None = None) -> None:
+    """初始化 WebUI 研究库；CREATE IF NOT EXISTS 允许多线程/重启安全调用。"""
+    conn = _open_research_db(path)
+    try:
+        conn.executescript("""
+        CREATE TABLE IF NOT EXISTS market_daily (
+            date TEXT PRIMARY KEY,
+            schema_version INTEGER NOT NULL,
+            generated_at TEXT,
+            temperature REAL,
+            up_count INTEGER, down_count INTEGER, flat_count INTEGER, na_count INTEGER,
+            up_ratio REAL, median_pct REAL, total_amount REAL, amount_change REAL,
+            ma20_above INTEGER, ma20_ratio REAL, high20 INTEGER, low20 INTEGER,
+            advance_decline_ratio REAL, breadth_gap_pp REAL,
+            up_change_1d_pp REAL, up_change_5d_pp REAL, ma20_change_1d_pp REAL,
+            amount_vs_prev5_pct REAL, amount_vs_prev20_pct REAL, net_high20 INTEGER,
+            snapshot_json TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS breadth_daily (
+            date TEXT PRIMARY KEY,
+            up_ratio REAL, ma20_ratio REAL, amount REAL, high20 INTEGER, low20 INTEGER
+        );
+        CREATE TABLE IF NOT EXISTS return_distribution_daily (
+            date TEXT NOT NULL,
+            bucket TEXT NOT NULL,
+            label TEXT NOT NULL,
+            count INTEGER NOT NULL,
+            ratio REAL NOT NULL,
+            PRIMARY KEY (date, bucket),
+            FOREIGN KEY (date) REFERENCES market_daily(date) ON DELETE CASCADE
+        );
+        CREATE TABLE IF NOT EXISTS sector_daily (
+            date TEXT NOT NULL,
+            industry TEXT NOT NULL,
+            stock_count INTEGER NOT NULL,
+            median_pct REAL,
+            up_ratio REAL,
+            amount REAL,
+            amount_change REAL,
+            PRIMARY KEY (date, industry),
+            FOREIGN KEY (date) REFERENCES market_daily(date) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_sector_industry_date ON sector_daily(industry, date DESC);
+        CREATE TABLE IF NOT EXISTS methodology (
+            schema_version INTEGER NOT NULL,
+            metric TEXT NOT NULL,
+            formula TEXT NOT NULL,
+            PRIMARY KEY (schema_version, metric)
+        );
+        PRAGMA user_version=1;
+        """)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def save_market_snapshot_db(summary: dict, path: Path | None = None) -> None:
+    """一个事务写入市场日表、宽度、分布、行业和方法论。"""
+    date = str(summary.get("date") or "")
+    if not date:
+        raise ValueError("市场快照缺少 date")
+    ensure_research_db(path)
+    derived = summary.get("derived") or {}
+    conn = _open_research_db(path)
+    try:
+        with conn:
+            market_values = (
+                date, int(summary.get("schema_version") or RESEARCH_SCHEMA), summary.get("generated_at"),
+                summary.get("temperature"), summary.get("up"), summary.get("down"), summary.get("flat"),
+                summary.get("na"), summary.get("up_ratio"), summary.get("median_pct"),
+                summary.get("total_amount"), summary.get("amount_change"), summary.get("ma20_above"),
+                summary.get("ma20_ratio"), summary.get("high20"), summary.get("low20"),
+                derived.get("advance_decline_ratio"), derived.get("breadth_gap_pp"),
+                derived.get("up_change_1d_pp"), derived.get("up_change_5d_pp"),
+                derived.get("ma20_change_1d_pp"), derived.get("amount_vs_prev5_pct"),
+                derived.get("amount_vs_prev20_pct"), derived.get("net_high20"),
+                json.dumps(summary, ensure_ascii=False, separators=(",", ":")),
+            )
+            conn.execute(f"INSERT OR REPLACE INTO market_daily VALUES ({','.join('?' for _ in market_values)})",
+                         market_values)
+            for row in summary.get("width_hist") or []:
+                conn.execute("INSERT OR REPLACE INTO breadth_daily VALUES (?,?,?,?,?,?)", (
+                    str(row.get("date") or ""), row.get("up_ratio"), row.get("ma20_ratio"),
+                    row.get("amount"), row.get("high20"), row.get("low20")))
+            conn.execute("DELETE FROM return_distribution_daily WHERE date=?", (date,))
+            for row in (summary.get("distribution") or {}).get("buckets") or []:
+                conn.execute("INSERT INTO return_distribution_daily VALUES (?,?,?,?,?)", (
+                    date, row.get("key"), row.get("label"), int(row.get("count") or 0),
+                    float(row.get("ratio") or 0)))
+            conn.execute("DELETE FROM sector_daily WHERE date=?", (date,))
+            sectors = summary.get("sectors") or {}
+            sector_rows = sectors.get("rows") or (sectors.get("top") or []) + (sectors.get("bottom") or [])
+            seen = set()
+            for row in sector_rows:
+                name = str(row.get("name") or "").strip()
+                if not name or name in seen:
+                    continue
+                seen.add(name)
+                conn.execute("INSERT INTO sector_daily VALUES (?,?,?,?,?,?,?)", (
+                    date, name, int(row.get("count") or 0), row.get("median_pct"),
+                    row.get("up_ratio"), row.get("amount"), row.get("amount_change")))
+            for metric, formula in (summary.get("methodology") or {}).items():
+                conn.execute("INSERT OR REPLACE INTO methodology VALUES (?,?,?)",
+                             (RESEARCH_SCHEMA, str(metric), str(formula)))
+    finally:
+        conn.close()
+
+
+def load_latest_market_snapshot_db(path: Path | None = None) -> dict | None:
+    try:
+        ensure_research_db(path)
+        conn = _open_research_db(path)
+        try:
+            row = conn.execute("SELECT snapshot_json FROM market_daily ORDER BY date DESC LIMIT 1").fetchone()
+        finally:
+            conn.close()
+        if not row:
+            return None
+        value = json.loads(row["snapshot_json"])
+        return value if isinstance(value, dict) and value.get("schema_version") == RESEARCH_SCHEMA else None
+    except Exception:
+        return None
+
+
+def research_db_status(path: Path | None = None) -> dict:
+    db_path = Path(path or RESEARCH_DB_PATH)
+    result = {"path": str(db_path), "ok": False, "latest_date": None, "size_mb": 0.0}
+    try:
+        ensure_research_db(db_path)
+        conn = _open_research_db(db_path)
+        try:
+            row = conn.execute("SELECT MAX(date) AS latest FROM market_daily").fetchone()
+        finally:
+            conn.close()
+        result.update(ok=True, latest_date=row["latest"] if row else None,
+                      size_mb=round(db_path.stat().st_size / 2 ** 20, 2) if db_path.exists() else 0.0)
+    except Exception as exc:
+        result["error"] = str(exc)[:200]
+    return result
 
 
 def _write_build_status() -> None:
@@ -759,6 +1035,41 @@ def _load_snapshot(prefix: str) -> dict | None:
     return None
 
 
+def migrate_legacy_market_snapshot() -> bool:
+    """SQLite 为空时迁移一份旧 market_snapshot JSON；保留原文件便于人工回滚。"""
+    if load_latest_market_snapshot_db() is not None:
+        return False
+    snap = None
+    try:
+        files = sorted(
+            (p for p in RESEARCH_CACHE_DIR.iterdir()
+             if p.is_file() and p.name.startswith("market_snapshot_")),
+            key=lambda p: p.name, reverse=True)
+    except Exception:
+        files = []
+    for legacy_path in files:
+        try:
+            candidate = json.loads(legacy_path.read_text(encoding="utf-8"))
+            version = int(candidate.get("schema_version") or 0)
+            if isinstance(candidate, dict) and candidate.get("date") and 1 <= version <= RESEARCH_SCHEMA:
+                snap = candidate
+                break
+        except Exception:
+            continue
+    if not snap:
+        return False
+    # 旧版可能没有派生指标、行业或方法论；先无损迁入，后台研究任务会按 v4 完整重算。
+    snap = dict(snap)
+    snap["schema_version"] = RESEARCH_SCHEMA
+    snap.setdefault("derived", {})
+    snap.setdefault("distribution", {"buckets": []})
+    snap.setdefault("sectors", {"available": False, "rows": [], "top": [], "bottom": []})
+    snap["methodology"] = {**MARKET_METHODOLOGY, **(snap.get("methodology") or {})}
+    save_market_snapshot_db(snap)
+    log(f"📊 已迁移旧市场快照 {snap.get('date')} → {RESEARCH_DB_PATH}")
+    return True
+
+
 def _fetch_bars(code: str, months: int = 4) -> list[dict]:
     """拉取单标的近 months 个月不复权日K（升序）。复用 vals 前缀通配。"""
     import urllib.request, urllib.parse
@@ -785,6 +1096,34 @@ def _stock_name(bars: list[dict], code: str) -> str:
         if n:
             return str(n)
     return code
+
+
+def _fetch_sw1_industry_map() -> dict[str, str]:
+    """一次读取板块全集，构建 股票代码 → 申万一级行业；接口不可用时返回空映射。"""
+    import urllib.request, urllib.parse
+    try:
+        query = urllib.parse.urlencode({"cmd": "bk.get", "x": "", "category": "1"})
+        with urllib.request.urlopen(f"http://{STOCKDB_HOST}:{STOCKDB_PORT}/?{query}", timeout=20) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+    except Exception:
+        return {}
+    mapping: dict[str, str] = {}
+    for raw in data if isinstance(data, list) else []:
+        board = raw[1] if isinstance(raw, list) and len(raw) == 2 and isinstance(raw[1], dict) else raw
+        if not isinstance(board, dict):
+            continue
+        category = str(board.get("category") or "")
+        board_type = str(board.get("type") or "")
+        if category != "申万一级" and board_type != "sw_1":
+            continue
+        name = str(board.get("name") or "").strip()
+        if not name:
+            continue
+        for symbol in board.get("symbols") or []:
+            code = str(symbol).strip().split(".")[0]
+            if len(code) == 6 and code.isdigit():
+                mapping[code] = name
+    return mapping
 
 
 def _run_research_build(date_target: str) -> None:
@@ -816,12 +1155,12 @@ def _run_research_build(date_target: str) -> None:
                         "pct_chg": None, "close": None, "amount": 0.0, "prev_amount": 0.0,
                         "ma20": None, "is_high20": False, "is_low20": False, "daily": {},
                         "mom20": None, "vol20": None, "vr520": None, "dd60": None}
-            # 近20日宽度贡献（用于市场聚合）
+            # 近21日宽度贡献：图表展示20日，多取1日用于“当日相对前20日均值”。
             daily = {}
             closes = [float(b["close"]) for b in bars if b.get("close") is not None]
             highs = [float(b["high"]) for b in bars if b.get("high") is not None]
             lows = [float(b["low"]) for b in bars if b.get("low") is not None]
-            for i in range(max(0, len(bars) - 20), len(bars)):
+            for i in range(max(0, len(bars) - 21), len(bars)):
                 b = bars[i]
                 d = _bar_date(b)
                 c = float(b.get("close") or 0)
@@ -883,11 +1222,16 @@ def _run_research_build(date_target: str) -> None:
         if valid < max(10, int(len(codes) * 0.5)):
             raise RuntimeError(f"有效行情过少（{valid}/{len(codes)}），中止构建以保留旧缓存")
 
-        # 2. 聚合市场状态（仅普通股票；只统计 date==target_date 的记录）
+        # 2. 聚合市场状态（仅普通股票；只统计 date==target_date 的记录）。
+        # 板块全集只读取一次，再在内存建立 code→申万一级映射，避免逐股查询。
         stock_rows = [r for r in results if r.get("type") == "stock"]
+        industry_map = _fetch_sw1_industry_map()
+        for row in stock_rows:
+            row["industry"] = industry_map.get(str(row.get("code") or ""))
         summary = market_summary_from_stocks(stock_rows, target_date=date_target)
         if not summary.get("date"):
             raise RuntimeError("市场快照无有效数据日期，中止构建以保留旧缓存")
+        summary["sectors"] = sector_strength(stock_rows, target_date=date_target)
 
         # 3. 全市场因子百分位（股票+ETF 各自独立排名）
         for f in FACTOR_META:
@@ -897,7 +1241,7 @@ def _run_research_build(date_target: str) -> None:
                 pool = pool_stock if r.get("type") == "stock" else pool_etf
                 add_percentiles(r, f, pool, FACTOR_META[f]["higher"])
 
-        # 4. 落盘（原子写）
+        # 4. 落盘：市场复盘用单个 SQLite 事务；因子 JSON 在数据库提交后再原子发布。
         RESEARCH_CACHE_DIR.mkdir(parents=True, exist_ok=True)
         factor_payload = {
             "schema_version": RESEARCH_SCHEMA, "date": summary["date"],
@@ -908,12 +1252,21 @@ def _run_research_build(date_target: str) -> None:
                                          "vr520", "vr520_pct", "dd60", "dd60_pct")}
                       for r in results if r.get("date")],  # 排除无行情占位行
         }
-        _atomic_write_json(RESEARCH_CACHE_DIR / FACTOR_SNAP.format(date=summary["date"]), factor_payload)
-        _atomic_write_json(RESEARCH_CACHE_DIR / MARKET_SNAP.format(date=summary["date"]), summary)
-        # 清理旧日期缓存（只保留最新一份）
+        factor_path = RESEARCH_CACHE_DIR / FACTOR_SNAP.format(date=summary["date"])
+        factor_pending = factor_path.with_suffix(".pending")
+        factor_pending.write_text(json.dumps(factor_payload, ensure_ascii=False), encoding="utf-8")
+        try:
+            save_market_snapshot_db(summary)
+            os.replace(factor_pending, factor_path)
+        finally:
+            if factor_pending.exists():
+                try:
+                    factor_pending.unlink()
+                except Exception:
+                    pass
+        # 因子排行只保留最新一份；SQLite 市场历史按日期长期保留。
         for p in RESEARCH_CACHE_DIR.iterdir():
-            if p.is_file() and (p.name.startswith("market_snapshot_") or p.name.startswith("factor_snapshot_")) \
-                    and summary["date"] not in p.name:
+            if p.is_file() and p.name.startswith("factor_snapshot_") and summary["date"] not in p.name:
                 try:
                     p.unlink()
                 except Exception:
@@ -963,7 +1316,8 @@ def research_check_loop() -> None:
         try:
             st = research_status()
             need = (st.get("stale")
-                    or (st.get("data_date") and not st.get("cache_generated_at")))
+                    or (st.get("data_date") and not st.get("cache_generated_at"))
+                    or (st.get("data_date") and not st.get("market_date")))
             if need:
                 _start_research_build()
         except Exception:
@@ -972,7 +1326,7 @@ def research_check_loop() -> None:
 
 
 def research_status() -> dict:
-    """研究功能状态：结合内存状态与缓存文件。"""
+    """研究功能状态：结合内存状态、因子缓存与 SQLite 市场库。"""
     st = dict(_research_build)
     st["cache_date"] = None
     st["cache_generated_at"] = None
@@ -983,19 +1337,25 @@ def research_status() -> dict:
             st["cache_generated_at"] = _load_snapshot("factor_snapshot_").get("generated_at")
         except Exception:
             pass
+    db = research_db_status()
+    st["market_date"] = db.get("latest_date")
+    st["research_db"] = db
     st["data_date"] = data_latest_date()
-    st["stale"] = bool(st.get("cache_date") and st.get("data_date")
-                       and st["cache_date"] < st["data_date"])
+    stored_dates = [d for d in (st.get("cache_date"), st.get("market_date")) if d]
+    st["stale"] = bool(st.get("data_date") and stored_dates
+                       and min(stored_dates) < st["data_date"])
     # 服务重启后内存态为 idle，但存在有效缓存 → 归一到 done（缓存仍可用）
-    if st["state"] == "idle" and st.get("cache_date"):
+    if st["state"] == "idle" and st.get("cache_date") and st.get("market_date"):
         st["state"] = "done"
-        st["last_date"] = st["cache_date"]
+        st["last_date"] = min(st["cache_date"], st["market_date"])
     return st
 
 
 def research_market() -> dict:
-    """市场状态快照（读缓存，构建中返回上一份有效缓存或降级状态）。"""
-    snap = _load_snapshot("market_snapshot_")
+    """市场状态快照：SQLite 为主，旧 JSON 仅作迁移期只读回退。"""
+    snap = load_latest_market_snapshot_db()
+    if not snap:
+        snap = _load_snapshot("market_snapshot_")
     if snap:
         return snap
     return {"schema_version": RESEARCH_SCHEMA, "date": None, "error": "暂无市场快照",
@@ -1960,17 +2320,53 @@ tr.hr-row:hover{background:rgba(56,189,248,.04)}
 .badge-st.b-building{color:var(--brand)}
 .badge-st.b-ok{color:var(--ok)}
 .badge-st.b-fail{color:var(--err)}
-.ms-top{display:flex;gap:28px;flex-wrap:wrap;align-items:flex-start}
-.ms-temp{min-width:160px}
-.ms-temp-val{font-size:46px;font-weight:800;line-height:1.1;font-variant-numeric:tabular-nums}
-.ms-temp .lbl{font-size:12px;color:var(--muted);margin-top:6px}
-.ms-stats{flex:1;display:grid;grid-template-columns:repeat(auto-fill,minmax(118px,1fr));gap:10px;min-width:260px}
-.ms-st .lbl{font-size:12px;color:var(--muted);margin-bottom:2px}
-.ms-st .v{font-size:15px;font-weight:700}
-.bcharts{display:grid;grid-template-columns:1fr 1fr;gap:14px}
-@media(max-width:760px){.bcharts{grid-template-columns:1fr}}
-.bcharts>div{min-width:0}   /* 防 ECharts 撑破网格容器（移动端整页溢出） */
-.bcharts .bchart{width:100%;height:250px}
+.research-card{padding:20px}
+.research-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:16px}
+.research-head .card-title{margin:0;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.research-head .badge-st{margin-left:0}
+.ms-review{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin-bottom:10px}
+.ms-review-it{padding:13px 14px;background:linear-gradient(145deg,rgba(56,189,248,.09),rgba(56,189,248,.02));border:1px solid rgba(56,189,248,.16);border-radius:10px}
+.ms-review-it .lbl{font-size:11px;margin-bottom:4px}
+.ms-review-it .v{font-size:16px;font-weight:750;font-variant-numeric:tabular-nums}
+.ms-review-it .sub{color:var(--muted);font-size:11px;margin-top:2px}
+.ms-temp-line{display:flex;align-items:baseline;gap:5px}
+.ms-temp-val{font-size:19px;font-weight:800;line-height:1.2;font-variant-numeric:tabular-nums}
+.ms-temp-unit{font-size:10px;color:var(--muted);font-weight:500}
+.ms-temp-track{height:5px;border-radius:99px;background:rgba(143,162,188,.16);overflow:hidden;margin-top:14px}
+.ms-temp-track i{display:block;width:0;height:100%;border-radius:inherit;background:var(--brand);transition:width .4s ease,background .4s ease}
+.ms-stats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}
+.ms-st{min-width:0;padding:12px 14px;background:rgba(22,34,56,.58);border:1px solid rgba(143,162,188,.10);border-radius:10px}
+.ms-st .lbl{font-size:11px;color:var(--muted);margin-bottom:3px;white-space:nowrap}
+.ms-st .v{font-size:15px;font-weight:700;font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ms-st .sub{display:block;color:var(--muted);font-size:11px;font-weight:500;margin-top:1px}
+.ms-dist{margin-top:12px;padding:12px 14px;background:rgba(22,34,56,.30);border:1px solid rgba(143,162,188,.10);border-radius:10px}
+.ms-section-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:9px;font-size:12px;font-weight:650}
+.ms-section-head span{color:var(--muted);font-size:10px;font-weight:400}
+.dist-bar{height:10px;display:flex;overflow:hidden;border-radius:99px;background:var(--panel2)}
+.dist-bar i{display:block;height:100%;min-width:0}
+.dist-bar .ge5{background:#EF4444}.dist-bar .up2_5{background:#F87171}.dist-bar .up0_2{background:#FCA5A5}
+.dist-bar .flat{background:#64748B}.dist-bar .down0_2{background:#86EFAC}.dist-bar .down2_5{background:#4ADE80}.dist-bar .le_neg5{background:#16A34A}
+.dist-legend{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:8px;margin-top:9px}
+.dist-it{min-width:0}.dist-it .k{font-size:9px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.dist-it .n{font-size:12px;font-weight:700;font-variant-numeric:tabular-nums}
+.ms-note{margin-top:12px;border-top:1px solid rgba(143,162,188,.10);padding-top:10px;color:var(--muted);font-size:11px}
+.ms-note summary{cursor:pointer;display:inline-flex;align-items:center;gap:6px;list-style:none;color:var(--muted);user-select:none}
+.ms-note summary::-webkit-details-marker{display:none}
+.ms-note summary:before{content:'+';display:inline-grid;place-items:center;width:15px;height:15px;border:1px solid var(--line);border-radius:50%;font-size:12px;line-height:1}
+.ms-note[open] summary:before{content:'−'}
+.ms-note-body{margin-top:7px;line-height:1.75}
+.bcharts{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.chart-panel{min-width:0;background:rgba(22,34,56,.38);border:1px solid rgba(143,162,188,.10);border-radius:10px;padding:12px 12px 4px}
+.chart-title{display:flex;align-items:center;justify-content:space-between;gap:8px;color:var(--text);font-size:12px;font-weight:600;padding:0 2px}
+.chart-title span{color:var(--muted);font-size:10px;font-weight:400}
+.bcharts .bchart{width:100%;height:272px}
+.sector-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.sector-panel{border:1px solid rgba(143,162,188,.10);background:rgba(22,34,56,.30);border-radius:10px;padding:12px 14px;min-width:0}
+.sector-title{display:flex;justify-content:space-between;color:var(--text);font-size:12px;font-weight:650;margin-bottom:5px}
+.sector-title span{color:var(--muted);font-size:9px;font-weight:400}
+.sector-row{display:grid;grid-template-columns:minmax(70px,1fr) 64px 64px 70px;gap:6px;align-items:center;padding:7px 0;border-top:1px solid rgba(143,162,188,.08);font-size:11px}
+.sector-row:first-of-type{border-top:0}.sector-row .name{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.sector-row .num{text-align:right;font-variant-numeric:tabular-nums}
+@media(max-width:900px){.ms-review{grid-template-columns:1fr}.ms-stats{grid-template-columns:repeat(2,minmax(0,1fr))}.bcharts,.sector-grid{grid-template-columns:1fr}.dist-legend{grid-template-columns:repeat(4,minmax(0,1fr))}}
+@media(max-width:560px){.research-card{padding:16px}.research-head{align-items:flex-start}.ms-stats{grid-template-columns:1fr 1fr}.ms-st{padding:10px}.ms-st .v{font-size:14px}.bcharts .bchart{height:250px}.sector-row{grid-template-columns:minmax(64px,1fr) 58px 58px 64px}}
 .filters{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px}
 .filters input[type=text]{width:150px}
 .ftable-wrap{overflow-x:auto}
@@ -2018,22 +2414,22 @@ color:var(--text);padding:8px 10px;border-radius:8px;width:220px}
 
 <!-- 市场研究：①市场状态 ②宽度趋势 ③因子排行 ④个股研究 + 自选股 -->
 <div id="tab-research" class="tab-panel active">
-  <div class="card"><div class="card-title">市场状态 <span class="hint" style="font-weight:normal">（本地数据 · 仅普通股票）</span><span class="badge-st" id="msBuild">…</span></div>
-    <div class="ms-top">
-      <div class="ms-temp">
-        <div class="ms-temp-val" id="msTemp">—</div>
-        <div class="lbl">市场温度 <span id="tempHelp" style="cursor:help;color:var(--muted)" title="上涨家数占比40% + 站上MA20占比40% + (20日新高占比-新低占比)20%，各分项归一化0~100。仅描述市场状态，不构成买卖建议。">ⓘ</span></div>
-      </div>
-      <div class="ms-stats" id="msStats"></div>
-    </div>
-    <div class="hint" id="msNote" style="margin-top:10px"></div>
+  <div class="card research-card"><div class="research-head"><div class="card-title">今日市场复盘 <span class="hint" id="msAsOf" style="font-weight:normal">本地数据 · 仅普通股票</span></div><span class="badge-st" id="msBuild">…</span></div>
+    <div class="ms-review" id="msReview"></div>
+    <div class="ms-stats" id="msStats"></div>
+    <div class="ms-dist" id="msDistribution"></div>
+    <details class="ms-note"><summary>查看温度构成与统计口径</summary><div class="ms-note-body" id="msNote"></div></details>
   </div>
 
-  <div class="card"><div class="card-title">市场宽度趋势 <span class="hint" style="font-weight:normal">（最近 20 个交易日）</span></div>
+  <div class="card research-card"><div class="research-head"><div class="card-title">市场宽度趋势 <span class="hint" style="font-weight:normal">最近 20 个交易日</span></div></div>
     <div class="bcharts">
-      <div><div class="lbl">上涨占比 vs 站上 MA20 占比</div><div class="bchart" id="wchart1"></div></div>
-      <div><div class="lbl">成交额 · 20 日新高/新低</div><div class="bchart" id="wchart2"></div></div>
+      <div class="chart-panel"><div class="chart-title">市场参与度 <span>上涨占比 · 站上 MA20</span></div><div class="bchart" id="wchart1"></div></div>
+      <div class="chart-panel"><div class="chart-title">量能与强弱 <span>成交额 · 20 日新高/新低</span></div><div class="bchart" id="wchart2"></div></div>
     </div>
+  </div>
+
+  <div class="card research-card" id="sectorCard"><div class="research-head"><div class="card-title">行业强弱 <span class="hint" id="sectorMeta" style="font-weight:normal">申万一级 · 个股等权</span></div></div>
+    <div class="sector-grid" id="sectorGrid"></div>
   </div>
 
   <div class="card"><div class="card-title">因子排行榜 <span class="hint" style="font-weight:normal" id="fMeta"></span></div>
@@ -2201,6 +2597,7 @@ color:var(--text);padding:8px 10px;border-radius:8px;width:220px}
       <div class="it"><span class="lk">WebUI 启动</span><span id="cStart">—</span></div>
       <div class="it"><span class="lk">调度心跳</span><span id="cHeartbeat">—</span></div>
       <div class="it"><span class="lk">数据目录</span><span id="cDataDir">—</span></div>
+      <div class="it"><span class="lk">研究数据库</span><span id="cResearchDB">—</span></div>
       <div class="it"><span class="lk">交易日历</span><span id="cCalendar">—</span></div>
       <div class="it"><span class="lk">最近同步</span><span id="cLastSyncInfo">—</span></div>
     </div>
@@ -2522,6 +2919,8 @@ function renderSystem(s){
     }else hb.textContent='—';
   }
   $('cDataDir').textContent=s.data_dir||'—';
+  const rdb=s.research_db||{};
+  $('cResearchDB').textContent=rdb.ok?((rdb.path||'—')+' · '+(rdb.size_mb||0)+' MB'+(rdb.latest_date?' · '+rdb.latest_date:'')):('异常'+(rdb.error?'：'+rdb.error:''));
   // 交易日历覆盖：临近到期（<90 天）黄色提醒
   const cal=s.calendar||{};
   const cCal=$('cCalendar');
@@ -2612,26 +3011,54 @@ async function loadResearchMarket(){
   try{
     const m=await j('/api/research/market');
     marketLast=m;
-    if(m.error){$('msStats').innerHTML='<span class="hint">'+esc(m.error)+'</span>';$('msTemp').textContent='—';$('msNote').textContent='';return}
+    if(m.error){$('msReview').innerHTML='';$('msStats').innerHTML='<span class="hint">'+esc(m.error)+'</span>';$('msDistribution').innerHTML='';$('sectorGrid').innerHTML='<span class="hint">等待市场快照</span>';$('msNote').textContent='';return}
     renderMarket(m);
     if(!_rsMarketLoaded){_rsMarketLoaded=true;renderWidthCharts(m)}
   }catch(e){}
 }
 function renderMarket(m){
-  $('msTemp').textContent=(m.temperature!=null?m.temperature:'—');
-  const upc=m.up_ratio!=null?Math.round(m.up_ratio*100):null;
-  const mac=m.ma20_ratio!=null?Math.round(m.ma20_ratio*100):null;
+  const temp=m.temperature!=null?Math.max(0,Math.min(100,Number(m.temperature))):null;
+  const upc=m.up_ratio!=null?m.up_ratio*100:null;
+  const mac=m.ma20_ratio!=null?m.ma20_ratio*100:null;
   const hi20=m.high20||0,lo20=m.low20||0;
+  const d=m.derived||{};
+  const ad=d.advance_decline_ratio!=null?d.advance_decline_ratio:(m.down?Number(m.up||0)/Number(m.down):null);
+  const gap=d.breadth_gap_pp!=null?d.breadth_gap_pp:(upc!=null&&mac!=null?upc-mac:null);
+  const netHigh=d.net_high20!=null?d.net_high20:hi20-lo20;
+  const hist=m.width_hist||[],lastHist=hist.length?hist[hist.length-1]:null;
+  const prev=lastHist&&String(lastHist.date)===String(m.date)?(hist.length>1?hist[hist.length-2]:null):lastHist;
+  const upDelta=d.up_change_1d_pp!=null?d.up_change_1d_pp:(prev&&prev.up_ratio!=null&&m.up_ratio!=null?(m.up_ratio-prev.up_ratio)*100:null);
+  const signed=(v,d=1)=>v==null?'—':(v>0?'+':'')+Number(v).toFixed(d);
+  $('msAsOf').textContent=(m.date?fmtYMD(m.date)+' · ':'')+'本地数据 · 仅普通股票';
+  $('msReview').innerHTML=`
+    <div class="ms-review-it"><div class="lbl">当日赚钱效应</div><div class="v">${upc!=null?upc.toFixed(1)+'%':'—'} 上涨</div><div class="sub">A/D ${ad!=null?Number(ad).toFixed(2):'—'} · 1日 ${signed(upDelta)}pp · 5日 ${signed(d.up_change_5d_pp)}pp</div></div>
+    <div class="ms-review-it"><div class="lbl">短线与中期趋势</div><div class="v">上涨－MA20 ${signed(gap)}pp</div><div class="sub">站上 MA20 ${mac!=null?mac.toFixed(1)+'%':'—'} · 1日 ${signed(d.ma20_change_1d_pp)}pp</div></div>
+    <div class="ms-review-it"><div class="lbl">量能确认</div><div class="v">较前5日均额 ${signed(d.amount_vs_prev5_pct)}%</div><div class="sub">成交额 ${fmtAmount(m.total_amount)} · 较前20日均额 ${signed(d.amount_vs_prev20_pct)}%</div></div>`;
   $('msStats').innerHTML=`
-    <div class="ms-st"><div class="lbl">数据日期</div><div class="v">${m.date?fmtYMD(m.date):'—'}</div></div>
-    <div class="ms-st"><div class="lbl">上涨 / 下跌 / 平盘</div><div class="v">${m.up||0} / ${m.down||0} / ${m.flat||0}<span style="font-size:12px;color:var(--muted)"> · 停牌/无数据 ${m.na||0}</span></div></div>
+    <div class="ms-st"><div class="lbl">综合温度 <span id="tempHelp" style="cursor:help" title="上涨家数占比40% + 站上MA20占比40% + (20日新高占比-新低占比)20%，各分项归一化0~100。仅描述市场状态，不构成买卖建议。">ⓘ</span></div><div class="ms-temp-line"><span class="ms-temp-val">${temp!=null?temp:'—'}</span><span class="ms-temp-unit">/ 100</span></div><div class="ms-temp-track" aria-hidden="true"><i style="width:${temp==null?0:temp}%"></i></div></div>
+    <div class="ms-st"><div class="lbl">上涨 / 下跌 / 平盘</div><div class="v">${m.up||0} / ${m.down||0} / ${m.flat||0}<span class="sub">停牌 / 无数据 ${m.na||0}</span></div></div>
     <div class="ms-st"><div class="lbl">涨跌幅中位数</div><div class="v">${fmtPct(m.median_pct)}</div></div>
-    <div class="ms-st"><div class="lbl">全市场成交额</div><div class="v">${fmtAmount(m.total_amount)}</div></div>
-    <div class="ms-st"><div class="lbl">成交额变化</div><div class="v" style="color:${(m.amount_change||0)>0?'var(--ok)':(m.amount_change||0)<0?'var(--err)':'var(--text)'}">${m.amount_change!=null?fmtPct(m.amount_change):'—'}</div></div>
-    <div class="ms-st"><div class="lbl">站上 MA20</div><div class="v">${m.ma20_above||0} <span style="font-size:12px;color:var(--muted)">${mac!=null?mac+'%':''}</span></div></div>
-    <div class="ms-st"><div class="lbl">20 日新高 / 新低</div><div class="v">${hi20} / ${lo20}</div></div>`;
+    <div class="ms-st"><div class="lbl">全市场成交额</div><div class="v">${fmtAmount(m.total_amount)}<span class="sub" style="color:${(m.amount_change||0)>0?'var(--ok)':(m.amount_change||0)<0?'var(--err)':'var(--muted)'}">较前日 ${m.amount_change!=null?fmtPct(m.amount_change):'—'}</span></div></div>
+    <div class="ms-st"><div class="lbl">站上 MA20</div><div class="v">${mac!=null?mac.toFixed(1)+'%':'—'}<span class="sub">${m.ma20_above||0} 只股票</span></div></div>
+    <div class="ms-st"><div class="lbl">20 日新高 / 新低</div><div class="v">${hi20} / ${lo20}<span class="sub">净新高 ${signed(netHigh,0)}</span></div></div>`;
+  renderReturnDistribution(m.distribution||{});
+  renderSectorStrength(m.sectors||{});
   const tc=m.temp_components||{};
-  $('msNote').innerHTML='<span class="hint">温度构成：上涨家数占比 <b style="color:var(--text)">'+(tc.up_ratio!=null?tc.up_ratio:'—')+'</b>（40%） ｜ 站上 MA20 <b style="color:var(--text)">'+(tc.ma20_ratio!=null?tc.ma20_ratio:'—')+'</b>（40%） ｜ 20日新高-新低 <b style="color:var(--text)">'+(tc.highlow!=null?tc.highlow:'—')+'</b>（20%）　·　范围：普通股票，停牌/无数据不计入涨跌比例。仅描述市场状态，不构成买卖建议。</span>';
+  $('msNote').innerHTML='A/D＝上涨家数÷下跌家数；上涨－MA20＝上涨占比－站上MA20占比；1日/5日变化均为百分点差。成交额对比使用<b style="color:var(--text)">此前</b>5日/20日均额，不把当日放入基准。行业按申万一级聚合，行业涨跌取成分股等权中位数，上涨比例＝上涨成分股÷有效成分股。<br>涨跌分布按个股实际涨跌幅分桶；≥9.5%仅标记“大涨/大跌”，不等同涨停/跌停。温度＝上涨家数占比 '+(tc.up_ratio!=null?tc.up_ratio:'—')+'（40%）＋站上MA20 '+(tc.ma20_ratio!=null?tc.ma20_ratio:'—')+'（40%）＋新高/新低 '+(tc.highlow!=null?tc.highlow:'—')+'（20%）。指标仅描述市场状态，不构成买卖建议。';
+}
+function renderReturnDistribution(dist){
+  const rows=dist.buckets||[];
+  if(!rows.length){$('msDistribution').innerHTML='<div class="hint">涨跌分布将在重新计算后生成</div>';return}
+  const bar=rows.map(x=>`<i class="${esc(x.key)}" style="width:${Math.max(0,Number(x.ratio||0)*100)}%" title="${esc(x.label)} ${x.count||0}只"></i>`).join('');
+  const legend=rows.map(x=>`<div class="dist-it"><div class="k">${esc(x.label)}</div><div class="n">${x.count||0}</div></div>`).join('');
+  $('msDistribution').innerHTML=`<div class="ms-section-head">涨跌幅分布 <span>大涨 ≥9.5%：${dist.large_up||0} · 大跌 ≤−9.5%：${dist.large_down||0}</span></div><div class="dist-bar">${bar}</div><div class="dist-legend">${legend}</div>`;
+}
+function renderSectorStrength(data){
+  const meta=$('sectorMeta');
+  if(!data.available){meta.textContent='申万一级 · 板块映射暂不可用';$('sectorGrid').innerHTML='<div class="hint">重新计算时会批量读取 StockDB 板块映射；接口无数据时不生成行业排名。</div>';return}
+  meta.textContent='申万一级 · 已映射 '+(data.mapped||0)+' 只 · 未映射 '+(data.unmapped||0)+' 只';
+  const panel=(title,rows)=>`<div class="sector-panel"><div class="sector-title">${title}<span>中位涨跌 / 上涨占比 / 量能变化</span></div>${(rows||[]).map(x=>`<div class="sector-row"><span class="name">${esc(x.name)}</span><span class="num" style="${pctCls(x.median_pct||0)}">${fmtPct(x.median_pct)}</span><span class="num">${x.up_ratio!=null?(x.up_ratio*100).toFixed(0)+'%':'—'}</span><span class="num">${fmtPct(x.amount_change)}</span></div>`).join('')}</div>`;
+  $('sectorGrid').innerHTML=panel('领涨行业',data.top)+panel('领跌行业',data.bottom);
 }
 function fmtAmount(v){
   if(v==null)return '—';
@@ -2644,35 +3071,40 @@ function renderWidthCharts(m){
   const hist=m.width_hist||[];
   if(!hist.length){$('wchart1').innerHTML='<span class="hint">（暂无宽度历史）</span>';$('wchart2').innerHTML='';return}
   const dates=hist.map(x=>String(x.date).slice(4));
-  const c1=echarts.init($('wchart1'),'dark');c1.clear();
+  const axisColor='#71859F',gridColor='rgba(143,162,188,.10)';
+  const c1=echarts.getInstanceByDom($('wchart1'))||echarts.init($('wchart1'),'dark');c1.clear();
   window._wchart1=c1;
   c1.setOption({
     backgroundColor:'transparent',
-    tooltip:{trigger:'axis'},
-    legend:{right:4,top:0,textStyle:{color:'#8FA2BC',fontSize:11}},
-    grid:{left:44,right:12,top:28,bottom:22},
-    xAxis:{type:'category',data:dates,axisLabel:{color:'#8FA2BC',fontSize:10}},
-    yAxis:{type:'value',max:1,axisLabel:{formatter:v=>(v*100)+'%',color:'#8FA2BC',fontSize:10},splitLine:{lineStyle:{color:'#162238'}}},
+    aria:{enabled:true,description:'最近20个交易日的上涨股票占比与站上20日均线股票占比'},
+    tooltip:{trigger:'axis',backgroundColor:'#0B1120',borderColor:'#263A58',textStyle:{color:'#E5EDF8',fontSize:11},
+      valueFormatter:v=>v==null?'—':(v*100).toFixed(1)+'%'},
+    legend:{right:4,top:3,itemWidth:16,itemHeight:7,textStyle:{color:'#8FA2BC',fontSize:10}},
+    grid:{left:44,right:10,top:38,bottom:30},
+    xAxis:{type:'category',boundaryGap:false,data:dates,axisTick:{show:false},axisLine:{lineStyle:{color:gridColor}},axisLabel:{color:axisColor,fontSize:10,formatter:v=>v.slice(0,2)+'/'+v.slice(2)}},
+    yAxis:{type:'value',min:0,max:1,interval:.25,axisLabel:{formatter:v=>(v*100)+'%',color:axisColor,fontSize:10},axisLine:{show:false},axisTick:{show:false},splitLine:{lineStyle:{color:gridColor}}},
     series:[
-      {name:'上涨占比',type:'line',data:hist.map(x=>x.up_ratio),smooth:true,showSymbol:false,lineStyle:{width:1.5,color:'#F87171'}},
-      {name:'站上MA20',type:'line',data:hist.map(x=>x.ma20_ratio),smooth:true,showSymbol:false,lineStyle:{width:1.5,color:'#38BDF8'}}
+      {name:'上涨占比',type:'line',data:hist.map(x=>x.up_ratio),smooth:.3,showSymbol:false,emphasis:{focus:'series'},lineStyle:{width:2,color:'#F87171'},areaStyle:{color:'rgba(248,113,113,.07)'}},
+      {name:'站上 MA20',type:'line',data:hist.map(x=>x.ma20_ratio),smooth:.3,showSymbol:false,emphasis:{focus:'series'},lineStyle:{width:2,color:'#38BDF8'},areaStyle:{color:'rgba(56,189,248,.06)'}}
     ]
   });
-  const c2=echarts.init($('wchart2'),'dark');c2.clear();
+  const c2=echarts.getInstanceByDom($('wchart2'))||echarts.init($('wchart2'),'dark');c2.clear();
   window._wchart2=c2;
   c2.setOption({
     backgroundColor:'transparent',
-    tooltip:{trigger:'axis'},
-    legend:{right:4,top:0,textStyle:{color:'#8FA2BC',fontSize:11}},
-    grid:[{left:50,right:12,top:28,height:'55%'},{left:50,right:12,top:'72%',height:'22%'}],
-    xAxis:[{type:'category',data:dates,axisLabel:{color:'#8FA2BC',fontSize:10}},
-           {type:'category',gridIndex:1,data:dates,axisLabel:{show:false}}],
-    yAxis:[{type:'value',axisLabel:{formatter:v=>v>=1e8?((v/1e8)+'亿'):v,color:'#8FA2BC',fontSize:10},splitLine:{lineStyle:{color:'#162238'}}},
-           {gridIndex:1,type:'value',splitLine:{show:false},axisLabel:{color:'#8FA2BC',fontSize:10}}],
+    aria:{enabled:true,description:'最近20个交易日的全市场成交额及创20日新高和新低股票数量'},
+    tooltip:{trigger:'axis',backgroundColor:'#0B1120',borderColor:'#263A58',textStyle:{color:'#E5EDF8',fontSize:11}},
+    legend:{right:4,top:3,itemWidth:16,itemHeight:7,textStyle:{color:'#8FA2BC',fontSize:10}},
+    grid:{left:50,right:48,top:38,bottom:30},
+    xAxis:{type:'category',data:dates,axisTick:{show:false},axisLine:{lineStyle:{color:gridColor}},axisLabel:{color:axisColor,fontSize:10,formatter:v=>v.slice(0,2)+'/'+v.slice(2)}},
+    yAxis:[
+      {type:'value',name:'亿元',nameTextStyle:{color:axisColor,fontSize:9},axisLabel:{color:axisColor,fontSize:10},axisLine:{show:false},axisTick:{show:false},splitLine:{lineStyle:{color:gridColor}}},
+      {type:'value',name:'家数',nameTextStyle:{color:axisColor,fontSize:9},axisLabel:{color:axisColor,fontSize:10},axisLine:{show:false},axisTick:{show:false},splitLine:{show:false}}
+    ],
     series:[
-      {name:'成交额',type:'bar',data:hist.map(x=>x.amount),itemStyle:{color:'#38BDF8',opacity:.7}},
-      {name:'20日新高',type:'line',xAxisIndex:1,yAxisIndex:1,data:hist.map(x=>x.high20),showSymbol:false,lineStyle:{width:1,color:'#22C55E'}},
-      {name:'20日新低',type:'line',xAxisIndex:1,yAxisIndex:1,data:hist.map(x=>x.low20),showSymbol:false,lineStyle:{width:1,color:'#EF4444'}}
+      {name:'成交额',type:'bar',data:hist.map(x=>x.amount==null?null:+(x.amount/1e8).toFixed(1)),barMaxWidth:20,itemStyle:{color:'#38BDF8',opacity:.48,borderRadius:[3,3,0,0]}},
+      {name:'20 日新高',type:'line',yAxisIndex:1,data:hist.map(x=>x.high20),smooth:.25,showSymbol:false,emphasis:{focus:'series'},lineStyle:{width:1.8,color:'#22C55E'}},
+      {name:'20 日新低',type:'line',yAxisIndex:1,data:hist.map(x=>x.low20),smooth:.25,showSymbol:false,emphasis:{focus:'series'},lineStyle:{width:1.8,color:'#EF4444'}}
     ]
   });
 }
@@ -2966,6 +3398,7 @@ class Handler(BaseHTTPRequestHandler):
             "webui": {"version": WEBUI_VERSION, "started": _webui_started,
                       "heartbeat": _scheduler_heartbeat},
             "data_dir": str(DATA_DIR),
+            "research_db": research_db_status(),
             "last_sync": last_sync_summary(),
             "schedule": load_schedule(),
             "calendar": {"through": XSHG_HOLIDAYS_THROUGH,
@@ -3192,6 +3625,9 @@ def main():
     print(f"webui listening on 0.0.0.0:{LISTEN_PORT}", file=sys.stderr)
     print(f"stockdb: {STOCKDB_HOST}:{STOCKDB_PORT} | container: {STOCKDB_CONTAINER} | data: {DATA_DIR}",
           file=sys.stderr)
+    ensure_research_db()
+    migrate_legacy_market_snapshot()
+    print(f"research db: {RESEARCH_DB_PATH}", file=sys.stderr)
     threading.Thread(target=scheduler_loop, daemon=True).start()
     threading.Thread(target=research_check_loop, daemon=True).start()
     ThreadingHTTPServer(("0.0.0.0", LISTEN_PORT), Handler).serve_forever()

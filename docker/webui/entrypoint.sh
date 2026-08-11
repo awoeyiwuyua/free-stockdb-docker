@@ -2,7 +2,7 @@
 # webui 容器入口：初始化数据卷内的配置模板后启动 Python HTTP 服务
 set -eu
 
-mkdir -p /data /mydb
+mkdir -p /data /research
 
 # sync_url.txt 模板落卷（首次启动），用户可后续编辑 /data/sync_url.txt
 if [ ! -f /data/sync_url.txt ]; then

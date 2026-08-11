@@ -18,13 +18,15 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 : "${STOCKDB_PORT:=7899}"
 : "${WEBUI_PORT:=8080}"
 : "${DATA_DIR:=$DIR/.dev-data}"
+: "${RESEARCH_DB_PATH:=$DATA_DIR/market_research.sqlite3}"
 
 mkdir -p "$DATA_DIR"
-export STOCKDB_HOST STOCKDB_PORT WEBUI_PORT DATA_DIR
+export STOCKDB_HOST STOCKDB_PORT WEBUI_PORT DATA_DIR RESEARCH_DB_PATH
 
 echo "→ webui    http://127.0.0.1:${WEBUI_PORT}"
 echo "  stockdb  ${STOCKDB_HOST}:${STOCKDB_PORT}"
 echo "  本地数据  ${DATA_DIR}（仅自选/历史/日志等落盘，不碰 NAS 数据卷）"
+echo "  研究数据库 ${RESEARCH_DB_PATH}"
 echo "  注意：docker 操控与同步仅在 NAS 容器内可用，本地对应接口返回降级提示"
 
 exec python3 "$DIR/app.py"
