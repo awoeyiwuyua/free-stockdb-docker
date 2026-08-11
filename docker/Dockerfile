@@ -55,8 +55,12 @@ FROM alpine:3.20
 RUN apk add --no-cache tzdata ca-certificates
 
 COPY --from=build /out/stockdb /opt/stockdb
+# 发行版自带 stockdb.conf 是 127.0.0.1 原版且 conf 必须命令行传入；
+# 容器内统一用 /etc/stockdb/stockdb.conf 模板（0.0.0.0 + 卷内 pidfile/log），
+# 删掉自带的避免混淆。
+RUN rm -f /opt/stockdb/stockdb.conf
 
-# 容器内监听必须 0.0.0.0 才能对外映射；conf 覆盖版由 entrypoint 应用
+# 容器内监听必须 0.0.0.0 才能对外映射；conf 模板由 entrypoint 拷到 /data 卷
 COPY stockdb.conf /etc/stockdb/stockdb.conf
 COPY entrypoint.sh sync.sh /opt/stockdb/
 

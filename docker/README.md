@@ -13,9 +13,9 @@ NAS 拉取时自动匹配自身 CPU 架构。
 |------|------|
 | `Dockerfile` | 多阶段：下载官方发布包 + SHA256 校验 + 静态二进制打包进 alpine |
 | `docker-compose.yml` | `stockdb` 服务（常驻）+ `stockdb-sync`（一次性增量同步，sync profile） |
-| `stockdb.conf` | 容器内配置：`server.ip: 0.0.0.0`（默认 127.0.0.1，容器内必须改才能映射） |
-| `entrypoint.sh` | 容器入口：数据卷对齐（`data/`、`mydb/` 软链到卷）→ 应用 conf → 启动服务端 |
-| `sync.sh` | 同步封装：读 `/data/sync_url.txt` 同步源，增量同步 |
+| `stockdb.conf` | 容器内配置模板：`server.ip: 0.0.0.0`（默认 127.0.0.1，容器内必须改才能映射）；pidfile/log 绝对路径落 `/data` 卷；首次启动拷到 `/data/stockdb.conf` 供编辑 |
+| `entrypoint.sh` | 容器入口：切到 `/data` 可写卷 → 拷贝 conf/sync_url 模板 → 以绝对路径 conf 启动 `stockdb`（发行版要求 `stockdb /path/to/conf`） |
+| `sync.sh` | 同步封装：切到 `/data` → 读 `/data/sync_url.txt` 数据源 → 运行 `数据更新` 增量同步 |
 | `.github/workflows/build-image.yml` | GitHub Actions：手动触发，buildx 构建 amd64+arm64 推 ghcr.io |
 
 ---
@@ -122,3 +122,15 @@ docker compose pull && docker compose up -d
 - ghcr 国内拉取不稳：备选 `docker save` 导出 tar 到极空间导入
 - 默认数据源 `http://a.123128.xyz` 走公网：不可达则改 `sync_url.txt` 指向内网镜像/自建源
 - 镜像构建需 GitHub 可访问；如网络受限，走「备选：本机/极空间构建」路径
+
+### 排障：容器一直重启（Restarting / Exit 循环）
+
+`stockdb` 发行版的行为约束（已实测二进制确认）：
+- **conf 必须作为命令行参数**：用法 `stockdb [-d] /path/to/conf`，不传 conf 会 `error loading conf file` 直接退出
+- **pidfile/log 必须可写**：conf 里 `pidfile`/`output` 若指向只读路径（镜像层）会写失败退出
+- **数据目录硬编码绝对路径** `/data`（行情）、`/mydb`（私有库），由 compose 卷挂载
+
+entrypoint 已按上述约束实现（`cd /data` + 绝对路径 conf 启动）。若仍重启：
+1. `docker compose logs stockdb` 看退出原因（conf 报错 / pidfile 报错 / 端口占用）
+2. 端口被占：compose 里宿主端口换 `17899:7899`，访问改 `http://<NAS_IP>:17899`
+3. 数据卷权限：确认 `./data` 目录容器可写（极空间共享目录需在 Docker 里映射为可写）

@@ -1,21 +1,25 @@
 #!/bin/sh
 # free-stockdb 容器启动入口
-# 职责：数据卷对齐 -> conf 覆盖 -> 启动服务端（前台，随容器生命周期）
+# 发行版用法：stockdb [-d] /path/to/conf  （conf 必须作为命令行参数）
+# 发行版数据路径硬编码为绝对路径：/data（行情）、/mydb（私有库）
 set -eu
 
-cd /opt/stockdb
-
-# ---- 1. 数据目录对齐到卷（发行版默认 data 为 work_dir 下 ./data，mydb 为 ./mydb）----
+# ---- 1. 数据卷准备（发行版硬编码 /data /mydb 绝对路径）----
 mkdir -p /data /mydb
-# 首次启动：把发行包自带的 sync_url.txt 落到卷内一份，便于用户直接编辑 /data/sync_url.txt
-if [ ! -f /data/sync_url.txt ]; then
-  cp ./sync_url.txt /data/sync_url.txt
+
+# ---- 2. 工作目录切到可写卷 ----
+# conf 里 pidfile/log 为相对 work_dir 路径（./stockdb.pid、./log.txt），
+# 若在 /opt/stockdb（镜像只读层）会写失败导致启动即退出。
+cd /data
+
+# ---- 3. conf 落卷（可写 + 用户可改），首次启动从镜像模板拷贝 ----
+if [ ! -f /data/stockdb.conf ]; then
+  cp /etc/stockdb/stockdb.conf /data/stockdb.conf
 fi
-ln -sfn /data ./data
-ln -sfn /mydb ./mydb
+# sync_url.txt 同样落卷，便于用户编辑同步源
+if [ ! -f /data/sync_url.txt ]; then
+  cp /opt/stockdb/sync_url.txt /data/sync_url.txt
+fi
 
-# ---- 2. 应用容器内 conf（监听 0.0.0.0）----
-cp /etc/stockdb/stockdb.conf ./stockdb.conf
-
-# ---- 3. 启动服务端（前台）----
-exec ./stockdb
+# ---- 4. 启动服务端（前台，带 conf 绝对路径）----
+exec /opt/stockdb/stockdb /data/stockdb.conf
