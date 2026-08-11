@@ -31,7 +31,7 @@ env:
   # 固定包名，避免随仓库名漂移（fork 仓库名带 -docker 后缀时也不会改变）
   IMAGE_NAME: free-stockdb
   WEBUI_IMAGE_NAME: free-stockdb-webui
-  WEBUI_VERSION: '0.2.0'
+  WEBUI_VERSION: '0.3.0'
 
 jobs:
   build-stockdb:
