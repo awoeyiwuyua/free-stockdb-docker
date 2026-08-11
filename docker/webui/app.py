@@ -9,8 +9,8 @@
 
 安全边界：
   - docker 操控仅限固定的 stockdb 容器（stop/start/inspect 白名单），
-    不开放任意命令；页面用可选的同步令牌（WEBUI_TOKEN）保护写操作
-  - 只读查询不校验令牌（局域网内行情查看免密），写操作（同步）需令牌
+    不开放任意命令；写操作（同步/定时/自选）面向内网信任环境，无令牌鉴权。
+  - 只读查询不鉴权；局域网部署即可，如需公网暴露请自行加反向代理鉴权。
   - 同步串行化（互斥锁），防止并发点击
 """
 
@@ -35,7 +35,6 @@ STOCKDB_CONTAINER = os.environ.get("STOCKDB_CONTAINER", "stockdb")
 DOCKER_SOCKET = os.environ.get("DOCKER_SOCKET", "/var/run/docker.sock")
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 SYNC_LOG = DATA_DIR / "sync.log"
-WEBUI_TOKEN = os.environ.get("WEBUI_TOKEN", "")   # 空=不启用写保护
 LISTEN_PORT = int(os.environ.get("WEBUI_PORT", "8080"))
 
 # 同步线程状态
@@ -43,6 +42,7 @@ _sync_lock = threading.Lock()
 _sync_state = {"running": False, "exit_code": None, "last_start": None, "last_end": None}
 _last_sync_stdout: str = ""          # 最近一次同步的 stdout（供解析下载/删除数）
 _last_verify_result: str | None = None  # 最近一次完整性验证结果（pass/fail/跳过）
+_scheduler_alive = False             # 定时线程心跳（每次循环更新时间戳）
 
 HISTORY_FILE = DATA_DIR / "sync_history.json"
 SCHEDULE_FILE = DATA_DIR / "sync_schedule.json"
@@ -250,7 +250,8 @@ def docker_request(method: str, path: str, timeout: int = 10) -> dict:
     try:
         # HTTPConnection.request() 不接受 timeout 关键字参数；
         # 超时在 socket 上设置（Unix socket connect/read 均生效）
-        conn.sock.settimeout(timeout)
+        if conn.sock is not None:
+            conn.sock.settimeout(timeout)
         conn.request(method, path)
         resp = conn.getresponse()
         body = resp.read().decode("utf-8", "replace")
@@ -261,15 +262,21 @@ def docker_request(method: str, path: str, timeout: int = 10) -> dict:
         conn.close()
 
 
-def container_state() -> str:
-    """返回 stockdb 容器状态：running / exited / not-found / docker-unavailable。"""
+def container_state() -> dict:
+    """返回 stockdb 容器状态详情。
+
+    {ok, status, note}：ok=False 表示 docker socket 不可用（热更新无法停/启容器）。
+    """
     try:
         info = docker_request("GET", f"/containers/{STOCKDB_CONTAINER}/json")
     except FileNotFoundError:
-        return "docker-unavailable"
-    except Exception:
-        return "unknown"
-    return info.get("State", {}).get("Status", "unknown")
+        return {"ok": False, "status": "unknown", "note": "docker socket 未挂载（/var/run/docker.sock 不可达），无法停/启容器"}
+    except PermissionError:
+        return {"ok": False, "status": "unknown", "note": "docker socket 权限不足，无法操控容器"}
+    except Exception as exc:
+        return {"ok": False, "status": "unknown", "note": f"docker 查询失败: {exc}"}
+    st = info.get("State", {}).get("Status", "unknown")
+    return {"ok": True, "status": st, "note": ""}
 
 
 def container_start() -> None:
@@ -349,7 +356,7 @@ def run_sync(hot: bool = True, trigger: str = "manual") -> None:
         if not hot:
             log("→ 停止 stockdb 容器 ...")
             try:
-                if container_state() == "running":
+                if container_state().get("status") == "running":
                     container_stop()
                 else:
                     log("  （stockdb 已处于停止状态）")
@@ -357,12 +364,12 @@ def run_sync(hot: bool = True, trigger: str = "manual") -> None:
                 log(f"  ⚠️ 停止失败，继续同步（风险：数据卷并发写）：{exc}")
         else:
             st = container_state()
-            if st == "running":
+            if st["status"] == "running":
                 log("→ 热更新：stockdb 保持运行，直接增量同步 ...")
-            elif st in ("exited", "not-found"):
-                log(f"→ 热更新：stockdb 当前 {st}，同步后尝试启动 ...")
+            elif st["status"] in ("exited", "not-found"):
+                log(f"→ 热更新：stockdb 当前 {st['status']}，同步后尝试启动 ...")
             else:
-                log(f"→ 热更新：stockdb 状态 {st}（docker 不可用？），仍继续同步 ...")
+                log(f"→ 热更新：stockdb 状态 {st['status']}（{st['note']}），仍继续同步 ...")
 
         # 2. 同步数据（同步器读当前目录 sync_url.txt / stockdb.conf）
         log("→ 运行 数据更新（增量同步，断点续传）...")
@@ -407,7 +414,7 @@ def run_sync(hot: bool = True, trigger: str = "manual") -> None:
                 _last_verify_result = "skipped"
                 log("  ⚠️ 同步退出码非 0，跳过完整性验证")
                 # 同步失败时确保服务仍在（可能中途被手动停过）
-                if container_state() != "running":
+                if container_state().get("status") != "running":
                     try:
                         container_start()
                         log("  → 已尝试重新启动 stockdb")
@@ -422,7 +429,7 @@ def run_sync(hot: bool = True, trigger: str = "manual") -> None:
                 log("  ✅ stockdb 已启动")
             except Exception as exc:
                 log(f"  ❌ 启动失败：{exc}")
-        elif container_state() in ("exited", "not-found"):
+        elif container_state().get("status") in ("exited", "not-found"):
             log("→ 热更新收尾：stockdb 未在运行，尝试启动 ...")
             try:
                 container_start()
@@ -481,8 +488,10 @@ def tail_log(n: int = 200) -> str:
 # ==================== 定时自动同步 ====================
 def scheduler_loop() -> None:
     """后台定时线程：每 30s 检查一次定时配置，到点触发热更新同步（记录触发日志）。"""
+    global _scheduler_alive
     last_fired = ""
     while True:
+        _scheduler_alive = True  # 心跳：页面据此判断定时功能是否正常
         try:
             cfg = load_schedule()
             if cfg["enabled"] and not _sync_state["running"]:
@@ -497,6 +506,18 @@ def scheduler_loop() -> None:
         except Exception as exc:
             log(f"⏰ 定时线程异常: {exc}")
         time.sleep(30)
+
+
+def disk_usage() -> dict:
+    """数据卷磁盘用量（/data 挂载点）。"""
+    try:
+        import shutil
+        total, used, free = shutil.disk_usage(str(DATA_DIR))
+        return {"total_gb": round(total / 2 ** 30, 1),
+                "used_gb": round(used / 2 ** 30, 1),
+                "free_gb": round(free / 2 ** 30, 1)}
+    except Exception:
+        return {"total_gb": None, "used_gb": None, "free_gb": None}
 
 
 # ==================== K 线区间查询（复刻本地 MCP 的 vals 前缀通配） ====================
@@ -690,20 +711,16 @@ font-size:15px;padding:8px 18px;cursor:pointer}
   <button class="tab-btn" data-tab="system" onclick="showTab('system',this)">系统</button>
 </div>
 
-<!-- 概览：健康度 + 大盘 + 自选股 -->
+<!-- 概览：大盘 + 自选股 -->
 <div id="tab-overview" class="tab-panel active">
   <div class="card"><div class="metrics">
-    <div class="m"><div class="lbl">数据健康度</div><div class="val" id="cLatest" style="font-size:14px">…</div></div>
-    <div class="m"><div class="lbl">大盘</div><div class="row" id="idxRow" style="gap:14px"><span class="hint">…</span></div></div>
+    <div class="m"><div class="lbl">大盘指数</div><div class="row" id="idxRow" style="gap:14px"><span class="hint">…</span></div></div>
     <div class="m"><div class="lbl">自选股（点代码看K线）</div><div class="row" id="wlRow" style="gap:14px"><span class="hint">…</span></div></div>
   </div>
   <div style="margin-top:10px;display:flex;gap:8px">
     <input type="text" id="wlAdd" placeholder="加自选，如 600633,000967" style="width:280px">
     <button onclick="addWatch()" style="background:#334155;color:#e2e8f0">加入自选</button>
     <span id="wlMsg" class="hint"></span>
-  </div>
-  <div class="actions" style="margin-top:12px">
-    <button id="syncBtn" onclick="showTab('sync',document.querySelector('[data-tab=sync]'))">→ 到「同步」页</button>
   </div></div>
 </div>
 
@@ -734,8 +751,13 @@ font-size:15px;padding:8px 18px;cursor:pointer}
   </div>
 </div>
 
-<!-- 同步：按钮 + 定时 + 历史 + 日志 -->
+<!-- 同步：健康度 + 按钮 + 定时 + 历史 + 日志 -->
 <div id="tab-sync" class="tab-panel">
+  <div class="card"><div class="metrics">
+    <div class="m"><div class="lbl">数据健康度</div><div class="val" id="cLatest" style="font-size:13px">…</div></div>
+    <div class="m"><div class="lbl">定时调度器</div><div class="val" id="cSched" style="font-size:14px">…</div></div>
+    <div class="m"><div class="lbl">磁盘用量</div><div class="val" id="cDisk" style="font-size:14px">…</div></div>
+  </div></div>
   <div class="card">
     <div class="actions">
       <button id="syncBtn2" onclick="doSync()">开始同步</button>
@@ -744,7 +766,6 @@ font-size:15px;padding:8px 18px;cursor:pointer}
       </label>
       <span id="syncMsg" class="hint">热更新=服务保持运行直接增量同步；严格模式=停服后同步</span>
     </div>
-    <div class="hint" style="margin-top:8px">同步令牌：<input type="password" id="token" placeholder="留空=未启用保护"></div>
   </div>
   <div class="card"><div class="k">定时自动同步</div>
     <div class="actions" style="margin-top:8px">
@@ -762,14 +783,13 @@ font-size:15px;padding:8px 18px;cursor:pointer}
   <div class="card"><div class="k">同步日志（自动刷新）</div><pre id="log">（暂无）</pre></div>
 </div>
 
-<!-- 系统：容器/数据源/健康度详情 -->
+<!-- 系统：容器/数据源 状态判断 -->
 <div id="tab-system" class="tab-panel">
   <div class="card"><div class="metrics">
-    <div class="m"><div class="lbl">stockdb 容器</div><div class="val" id="cState">…</div></div>
+    <div class="m"><div class="lbl">stockdb 容器</div><div class="val" id="cState" style="font-size:15px">…</div></div>
     <div class="m"><div class="lbl">数据源</div><div class="val" id="cSource" style="font-size:13px">…</div></div>
-    <div class="m"><div class="lbl">最近同步</div><div class="val" id="cSync">…</div></div>
-    <div class="m"><div class="lbl">同步退出码</div><div class="val" id="cCode">…</div></div>
-  </div></div>
+  </div>
+  <div class="hint" style="margin-top:8px" id="cStateNote">…</div></div>
 </div>
 </div>
 <script src="/static/echarts.min.js"></script>
@@ -789,13 +809,17 @@ function showTab(name,btn){
 async function refresh(){
   try{
     const s=await j('/api/status');
-    document.getElementById('cState').textContent=s.container;
+    // 系统页：容器状态 + 数据源
+    const cs=s.container||{};
+    document.getElementById('cState').textContent=cs.status||'unknown';
+    document.getElementById('cStateNote').textContent=cs.note||(cs.ok?'':'docker 不可用，同步按钮将无法停/启容器');
     document.getElementById('cSource').textContent=s.source||'—';
-    document.getElementById('cLatest').textContent=s.data_latest||'—';
-    document.getElementById('cSync').textContent=s.last_sync||'从未';
-    document.getElementById('cCode').textContent=s.exit_code==null?'—':String(s.exit_code);
     const d=document.getElementById('statusDot');
-    d.className='dot '+(s.container==='running'?'ok':s.container==='docker-unavailable'?'warn':'err');
+    d.className='dot '+(cs.status==='running'?'ok':(cs.ok?'err':'warn'));
+    // 同步页：健康度 + 定时调度器 + 磁盘
+    loadHealth();
+    document.getElementById('cSched').innerHTML='<span style="color:'+(s.scheduler_alive?'var(--ok)':'var(--err)')+'">'+(s.scheduler_alive?'运行中':'未运行')+'</span>'+(s.schedule&&s.schedule.enabled?' ｜ 每日 '+s.schedule.time:'');
+    if(s.disk&&s.disk.total_gb!=null)document.getElementById('cDisk').textContent=s.disk.used_gb+' / '+s.disk.total_gb+' GB';
     const b=document.getElementById('syncBtn2');if(b)b.disabled=s.sync_running;
     document.getElementById('syncMsg').textContent=s.sync_running?'同步进行中，请勿重复点击…':'热更新=服务保持运行直接增量同步；严格模式=停服后同步';
     if(s.schedule){
@@ -805,7 +829,7 @@ async function refresh(){
       const sl=document.getElementById('schLast');if(sl)sl.textContent=last||'';
     }
     const lg=await j('/api/log?n=100');document.getElementById('log').textContent=lg.log;
-    loadHealth();loadWatchlist();loadHistory();
+    loadWatchlist();loadHistory();
   }catch(e){document.getElementById('log').textContent='状态刷新失败: '+e}
 }
 async function loadHealth(){
@@ -831,11 +855,10 @@ async function loadWatchlist(){
 async function addWatch(){
   const codes=document.getElementById('wlAdd').value.trim();
   if(!codes){return}
-  const t=document.getElementById('token').value;
   try{
     const cur=await j('/api/watchlist');
     const merged=[...new Set((cur.codes||[]).concat(codes.split(/[,，\s]+/)))];
-    const r=await j('/api/watchlist?action=set&codes='+encodeURIComponent(merged.join(','))+'&token='+encodeURIComponent(t));
+    const r=await j('/api/watchlist?action=set&codes='+encodeURIComponent(merged.join(',')));
     document.getElementById('wlMsg').textContent='已保存 '+r.codes.length+' 只';
     document.getElementById('wlAdd').value='';
     loadWatchlist();
@@ -858,18 +881,16 @@ async function loadHistory(){
   }catch(e){}
 }
 async function doSync(){
-  const t=document.getElementById('token').value;
   const hot=document.getElementById('hotMode').checked;
-  const opt={method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:t,hot:hot})};
+  const opt={method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({hot:hot})};
   try{const r=await j('/api/sync',opt);document.getElementById('syncMsg').textContent=r.msg;}
   catch(e){document.getElementById('syncMsg').textContent='启动失败: '+e;}
 }
 async function saveSchedule(){
   const enabled=document.getElementById('schEnabled').checked;
   const time=document.getElementById('schTime').value;
-  const t=document.getElementById('token').value;
   try{
-    const r=await j('/api/schedule?action=save&enabled='+enabled+'&time='+encodeURIComponent(time)+'&token='+encodeURIComponent(t));
+    const r=await j('/api/schedule?action=save&enabled='+enabled+'&time='+encodeURIComponent(time));
     document.getElementById('schMsg').textContent=r.msg||(r.schedule&&r.schedule.enabled?'已启用，每日 '+r.schedule.time+' 自动热更新':'已关闭定时');
   }catch(e){document.getElementById('schMsg').textContent='保存失败: '+e;}
 }
@@ -997,12 +1018,6 @@ class Handler(BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             return {}
 
-    def _token_ok(self) -> bool:
-        if not WEBUI_TOKEN:
-            return True
-        body = self._read_json()
-        return str(body.get("token") or "") == WEBUI_TOKEN
-
     def _status(self):
         state = container_state()
         src = ""
@@ -1011,16 +1026,15 @@ class Handler(BaseHTTPRequestHandler):
             lines = [ln for ln in cfg.read_text(encoding="utf-8", errors="replace").splitlines()
                      if ln.strip() and not ln.strip().startswith("#")]
             src = lines[0] if lines else ""
-        last = _sync_state["last_end"] or _sync_state["last_start"]
         self._send(200, json.dumps({
-            "container": state,
+            "container": state,          # {ok, status, note}
             "source": src,
             "sync_running": _sync_state["running"],
             "exit_code": _sync_state["exit_code"],
             "data_latest": data_latest_date(),
-            "last_sync": datetime.fromtimestamp(last).strftime("%Y-%m-%d %H:%M:%S")
-            if last else None,
             "schedule": load_schedule(),
+            "disk": disk_usage(),
+            "scheduler_alive": _scheduler_alive,
         }, ensure_ascii=False))
 
     def _history(self):
@@ -1029,9 +1043,6 @@ class Handler(BaseHTTPRequestHandler):
     def _schedule(self):
         q = parse_qs(urlparse(self.path).query)
         if q.get("action", [""])[0] == "save":
-            if not self._token_ok():
-                self._send(403, json.dumps({"msg": "令牌错误"}))
-                return
             enabled = q.get("enabled", ["false"])[0].lower() == "true"
             time_str = q.get("time", ["15:30"])[0]
             try:
@@ -1081,9 +1092,6 @@ class Handler(BaseHTTPRequestHandler):
         q = parse_qs(urlparse(self.path).query)
         action = q.get("action", [""])[0]
         if action == "set":
-            if not self._token_ok():
-                self._send(403, json.dumps({"msg": "令牌错误"}))
-                return
             codes_raw = q.get("codes", [""])[0]
             codes = [c for c in codes_raw.split(",") if c.strip()]
             codes = save_watchlist(codes)
@@ -1109,9 +1117,6 @@ class Handler(BaseHTTPRequestHandler):
             self._send(502, f"stockdb 查询失败: {exc}")
 
     def _sync(self):
-        if not self._token_ok():
-            self._send(403, json.dumps({"msg": "令牌错误"}))
-            return
         if _sync_state["running"]:
             self._send(200, json.dumps({"msg": "同步已在运行中"}))
             return

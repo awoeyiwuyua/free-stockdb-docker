@@ -76,7 +76,6 @@ services:
       STOCKDB_HOST: stockdb
       STOCKDB_PORT: "7899"
       STOCKDB_CONTAINER: stockdb
-      # WEBUI_TOKEN: 设置后网页「开始同步」需填写令牌（局域网部署可不设）
     depends_on:
       - stockdb
     networks:
