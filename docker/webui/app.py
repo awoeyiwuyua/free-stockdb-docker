@@ -1654,6 +1654,7 @@ function rmSchTime(t,ev){ev.preventDefault();const cur=($('schTimesEdit').textCo
 async function saveScheduleNow(){
   const enabled=$('schEnabled').checked,trading=$('schTrading').checked;
   const times=[...($('schTimesEdit').textContent.match(/\d{2}:\d{2}/g)||[])];
+  if(!times.length){toast('至少保留一个执行时间点');return}
   try{
     const r=await j('/api/schedule?action=save&enabled='+enabled+'&trading_only='+trading+'&times='+encodeURIComponent(times.join(',')));
     toast(r.msg||'自动同步计划已保存');
@@ -2005,8 +2006,12 @@ class Handler(BaseHTTPRequestHandler):
         if q.get("action", [""])[0] == "save":
             enabled = q.get("enabled", ["false"])[0].lower() == "true"
             trading_only = q.get("trading_only", ["true"])[0].lower() != "false"
-            raw_times = q.get("times", []) or [q.get("time", ["15:30"])[0]]  # 兼容单 time
-            # times 可能是 "15:30,16:05" 一个字符串，按逗号拆分
+            # 兼容单 time；parse_qs 默认丢弃空值（times= 会得到空列表），
+            # 此时若不显式 400，会静默兜底到 15:30 —— 前端删光时间点保存会悄悄变回默认值
+            raw_times = q.get("times") or q.get("time") or []
+            if not raw_times:
+                self._send(400, json.dumps({"msg": "至少需要一个执行时间点（HH:MM）"}))
+                return
             times = [t for part in raw_times for t in str(part).split(",")]
             try:
                 cfg = save_schedule(enabled, times, trading_only)
