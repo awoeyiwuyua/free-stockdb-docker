@@ -104,11 +104,14 @@ XSHG_HOLIDAYS: dict[str, set[str]] = {
 XSHG_HOLIDAYS_THROUGH = "2026-12-31"  # 休市表覆盖到的最后日期（用于到期提示）
 
 
+_calendar_warned: set[int] = set()  # 休市表未收录年份的日志限频（每年只警告一次）
+
+
 def is_trading_day(d=None) -> bool:
     """A 股交易日判定：工作日 且 非休市表内日期。
 
-    未收录年份（休市表覆盖后）按"工作日=交易日"处理，并在日志提示更新。
-    供定时同步跳过周末/法定节假日触发用。
+    未收录年份（休市表覆盖后）按"工作日=交易日"处理，并在日志提示更新（每年限频一次，
+    避免 4s 轮询触发日志风暴）。供定时同步跳过周末/法定节假日触发用。
     """
     from datetime import datetime as _dt
     d = d or _dt.now().date()
@@ -116,7 +119,9 @@ def is_trading_day(d=None) -> bool:
         return False
     holidays = XSHG_HOLIDAYS.get(str(d.year))
     if holidays is None:
-        log(f"⚠️ A股休市表未收录 {d.year} 年（数据截至 {XSHG_HOLIDAYS_THROUGH}），请更新 XSHG_HOLIDAYS")
+        if d.year not in _calendar_warned:
+            _calendar_warned.add(d.year)
+            log(f"⚠️ A股休市表未收录 {d.year} 年（数据截至 {XSHG_HOLIDAYS_THROUGH}），请更新 XSHG_HOLIDAYS")
         return True  # 未知年份：工作日即视为交易日
     return d.strftime("%m-%d") not in holidays
 
@@ -137,11 +142,22 @@ def _normalize_times(times) -> list[str]:
     return sorted(result)
 
 
+_schedule_lock = threading.Lock()  # sync_schedule.json 读改写互斥（调度线程/同步回填/Web 请求并发）
+
+
+def _write_schedule(cfg: dict) -> None:
+    """原子写定时配置：临时文件 + os.replace（避免读者看到写一半的内容）。"""
+    tmp = SCHEDULE_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(cfg, ensure_ascii=False, indent=1), encoding="utf-8")
+    os.replace(tmp, SCHEDULE_FILE)
+
+
 def load_schedule() -> dict:
     """读定时配置；兼容旧格式 {enabled, time} → 迁移为 {enabled, times:[time], trading_only}。
 
     fired: {日期: [已触发时间点...]}——当天每个时间点只触发一次（多时间点防循环重复触发）。
     retried: {日期: [已安排过自动重试的时间点...]}；retry_pending: 计划执行重试的时间（字符串）。
+    纯读不加锁（_write_schedule 原子替换保证读到完整文件）。
     """
     if not SCHEDULE_FILE.exists():
         return _default_schedule()
@@ -162,41 +178,46 @@ def load_schedule() -> dict:
     if not isinstance(retried, dict):
         retried = {}
     rp = data.get("retry_pending")
+    norm_times = _normalize_times(times)
     return {
         "enabled": bool(data.get("enabled")),
-        "times": _normalize_times(times),
+        "times": norm_times,
         "trading_only": bool(data.get("trading_only", True)),
         "fired": fired,
         "retried": retried,
         "retry_pending": rp if isinstance(rp, str) else None,
         "last_trigger": last,
-        "next_trigger": compute_next_trigger(_normalize_times(times)),
+        "next_trigger": compute_next_trigger(norm_times, trading_only=bool(data.get("trading_only", True))),
     }
 
 
 def save_schedule(enabled: bool, times, trading_only: bool = True) -> dict:
-    """保存定时配置（保留 last_trigger / fired / retried / retry_pending，不因改配置清空）。"""
-    cfg = {"enabled": bool(enabled), "times": _normalize_times(times),
-           "trading_only": bool(trading_only)}
-    if not cfg["times"]:
-        raise RuntimeError("至少需要一个合法时间点（HH:MM）")
-    try:
-        old = {}
-        if SCHEDULE_FILE.exists():
-            try:
-                old = json.loads(SCHEDULE_FILE.read_text(encoding="utf-8"))
-            except Exception:
-                old = {}
-        # 触发/重试记录：保留有效值，缺失时用空默认（配置结构保持完整）
-        cfg["fired"] = old.get("fired") if isinstance(old.get("fired"), dict) else {}
-        cfg["retried"] = old.get("retried") if isinstance(old.get("retried"), dict) else {}
-        cfg["retry_pending"] = old.get("retry_pending") if isinstance(old.get("retry_pending"), str) else None
-        cfg["last_trigger"] = old.get("last_trigger") if isinstance(old.get("last_trigger"), dict) else None
-        cfg["next_trigger"] = compute_next_trigger(cfg["times"])
-        SCHEDULE_FILE.write_text(json.dumps(cfg, ensure_ascii=False, indent=1), encoding="utf-8")
-    except Exception as exc:
-        raise RuntimeError(f"定时配置写入失败: {exc}")
-    return cfg
+    """保存定时配置（保留 last_trigger / fired / retried / retry_pending，不因改配置清空）。
+
+    读改写整体持锁，防止与调度线程/同步回填并发写丢状态。
+    """
+    with _schedule_lock:
+        cfg = {"enabled": bool(enabled), "times": _normalize_times(times),
+               "trading_only": bool(trading_only)}
+        if not cfg["times"]:
+            raise RuntimeError("至少需要一个合法时间点（HH:MM）")
+        try:
+            old = {}
+            if SCHEDULE_FILE.exists():
+                try:
+                    old = json.loads(SCHEDULE_FILE.read_text(encoding="utf-8"))
+                except Exception:
+                    old = {}
+            # 触发/重试记录：保留有效值，缺失时用空默认（配置结构保持完整）
+            cfg["fired"] = old.get("fired") if isinstance(old.get("fired"), dict) else {}
+            cfg["retried"] = old.get("retried") if isinstance(old.get("retried"), dict) else {}
+            cfg["retry_pending"] = old.get("retry_pending") if isinstance(old.get("retry_pending"), str) else None
+            cfg["last_trigger"] = old.get("last_trigger") if isinstance(old.get("last_trigger"), dict) else None
+            cfg["next_trigger"] = compute_next_trigger(cfg["times"], trading_only=trading_only)
+            _write_schedule(cfg)
+        except Exception as exc:
+            raise RuntimeError(f"定时配置写入失败: {exc}")
+        return cfg
 
 
 def _today_key() -> str:
@@ -217,77 +238,98 @@ def _prune_fired(cfg: dict) -> dict:
 
 def _mark_fired(t: str) -> None:
     """记录某时间点今天已触发（防同一天重复触发），落盘。"""
-    try:
-        cfg = load_schedule()
-        today = _today_key()
-        fired = dict(cfg.get("fired") or {})
-        fired.setdefault(today, [])
-        if t not in fired[today]:
-            fired[today].append(t)
-        cfg["fired"] = fired
-        cfg["next_trigger"] = compute_next_trigger(cfg["times"])
-        cfg = _prune_fired(cfg)
-        SCHEDULE_FILE.write_text(json.dumps(cfg, ensure_ascii=False, indent=1), encoding="utf-8")
-    except Exception as exc:
-        log(f"⏰ 定时触发标记失败: {exc}")
+    with _schedule_lock:
+        try:
+            cfg = load_schedule()
+            today = _today_key()
+            fired = dict(cfg.get("fired") or {})
+            fired.setdefault(today, [])
+            if t not in fired[today]:
+                fired[today].append(t)
+            cfg["fired"] = fired
+            cfg["next_trigger"] = compute_next_trigger(cfg["times"], trading_only=cfg["trading_only"])
+            cfg = _prune_fired(cfg)
+            _write_schedule(cfg)
+        except Exception as exc:
+            log(f"⏰ 定时触发标记失败: {exc}")
 
 
 def _mark_last_trigger(key: str, t: str | None = None, retry: bool = False) -> None:
     """记录最近一次定时触发（key=日期 时间点；t=该时间点 HH:MM），供界面展示与重试判定。"""
-    try:
-        cfg = load_schedule()
-        cfg["last_trigger"] = {"key": key, "t": t, "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                               "exit": None, "retry": bool(retry)}
-        cfg["next_trigger"] = compute_next_trigger(cfg["times"])
-        SCHEDULE_FILE.write_text(json.dumps(cfg, ensure_ascii=False, indent=1), encoding="utf-8")
-    except Exception as exc:
-        log(f"⏰ 定时触发标记失败: {exc}")
+    with _schedule_lock:
+        try:
+            cfg = load_schedule()
+            cfg["last_trigger"] = {"key": key, "t": t, "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                   "exit": None, "retry": bool(retry)}
+            cfg["next_trigger"] = compute_next_trigger(cfg["times"], trading_only=cfg["trading_only"])
+            _write_schedule(cfg)
+        except Exception as exc:
+            log(f"⏰ 定时触发标记失败: {exc}")
 
 
 def _mark_retried(t: str) -> None:
     """记录某时间点今天已安排过自动重试，并登记 10 分钟后的执行计划（retry_pending）。"""
-    try:
-        cfg = load_schedule()
-        today = _today_key()
-        retried = dict(cfg.get("retried") or {})
-        retried.setdefault(today, [])
-        if t not in retried[today]:
-            retried[today].append(t)
-        cfg["retried"] = retried
-        cfg["retry_pending"] = (datetime.now() + timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M:%S")
-        cfg = _prune_fired(cfg)
-        SCHEDULE_FILE.write_text(json.dumps(cfg, ensure_ascii=False, indent=1), encoding="utf-8")
-    except Exception as exc:
-        log(f"↻ 重试登记失败: {exc}")
+    with _schedule_lock:
+        try:
+            cfg = load_schedule()
+            today = _today_key()
+            retried = dict(cfg.get("retried") or {})
+            retried.setdefault(today, [])
+            if t not in retried[today]:
+                retried[today].append(t)
+            cfg["retried"] = retried
+            cfg["retry_pending"] = (datetime.now() + timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M:%S")
+            cfg = _prune_fired(cfg)
+            _write_schedule(cfg)
+        except Exception as exc:
+            log(f"↻ 重试登记失败: {exc}")
 
 
 def _clear_retry_pending() -> None:
-    try:
-        cfg = load_schedule()
-        cfg["retry_pending"] = None
-        SCHEDULE_FILE.write_text(json.dumps(cfg, ensure_ascii=False, indent=1), encoding="utf-8")
-    except Exception:
-        pass
+    with _schedule_lock:
+        try:
+            cfg = load_schedule()
+            cfg["retry_pending"] = None
+            _write_schedule(cfg)
+        except Exception:
+            pass
 
 
 def _update_schedule_trigger_exit(exit_code, retry: bool = False) -> None:
     """run_sync 结束后回填最近一次定时触发的 exit 码（retry 记录随 last_trigger 保留）。"""
-    try:
-        cfg = load_schedule()
-        if cfg["last_trigger"] and cfg["last_trigger"].get("exit") is None:
-            cfg["last_trigger"]["exit"] = exit_code
-            if retry:
-                cfg["last_trigger"]["retry"] = True
-            SCHEDULE_FILE.write_text(json.dumps(cfg, ensure_ascii=False, indent=1), encoding="utf-8")
-    except Exception:
-        pass
+    with _schedule_lock:
+        try:
+            cfg = load_schedule()
+            if cfg["last_trigger"] and cfg["last_trigger"].get("exit") is None:
+                cfg["last_trigger"]["exit"] = exit_code
+                if retry:
+                    cfg["last_trigger"]["retry"] = True
+                _write_schedule(cfg)
+        except Exception:
+            pass
 
 
-def compute_next_trigger(times: list[str], now=None) -> str | None:
-    """计算最近的下一次触发时间（今天剩余 or 明天），返回如 '今天 16:05' / '明天 15:30'。"""
+def compute_next_trigger(times: list[str], now=None, trading_only: bool = True) -> str | None:
+    """最近的下一次触发时间，返回如 '今天 16:05' / '明天 15:30' / '08-13 15:30'。
+
+    与调度器使用同一套交易日判定（trading_only 时跳过周末/A股法定休市），
+    避免界面显示"明天"而调度器实际跳过（周五/节假日前）的不一致。
+    8 天内无交易日时退回不跳过的兜底计算（极端长假边界）。
+    """
     if not times:
         return None
     now = now or datetime.now()
+    today = now.date()
+    for offset in range(8):
+        d = today + timedelta(days=offset)
+        if trading_only and not is_trading_day(d):
+            continue
+        hm = now.strftime("%H:%M") if offset == 0 else "00:00"
+        for t in times:
+            if t > hm:
+                label = "今天" if offset == 0 else ("明天" if offset == 1 else d.strftime("%m-%d"))
+                return f"{label} {t}"
+    # 兜底：8 天内无交易日，退回不跳过的原始逻辑
     today_hm = now.strftime("%H:%M")
     for t in times:
         if t > today_hm:
@@ -893,10 +935,14 @@ def scheduler_loop() -> None:
             if cfg["enabled"] and cfg["times"] and not _sync_state["running"]:
                 if cfg["trading_only"] and not is_trading_day(now.date()):
                     continue  # 非交易日：不触发，也不安排重试
-                # 1. 正常触发：时间点已到且今天未触发过（多时间点集合判定，防循环重复触发）
+                # 正常触发优先；每轮只启动一个任务（if/else 隔离），
+                # 避免同轮「正常触发 + 到期重试」并发启动两个线程，导致
+                # run_sync 锁静默拒绝其中一个而 fired 已标记（计划未执行却视为已执行）。
+                # 跨轮由外层 not _sync_state["running"] 守卫，不存在并发。
                 fired = set((cfg.get("fired") or {}).get(today_key, []))
                 due = _pending_times(now_hm, cfg["times"], fired)
-                for t in due:
+                if due:
+                    t = due[0]
                     _mark_fired(t)
                     _mark_last_trigger(f"{today_key} {t}", t)
                     log(f"⏰ 定时同步触发（{t}）——stockdb 保持运行，热更新")
@@ -905,9 +951,8 @@ def scheduler_loop() -> None:
                         kwargs={"hot": True, "trigger": "scheduled"},
                         daemon=True,
                     ).start()
-                    break
-                # 2. 失败自动重试
-                if not _sync_state["running"]:
+                else:
+                    # 本轮无正常触发 → 检查失败自动重试（登记或到期执行）
                     rp = cfg.get("retry_pending")
                     if rp and now.strftime("%Y-%m-%d %H:%M:%S") >= rp:
                         _clear_retry_pending()
@@ -934,12 +979,20 @@ def scheduler_loop() -> None:
         time.sleep(30)
 
 
+_cap_cache: dict = {"at": 0.0, "val": None}  # 同步能力检查缓存（60s），避免 4s 轮询反复探测磁盘
+
+
 def sync_capability() -> dict:
-    """同步能力检查：更新程序 / 数据源 / 数据卷可写 / 待重试。
+    """同步能力检查：更新程序 / 数据源 / 数据卷可写 / 待重试（warn 级，不参与可用性）。
 
     比只看 Docker 更能解释"为什么同步失败"。本地开发模式（无 /opt/stockdb/数据更新）
     返回 ok=False，前端展示为不可用。
+    待重试任务属于"正在进行中的重试计划"，是 warn/info 而非能力缺失，不参与 ok 计算。
+    数据卷探测用唯一临时文件（多浏览器并发不互相删除探针），结果缓存 60s。
     """
+    if _cap_cache["val"] is not None and time.time() - _cap_cache["at"] < 60:
+        return _cap_cache["val"]
+    import tempfile
     checks = {}
     # 1. 更新程序（容器内发行版同步器）
     updater = Path("/opt/stockdb/数据更新")
@@ -957,19 +1010,22 @@ def sync_capability() -> dict:
                  if ln.strip() and not ln.strip().startswith("#")]
         src = lines[0] if lines else ""
     checks["source"] = {"ok": bool(src), "detail": src if src else "sync_url.txt 无有效数据源"}
-    # 3. 数据卷可写
+    # 3. 数据卷可写（唯一临时文件名，避免多浏览器同时删除彼此的探针）
     try:
-        probe = DATA_DIR / ".write_probe"
+        probe = Path(tempfile.mktemp(prefix=".write_probe_", dir=str(DATA_DIR)))
         probe.write_text("ok", encoding="utf-8")
         probe.unlink()
         checks["writable"] = {"ok": True, "detail": "数据卷可写"}
     except Exception as exc:
         checks["writable"] = {"ok": False, "detail": f"数据卷不可写: {exc}"}
-    # 4. 待重试任务
+    # 4. 待重试任务（warn/info 级，不参与 ok）
     rp = load_schedule().get("retry_pending")
-    checks["retry_pending"] = {"ok": not rp,
-                               "detail": f"重试计划于 {rp} 执行" if rp else "无待重试任务"}
-    return {"ok": all(c["ok"] for c in checks.values()), "checks": checks}
+    checks["retry_pending"] = {"warn": bool(rp),
+                               "detail": f"等待重试：{rp}" if rp else "无待重试任务"}
+    cap_ok = all(c.get("ok") for c in checks.values() if "ok" in c)
+    result = {"ok": cap_ok, "warn": bool(rp), "checks": checks}
+    _cap_cache.update(at=time.time(), val=result)
+    return result
 
 
 def last_sync_summary() -> dict | None:
@@ -1423,6 +1479,7 @@ color:var(--text);padding:8px 10px;border-radius:8px;width:220px}
       <div class="it"><span class="lk">WebUI 启动</span><span id="cStart">—</span></div>
       <div class="it"><span class="lk">调度心跳</span><span id="cHeartbeat">—</span></div>
       <div class="it"><span class="lk">数据目录</span><span id="cDataDir">—</span></div>
+      <div class="it"><span class="lk">交易日历</span><span id="cCalendar">—</span></div>
       <div class="it"><span class="lk">最近同步</span><span id="cLastSyncInfo">—</span></div>
     </div>
   </div>
@@ -1470,6 +1527,7 @@ function showTab(name,btn){
 const PHASE_STAGE={stopping:'停服中',syncing:'同步数据',verifying:'校验数据完整性',restarting:'重启服务'};
 const PHASE_PCT={stopping:15,syncing:45,verifying:80,restarting:95};
 let _lastExit=null;
+let _healthCache=null;   // 最近一次 /api/health 结果缓存：停留概览/行情页时顶部状态用它，避免 h=null 误报"服务异常"
 
 // 轮询互斥 + 排队：避免重叠请求；切页 force 触发一次立即刷新
 let _refreshing=false,_refreshQueued=false;
@@ -1480,11 +1538,17 @@ async function refresh(force){
     const s=await j('/api/status');
     const active=document.querySelector('.tab-panel.active')?.id||'tab-overview';
     const h=(active==='tab-sync'||active==='tab-system')?await j('/api/health'):null;
-    // 顶部状态（总更新）
-    const hs=h||{};
-    $('statusDot').className='dot '+(hs.status==='ok'?'ok':hs.status==='stale'?'warn':'err');
+    if(h)_healthCache=h;
+    // 顶部状态：优先用本次 health，否则用最近缓存；缓存也没有时以 data_latest 降级判定
+    const hs=h||_healthCache||{};
+    let topSt,topColor;
+    if(hs.status==='ok'){topSt='服务正常';topColor='ok'}
+    else if(hs.status==='stale'){topSt='有待更新';topColor='warn'}
+    else if(s.data_latest){topSt='服务正常';topColor='ok'}   // 无 health 但数据可达 → 不误报异常
+    else {topSt='服务异常';topColor='err'}
+    $('statusDot').className='dot '+topColor;
     const up=s.data_latest?('数据更新至 '+String(s.data_latest).slice(4,6)+'-'+String(s.data_latest).slice(6,8)):'数据未同步';
-    $('brandStatus').textContent=(hs.status==='ok'?'服务正常':hs.status==='stale'?'有待更新':'服务异常')+' · '+up;
+    $('brandStatus').textContent=topSt+' · '+up;
     if(active==='tab-sync'){
       renderHero(s,h||{});
       renderSchView(s.schedule||{});
@@ -1666,14 +1730,16 @@ function renderSystem(s){
   $('hcDkrDot').style.background=cs.ok?'var(--ok)':'var(--err)';
   $('hcDkr').textContent=cs.ok?'已连接':'不可用';
   $('hcDkrSub').textContent=cs.ok?('容器 '+cs.status):'未检测到 docker.sock';
-  // 自动任务
+  // 自动任务：运行状态 + 待重试提示
   const sch=s.schedule||{};
   $('hcSchedDot').style.background=s.scheduler_alive?'var(--ok)':'var(--err)';
   $('hcSched').textContent=s.scheduler_alive?'运行中':'未运行';
-  $('hcSchedSub').textContent=(sch.enabled?(sch.next_trigger?'下次 '+sch.next_trigger:'已启用'):'定时未启用')||'—';
-  // 同步能力：更新程序/数据源/数据卷/待重试
+  const rp=sch.retry_pending;
+  $('hcSchedSub').innerHTML=(sch.enabled?(sch.next_trigger?'下次 '+esc(sch.next_trigger):'已启用'):'定时未启用')+''
+    +(rp?(' · <span style="color:var(--warn)">等待重试：'+esc(rp.slice(11,16))+'</span>'):(sch.enabled?' · 无待重试':''));
+  // 同步能力：更新程序/数据源/数据卷（待重试为 warn，不判不可用）
   const cap=s.sync_cap||{ok:false,checks:{}};
-  const fails=Object.values(cap.checks||{}).filter(c=>c&&!c.ok);
+  const fails=Object.values(cap.checks||{}).filter(c=>c&&c.ok===false);
   $('hcCapDot').style.background=cap.ok?'var(--ok)':'var(--err)';
   $('hcCap').textContent=cap.ok?'可用':'不可用';
   $('hcCapSub').textContent=fails.length?('受阻：'+fails.map(f=>f.detail).slice(0,2).join('；')):'更新程序 · 数据源 · 数据卷 就绪';
@@ -1706,6 +1772,16 @@ function renderSystem(s){
     }else hb.textContent='—';
   }
   $('cDataDir').textContent=s.data_dir||'—';
+  // 交易日历覆盖：临近到期（<90 天）黄色提醒
+  const cal=s.calendar||{};
+  const cCal=$('cCalendar');
+  if(cCal){
+    if(cal.through){
+      const daysLeft=Math.round((new Date(cal.through.replace(/-/g,'/'))-Date.now())/86400000);
+      cCal.innerHTML=cal.through+'（'+cal.days+' 个休市日）'
+        +(daysLeft<90?('<span style="color:var(--warn)"> ｜ 即将到期，请更新休市表</span>'):'');
+    }else cCal.textContent='—';
+  }
 }
 
 async function loadWatchlist(){
@@ -1905,6 +1981,8 @@ class Handler(BaseHTTPRequestHandler):
             "data_dir": str(DATA_DIR),
             "last_sync": last_sync_summary(),
             "schedule": load_schedule(),
+            "calendar": {"through": XSHG_HOLIDAYS_THROUGH,
+                         "days": sum(len(v) for v in XSHG_HOLIDAYS.values())},
             "disk": disk_usage(),
             "scheduler_alive": _scheduler_alive,
             "trading_today": is_trading_day(),   # 定时是否会在今天触发（严格交易日）
