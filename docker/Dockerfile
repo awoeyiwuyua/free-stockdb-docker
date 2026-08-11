@@ -52,7 +52,9 @@ RUN set -eu; \
 # ================= 运行时阶段 =================
 FROM alpine:3.20
 
-RUN apk add --no-cache tzdata ca-certificates
+# bash：极空间等容器管理 APP 进容器默认执行 /bin/bash，alpine 默认没有会报
+# "OCI runtime exec failed"，装上后 APP 终端可正常进入。
+RUN apk add --no-cache tzdata ca-certificates bash
 
 COPY --from=build /out/stockdb /opt/stockdb
 # 发行版自带 stockdb.conf 是 127.0.0.1 原版且 conf 必须命令行传入；

@@ -44,7 +44,9 @@ RUN set -eu; \
 # ================= 运行时阶段 =================
 FROM python:3.12-alpine
 
-RUN apk add --no-cache tzdata curl
+# bash：极空间等容器管理 APP 进容器默认执行 /bin/bash，alpine 默认没有会导致
+# "OCI runtime exec failed: /bin/bash not found"。装上后用 APP 终端可正常进入。
+RUN apk add --no-cache tzdata curl bash
 
 # 同步器二进制（webui 容器内直接跑同步；/data 卷挂载后即可读写行情库）
 COPY --from=build /out/stockdb/数据更新 /opt/stockdb/数据更新
