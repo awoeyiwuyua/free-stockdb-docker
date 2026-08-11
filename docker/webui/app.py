@@ -1444,8 +1444,8 @@ color:var(--text);padding:8px 10px;border-radius:8px;width:220px}
     <tbody id="histBody"><tr><td colspan="8" class="hint">（暂无历史）</td></tr></tbody></table>
     <div class="hr-cards" id="histCards"></div>
   </div>
-  <div class="card"><div class="card-title">同步日志 <span class="hint" style="font-weight:normal;margin-left:6px">（运行中或失败时自动展开）</span></div>
-    <pre id="log" style="display:none">（暂无）</pre>
+  <div class="card"><div class="card-title">同步日志</div>
+    <pre id="log">（暂无）</pre>
   </div>
 </div>
 
@@ -1557,9 +1557,7 @@ async function refresh(force){
       $('schToday').textContent=(sched.enabled&&sched.trading_only)?(s.trading_today?'':'今日非交易日，定时跳过'):'';
       loadHistory();
       const lg=await j('/api/log?n=80');
-      $('log').textContent=lg.log;
-      if(s.sync_running||(_lastExit!=null&&_lastExit!==0))$('log').style.display='block';
-      else $('log').style.display='none';
+      $('log').textContent=lg.log;   // 日志常展开（HTML 无 display:none，无需折叠逻辑）
     }else if(active==='tab-system'){
       renderSystem(s);
       loadHistory();
@@ -1616,8 +1614,19 @@ function renderDataOverview(s){
 function toggleMenu(){const m=$('moreMenu');const show=m.style.display==='none';m.style.display=show?'block':'none';$('menuCaret').textContent=show?'▴':'▾'}
 async function startSync(strict){
   const opt={method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({hot:!strict})};
-  try{const r=await j('/api/sync',opt);toast(r.msg||'已启动同步');toggleMenu();}
-  catch(e){toast('启动失败: '+e)}
+  try{
+    const r=await j('/api/sync',opt);
+    toast(r.msg||'已启动同步');
+    toggleMenu();
+    if(r.msg&&r.msg.includes('运行中')){
+      // 同步引擎被占用（如定时任务正在跑）：明确提示，不做无谓动作
+    }else{
+      // 已请求启动：立即展开日志并强制刷新一次，主状态区切到同步进度
+      $('log').style.display='block';
+      if(!$('log').textContent.trim()||$('log').textContent==='（暂无）')$('log').textContent='同步启动中，请稍候…';
+      refresh(true);
+    }
+  }catch(e){toast('启动失败: '+e)}
 }
 
 // 自动同步：编辑模式下不覆盖时间点草稿（防 4s 轮询吞掉未保存的修改）
@@ -2072,8 +2081,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def _sync(self):
         if _sync_state["running"]:
-            self._send(200, json.dumps({"msg": "同步已在运行中"}))
+            self._send(200, json.dumps({"msg": "同步已在运行中，请等待完成"}))
             return
+        # 锁探测：running 标志可能与锁短暂不一致，且可区分「定时任务占用」与「空闲」
+        if not _sync_lock.acquire(blocking=False):
+            self._send(200, json.dumps({"msg": "同步引擎正在运行中（可能为定时任务），请稍候再试"}))
+            return
+        _sync_lock.release()
         body = self._read_json()
         hot = bool(body.get("hot", True))  # 默认热更新；前端可传 hot=false 走严格模式
         threading.Thread(target=run_sync, kwargs={"hot": hot, "trigger": "manual"}, daemon=True).start()
