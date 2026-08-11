@@ -258,6 +258,75 @@ def data_latest_date() -> str | None:
     return max(dates) if dates else None
 
 
+def _classify_code(code: str) -> str:
+    """按代码段归类：etf / stock / other。
+
+    ETF：沪市 51x/52x/56x/58x（510-518 宽基、520-529 新宽基、560-563 行业、588/589 科创），
+          深市 159 开头。
+    股票：0/3/6 开头（深主板 00x、创业板 300/301、沪主板 60x、科创板 688/689），
+          4/8 开头与 92x（北交所 43x/83x/87x/88x/920x）。
+    其他：LOF(16x/50x)、REITs(18x)、B股(200/900) 等场内非股票非 ETF 品种。
+    """
+    c = str(code)
+    if c[:2] in ("51", "52", "56", "58") or c[:3] == "159":
+        return "etf"
+    if c[:2] == "92" or c[:3] == "430" or c[0] in ("0", "3", "4", "6", "8"):
+        return "stock"
+    return "other"
+
+
+def code_stats() -> dict:
+    """全市场标的数量，股票 / ETF 分开统计（其余归 other）。"""
+    import urllib.request, urllib.parse
+    try:
+        url = f"http://{STOCKDB_HOST}:{STOCKDB_PORT}/?cmd=get&t={urllib.parse.quote('股票代码')}"
+        with urllib.request.urlopen(url, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+        codes: list[str] = []
+        if isinstance(data, dict):
+            for group in data.values():
+                if isinstance(group, list):
+                    codes.extend(str(c) for c in group)
+        stats = {"stock": 0, "etf": 0, "other": 0}
+        for c in set(codes):
+            stats[_classify_code(c)] += 1
+        return stats
+    except Exception:
+        return {"stock": None, "etf": None, "other": None}
+
+
+_coverage_cache: dict = {"at": 0.0, "data": None}  # 15 分钟缓存，避免 4s 轮询重复全历史扫描
+
+
+def data_coverage() -> dict | None:
+    """行情数据覆盖范围（最早 ~ 最新交易日），基于 000001 逐年前缀扫描。
+
+    每 4s 轮询会反复请求 /api/status，全历史扫描较重，故缓存 15 分钟。
+    返回 {"earliest": int, "latest": int} 或 None（无数据）。
+    """
+    now = time.time()
+    if _coverage_cache["data"] is not None and now - _coverage_cache["at"] < 900:
+        return _coverage_cache["data"]
+    import urllib.request, urllib.parse
+    from datetime import datetime as _dt
+    this_year = _dt.now().year
+    earliest = latest = None
+    for y in range(1990, this_year + 1):
+        try:
+            url = f"http://{STOCKDB_HOST}:{STOCKDB_PORT}/?cmd=vals&t={urllib.parse.quote(f'日k:000001:{y}*')}"
+            with urllib.request.urlopen(url, timeout=8) as resp:
+                rows = json.loads(resp.read().decode("utf-8", "replace"))
+            ds = [int(r["date"]) for r in rows if isinstance(r, dict) and r.get("date")]
+            if ds:
+                earliest = min(ds) if earliest is None else earliest
+                latest = max(ds)
+        except Exception:
+            continue
+    data = {"earliest": earliest, "latest": latest} if earliest is not None else None
+    _coverage_cache.update(at=now, data=data)
+    return data
+
+
 def mirror_latest_date() -> str | None:
     """镜像源（a.123128.xyz 网页）标注的最新数据日期。
 
@@ -1000,13 +1069,16 @@ font-size:15px;padding:8px 18px;cursor:pointer}
 
 <!-- 同步：①数据库状态判断 ②手动同步 ③自动同步 + 历史 + 日志 -->
 <div id="tab-sync" class="tab-panel">
-  <div class="card"><div class="k">① 数据库状态</div>
+  <div class="card"><div class="k">数据库状态</div>
     <div class="metrics">
       <div class="m"><div class="lbl">数据健康度</div><div class="val" id="cLatest" style="font-size:13px">…</div></div>
+      <div class="m"><div class="lbl">标的数量</div><div class="val" id="cCount" style="font-size:13px">…</div></div>
+      <div class="m"><div class="lbl">数据覆盖</div><div class="val" id="cCoverage" style="font-size:13px">…</div></div>
+      <div class="m"><div class="lbl">上次同步</div><div class="val" id="cLastSync" style="font-size:13px">…</div></div>
       <div class="m"><div class="lbl">数据源</div><div class="val" id="cSource" style="font-size:12px">…</div></div>
     </div>
   </div>
-  <div class="card"><div class="k">② 手动同步</div>
+  <div class="card"><div class="k">手动同步</div>
     <div class="actions" style="margin-top:8px">
       <button id="syncBtn2" onclick="doSync()">开始同步</button>
       <span id="phaseBadge" class="badge b-skip" style="display:none"></span>
@@ -1016,7 +1088,7 @@ font-size:15px;padding:8px 18px;cursor:pointer}
       <span id="syncMsg" class="hint">热更新=服务保持运行直接增量同步；严格模式=停服后同步</span>
     </div>
   </div>
-  <div class="card"><div class="k">③ 自动同步 <span id="cSched" style="font-weight:normal;font-size:12px"></span></div>
+  <div class="card"><div class="k">自动同步 <span id="cSched" style="font-weight:normal;font-size:12px"></span></div>
     <div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
       <label class="hint"><input type="checkbox" id="schEnabled" onchange="saveScheduleNow()"> 启用</label>
       <label class="hint"><input type="checkbox" id="schTrading" onchange="saveScheduleNow()"> 仅交易日</label>
@@ -1078,6 +1150,14 @@ async function refresh(){
     document.getElementById('cUptime').textContent=cs.started?fmtUptime(cs.started):'—';
     document.getElementById('cStateNote').textContent=cs.note||(cs.ok?'':'docker 不可用，同步按钮将无法停/启容器');
     document.getElementById('cSource').textContent=s.source||'—';
+    // 标的数量（股票/ETF 分开）
+    const cc=s.code_stats||{};
+    const cCount=document.getElementById('cCount');
+    if(cCount)cCount.textContent=(cc.stock!=null?('股票 '+cc.stock+' ｜ ETF '+(cc.etf||0))+(cc.other?' ｜ 其他 '+(cc.other||0):''):'—');
+    // 数据覆盖范围（最早~最新）
+    const cov=s.coverage||{};
+    const cCov=document.getElementById('cCoverage');
+    if(cCov)cCov.textContent=(cov.earliest?String(cov.earliest).slice(0,4)+'-'+String(cov.earliest).slice(4,6)+'-'+String(cov.earliest).slice(6,8)+' ~ '+String(cov.latest).slice(0,4)+'-'+String(cov.latest).slice(4,6)+'-'+String(cov.latest).slice(6,8):'—');
     const d=document.getElementById('statusDot');
     d.className='dot '+(cs.status==='running'?'ok':(cs.ok?'err':'warn'));
     // 同步页：健康度 + 定时调度器 + 磁盘 + 阶段徽章
@@ -1196,6 +1276,13 @@ async function loadHistory(){
         st.textContent='近 7 次：成功 '+ok+' / '+recent.length+'，平均耗时 '+(avg==null?'—':avg+'s')
           +(lastOk?'，最近成功 '+lastOk.ts:'')+(hist.length>7?'；更早记录请往下滚动日志/历史': '');
       }else st.textContent='';
+    }
+    // 数据库状态卡「上次同步」摘要（取最新一条历史）
+    const cLastSync=document.getElementById('cLastSync');
+    if(cLastSync){
+      cLastSync.textContent=hist.length
+        ?(hist[0].ts.slice(5,16)+(hist[0].exit_code===0?' ✅':hist[0].exit_code==null?' ⏳':' ❌ '+hist[0].exit_code))
+        :'（暂无）';
     }
     if(!hist.length){tb.innerHTML='<tr><td colspan="8" class="hint">（暂无历史）</td></tr>';return;}
     tb.innerHTML=hist.map(x=>`<tr>
@@ -1390,6 +1477,8 @@ class Handler(BaseHTTPRequestHandler):
             "sync_phase": _sync_state.get("phase", "idle"),
             "exit_code": _sync_state["exit_code"],
             "data_latest": data_latest_date(),
+            "code_stats": code_stats(),          # {stock, etf, other}
+            "coverage": data_coverage(),         # {earliest, latest} 或 null
             "schedule": load_schedule(),
             "disk": disk_usage(),
             "scheduler_alive": _scheduler_alive,
