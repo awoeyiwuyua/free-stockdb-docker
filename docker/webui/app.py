@@ -44,6 +44,9 @@ _sync_state = {"running": False, "exit_code": None, "last_start": None, "last_en
 _last_sync_stdout: str = ""          # 最近一次同步的 stdout（供解析下载/删除数）
 _last_verify_result: str | None = None  # 最近一次完整性验证结果（pass/fail/跳过）
 _scheduler_alive = False             # 定时线程心跳（每次循环更新时间戳）
+_scheduler_heartbeat = 0.0           # 定时线程最近一次心跳时间戳（unix）
+_webui_started = time.time()         # webui 进程启动时间戳
+WEBUI_VERSION = "0.2.0"
 
 HISTORY_FILE = DATA_DIR / "sync_history.json"
 SCHEDULE_FILE = DATA_DIR / "sync_schedule.json"
@@ -76,6 +79,7 @@ def append_history(entry: dict) -> None:
 
 def _default_schedule() -> dict:
     return {"enabled": False, "times": ["15:30"], "trading_only": True,
+            "fired": {}, "retried": {}, "retry_pending": None,
             "last_trigger": None, "next_trigger": None}
 
 
@@ -134,7 +138,11 @@ def _normalize_times(times) -> list[str]:
 
 
 def load_schedule() -> dict:
-    """读定时配置；兼容旧格式 {enabled, time} → 迁移为 {enabled, times:[time], trading_only}。"""
+    """读定时配置；兼容旧格式 {enabled, time} → 迁移为 {enabled, times:[time], trading_only}。
+
+    fired: {日期: [已触发时间点...]}——当天每个时间点只触发一次（多时间点防循环重复触发）。
+    retried: {日期: [已安排过自动重试的时间点...]}；retry_pending: 计划执行重试的时间（字符串）。
+    """
     if not SCHEDULE_FILE.exists():
         return _default_schedule()
     try:
@@ -147,17 +155,27 @@ def load_schedule() -> dict:
     last = data.get("last_trigger")
     if not isinstance(last, dict):
         last = None
+    fired = data.get("fired")
+    if not isinstance(fired, dict):
+        fired = {}
+    retried = data.get("retried")
+    if not isinstance(retried, dict):
+        retried = {}
+    rp = data.get("retry_pending")
     return {
         "enabled": bool(data.get("enabled")),
         "times": _normalize_times(times),
         "trading_only": bool(data.get("trading_only", True)),
+        "fired": fired,
+        "retried": retried,
+        "retry_pending": rp if isinstance(rp, str) else None,
         "last_trigger": last,
         "next_trigger": compute_next_trigger(_normalize_times(times)),
     }
 
 
 def save_schedule(enabled: bool, times, trading_only: bool = True) -> dict:
-    """保存定时配置（保留 last_trigger，不因改配置而清空触发记录）。"""
+    """保存定时配置（保留 last_trigger / fired / retried / retry_pending，不因改配置清空）。"""
     cfg = {"enabled": bool(enabled), "times": _normalize_times(times),
            "trading_only": bool(trading_only)}
     if not cfg["times"]:
@@ -169,8 +187,11 @@ def save_schedule(enabled: bool, times, trading_only: bool = True) -> dict:
                 old = json.loads(SCHEDULE_FILE.read_text(encoding="utf-8"))
             except Exception:
                 old = {}
-        if isinstance(old, dict) and isinstance(old.get("last_trigger"), dict):
-            cfg["last_trigger"] = old["last_trigger"]
+        # 触发/重试记录：保留有效值，缺失时用空默认（配置结构保持完整）
+        cfg["fired"] = old.get("fired") if isinstance(old.get("fired"), dict) else {}
+        cfg["retried"] = old.get("retried") if isinstance(old.get("retried"), dict) else {}
+        cfg["retry_pending"] = old.get("retry_pending") if isinstance(old.get("retry_pending"), str) else None
+        cfg["last_trigger"] = old.get("last_trigger") if isinstance(old.get("last_trigger"), dict) else None
         cfg["next_trigger"] = compute_next_trigger(cfg["times"])
         SCHEDULE_FILE.write_text(json.dumps(cfg, ensure_ascii=False, indent=1), encoding="utf-8")
     except Exception as exc:
@@ -178,16 +199,75 @@ def save_schedule(enabled: bool, times, trading_only: bool = True) -> dict:
     return cfg
 
 
-def _mark_schedule_triggered(key: str, retry: bool = False) -> None:
-    """记录某时间点已触发（防同一天重复触发），落盘。"""
+def _today_key() -> str:
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+def _prune_fired(cfg: dict) -> dict:
+    """清理 fired/retried 里早于今天的日期（只保留最近记录，防累积）。"""
+    today = _today_key()
+    for k in ("fired", "retried"):
+        d = cfg.get(k) or {}
+        stale = [day for day in d if day < today]
+        for day in stale:
+            d.pop(day, None)
+        cfg[k] = d
+    return cfg
+
+
+def _mark_fired(t: str) -> None:
+    """记录某时间点今天已触发（防同一天重复触发），落盘。"""
     try:
         cfg = load_schedule()
-        cfg["last_trigger"] = {"key": key, "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        today = _today_key()
+        fired = dict(cfg.get("fired") or {})
+        fired.setdefault(today, [])
+        if t not in fired[today]:
+            fired[today].append(t)
+        cfg["fired"] = fired
+        cfg["next_trigger"] = compute_next_trigger(cfg["times"])
+        cfg = _prune_fired(cfg)
+        SCHEDULE_FILE.write_text(json.dumps(cfg, ensure_ascii=False, indent=1), encoding="utf-8")
+    except Exception as exc:
+        log(f"⏰ 定时触发标记失败: {exc}")
+
+
+def _mark_last_trigger(key: str, t: str | None = None, retry: bool = False) -> None:
+    """记录最近一次定时触发（key=日期 时间点；t=该时间点 HH:MM），供界面展示与重试判定。"""
+    try:
+        cfg = load_schedule()
+        cfg["last_trigger"] = {"key": key, "t": t, "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                                "exit": None, "retry": bool(retry)}
         cfg["next_trigger"] = compute_next_trigger(cfg["times"])
         SCHEDULE_FILE.write_text(json.dumps(cfg, ensure_ascii=False, indent=1), encoding="utf-8")
     except Exception as exc:
         log(f"⏰ 定时触发标记失败: {exc}")
+
+
+def _mark_retried(t: str) -> None:
+    """记录某时间点今天已安排过自动重试，并登记 10 分钟后的执行计划（retry_pending）。"""
+    try:
+        cfg = load_schedule()
+        today = _today_key()
+        retried = dict(cfg.get("retried") or {})
+        retried.setdefault(today, [])
+        if t not in retried[today]:
+            retried[today].append(t)
+        cfg["retried"] = retried
+        cfg["retry_pending"] = (datetime.now() + timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M:%S")
+        cfg = _prune_fired(cfg)
+        SCHEDULE_FILE.write_text(json.dumps(cfg, ensure_ascii=False, indent=1), encoding="utf-8")
+    except Exception as exc:
+        log(f"↻ 重试登记失败: {exc}")
+
+
+def _clear_retry_pending() -> None:
+    try:
+        cfg = load_schedule()
+        cfg["retry_pending"] = None
+        SCHEDULE_FILE.write_text(json.dumps(cfg, ensure_ascii=False, indent=1), encoding="utf-8")
+    except Exception:
+        pass
 
 
 def _update_schedule_trigger_exit(exit_code, retry: bool = False) -> None:
@@ -333,23 +413,31 @@ def data_coverage() -> dict | None:
     return data
 
 
+_mirror_cache: dict = {"at": 0.0, "val": None}  # 镜像日期抓取缓存（10 分钟），避免 4s 轮询重复访问外网
+
+
 def mirror_latest_date() -> str | None:
-    """镜像源（a.123128.xyz 网页）标注的最新数据日期。
+    """镜像源（a.123128.xyz 网页）标注的最新数据日期（10 分钟缓存）。
 
     镜像源是 LevelDB 文件镜像（HTTP + manifest），无行情 API，但它首页明文标注
     「数据更新至:YYYY-MM-DD」。抓该日期可判断「本地落后是同步未跑 vs 镜像未发布」。
     可配置 MIRROR_PAGE_URL 覆盖（内网映射/镜像源变更时）。
     """
+    if _mirror_cache["val"] is not None and time.time() - _mirror_cache["at"] < 600:
+        return _mirror_cache["val"]
     import urllib.request, re
     url = os.environ.get("MIRROR_PAGE_URL", "https://a.123128.xyz/")
+    result = None
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=12) as resp:
             html = resp.read().decode("utf-8", "replace")
         m = re.search(r"数据更新至:(\d{4}-\d{2}-\d{2})", html)
-        return m.group(1) if m else None
+        result = m.group(1) if m else None
     except Exception:
-        return None
+        result = None
+    _mirror_cache.update(at=time.time(), val=result)
+    return result
 
 
 def load_watchlist() -> list[str]:
@@ -769,61 +857,125 @@ def tail_log(n: int = 200) -> str:
 
 
 # ==================== 定时自动同步 ====================
+def _pending_times(now_hm: str, times: list[str], fired: set) -> list[str]:
+    """当前已到且今天尚未触发过的时间点（多时间点防循环触发核心判定）。
+
+    now_hm: HH:MM；times: 配置的时间点（已排序）；fired: 今天已触发时间点集合。
+    返回应触发的时间点（通常 0 或 1 个）。
+    """
+    return [t for t in times if now_hm >= t and t not in fired]
+
+
 def scheduler_loop() -> None:
     """后台定时线程：每 30s 检查定时配置，到点触发热更新同步。
 
-    触发判定（比"精确等于"健壮）：
-      对每个配置时间点 t：当前分钟 >= t 且 今天该点还没触发过（key=today+t）→ 触发。
-    即使某次轮询落在 t 分钟之后，只要当天未触发过且未到第二天，仍会触发；
-    触发后 key 落盘（容器重启不重复触发）。
+    触发判定（多时间点防循环）：
+      维护 fired={日期:[已触发时间点]}；对每个配置时间点 t，仅当
+      now>=t 且 t 不在「今天已触发集合」内才触发，并立即加入集合。
+      多时间点不再交替重复触发；容器重启后集合落盘，当天不会重复触发。
 
-    trading_only（默认开）：非交易日不触发。严格交易日判定见 is_trading_day()
-    （工作日排除 A 股法定休市；周末直接跳过）。休市日当天到点仅日志说明，不触发。
+    trading_only（默认开）：非交易日不触发（is_trading_day：工作日排除 A 股法定休市）。
 
-    失败自动重试：定时同步退出码非 0 时，安排一次补触发（约 10 分钟后），
-    当日每个时间点最多重试一次；重试仍失败则不再重试，历史可查（trigger=定时·重试）。
+    失败自动重试（持久化，重启不丢）：
+      最近一次定时触发 exit!=0 且该时间点今天未安排过重试 → 登记 retry_pending=10 分钟后，
+      retried={日期:[已安排重试的时间点]} 防重复安排。到点执行 run_sync(trigger=scheduled-retry)；
+      执行前若最后一次触发已成功则取消。重试仍失败不再重试。
     """
-    global _scheduler_alive
+    global _scheduler_alive, _scheduler_heartbeat
     while True:
-        _scheduler_alive = True  # 心跳：页面据此判断定时功能是否正常
+        _scheduler_alive = True
+        _scheduler_heartbeat = time.time()
         try:
             cfg = load_schedule()
+            now = datetime.now()
+            today_key = now.strftime("%Y-%m-%d")
+            now_hm = now.strftime("%H:%M")
             if cfg["enabled"] and cfg["times"] and not _sync_state["running"]:
-                now = datetime.now()
-                today_key = now.strftime("%Y-%m-%d")
-                now_hm = now.strftime("%H:%M")
-                fired_key = (cfg["last_trigger"] or {}).get("key", "")
                 if cfg["trading_only"] and not is_trading_day(now.date()):
-                    # 非交易日：仍推进 next_trigger 展示，但不触发
-                    continue
-                for t in cfg["times"]:
-                    key = f"{today_key} {t}"
-                    if now_hm >= t and key != fired_key:
-                        _mark_schedule_triggered(key)
-                        log(f"⏰ 定时同步触发（{t}）——stockdb 保持运行，热更新")
-                        threading.Thread(
-                            target=run_sync,
-                            kwargs={"hot": True, "trigger": "scheduled"},
-                            daemon=True,
-                        ).start()
-                        break
-                # 失败自动重试：上次定时触发 exit!=0 且未重试 → 补一次（10 分钟后）
+                    continue  # 非交易日：不触发，也不安排重试
+                # 1. 正常触发：时间点已到且今天未触发过（多时间点集合判定，防循环重复触发）
+                fired = set((cfg.get("fired") or {}).get(today_key, []))
+                due = _pending_times(now_hm, cfg["times"], fired)
+                for t in due:
+                    _mark_fired(t)
+                    _mark_last_trigger(f"{today_key} {t}", t)
+                    log(f"⏰ 定时同步触发（{t}）——stockdb 保持运行，热更新")
+                    threading.Thread(
+                        target=run_sync,
+                        kwargs={"hot": True, "trigger": "scheduled"},
+                        daemon=True,
+                    ).start()
+                    break
+                # 2. 失败自动重试
                 if not _sync_state["running"]:
-                    lt = cfg.get("last_trigger") or {}
-                    if (lt.get("exit") not in (None, 0) and lt.get("key", "").startswith(today_key)
-                            and not lt.get("retry")):
-                        retry_key = f"{today_key} RETRY"
-                        if lt.get("key") != retry_key:
-                            log(f"↻ 定时同步上次失败（exit={lt.get('exit')}），安排 10 分钟后自动重试 ...")
-                            _mark_schedule_triggered(retry_key, retry=True)
+                    rp = cfg.get("retry_pending")
+                    if rp and now.strftime("%Y-%m-%d %H:%M:%S") >= rp:
+                        _clear_retry_pending()
+                        lt = cfg.get("last_trigger") or {}
+                        if lt.get("exit") == 0:
+                            log("↻ 重试前同步已成功，取消重试")
+                        else:
+                            log("↻ 定时重试执行（上次失败）——stockdb 保持运行，热更新")
                             threading.Thread(
-                                target=lambda: (time.sleep(600),
-                                                run_sync(hot=True, trigger="scheduled-retry", retry=True)),
+                                target=run_sync,
+                                kwargs={"hot": True, "trigger": "scheduled-retry", "retry": True},
                                 daemon=True,
                             ).start()
+                    else:
+                        lt = cfg.get("last_trigger") or {}
+                        retried = set((cfg.get("retried") or {}).get(today_key, []))
+                        lt_t = lt.get("t")
+                        if (lt.get("exit") not in (None, 0) and lt.get("key", "").startswith(today_key)
+                                and lt_t and lt_t not in retried):
+                            _mark_retried(lt_t)
+                            log(f"↻ 定时同步上次失败（exit={lt.get('exit')}），安排 10 分钟后自动重试 ...")
         except Exception as exc:
             log(f"⏰ 定时线程异常: {exc}")
         time.sleep(30)
+
+
+def sync_capability() -> dict:
+    """同步能力检查：更新程序 / 数据源 / 数据卷可写 / 待重试。
+
+    比只看 Docker 更能解释"为什么同步失败"。本地开发模式（无 /opt/stockdb/数据更新）
+    返回 ok=False，前端展示为不可用。
+    """
+    checks = {}
+    # 1. 更新程序（容器内发行版同步器）
+    updater = Path("/opt/stockdb/数据更新")
+    if updater.is_file() and os.access(str(updater), os.X_OK):
+        checks["updater"] = {"ok": True, "detail": "更新程序存在"}
+    elif updater.exists():
+        checks["updater"] = {"ok": False, "detail": "更新程序存在但不可执行"}
+    else:
+        checks["updater"] = {"ok": False, "detail": "未找到更新程序 /opt/stockdb/数据更新"}
+    # 2. 数据源配置
+    src = ""
+    cfg = DATA_DIR / "sync_url.txt"
+    if cfg.exists():
+        lines = [ln.strip() for ln in cfg.read_text(encoding="utf-8", errors="replace").splitlines()
+                 if ln.strip() and not ln.strip().startswith("#")]
+        src = lines[0] if lines else ""
+    checks["source"] = {"ok": bool(src), "detail": src if src else "sync_url.txt 无有效数据源"}
+    # 3. 数据卷可写
+    try:
+        probe = DATA_DIR / ".write_probe"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+        checks["writable"] = {"ok": True, "detail": "数据卷可写"}
+    except Exception as exc:
+        checks["writable"] = {"ok": False, "detail": f"数据卷不可写: {exc}"}
+    # 4. 待重试任务
+    rp = load_schedule().get("retry_pending")
+    checks["retry_pending"] = {"ok": not rp,
+                               "detail": f"重试计划于 {rp} 执行" if rp else "无待重试任务"}
+    return {"ok": all(c["ok"] for c in checks.values()), "checks": checks}
+
+
+def last_sync_summary() -> dict | None:
+    """最近一次同步摘要（历史数组末尾=最新记录）。"""
+    h = load_history()
+    return h[-1] if h else None
 
 
 def disk_usage() -> dict:
@@ -1089,7 +1241,7 @@ tr.hr-row:hover{background:rgba(56,189,248,.04)}
 .storage-bar i.high{background:var(--warn)}
 
 /* 系统健康卡 */
-.hc-cards{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin:12px 0 4px}
+.hc-cards{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin:12px 0 4px}
 @media(max-width:760px){.hc-cards{grid-template-columns:1fr}}
 .hc{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px 16px}
 .hc .lbl{font-size:12px;color:var(--muted);margin-bottom:6px}
@@ -1178,6 +1330,7 @@ color:var(--text);padding:8px 10px;border-radius:8px;width:220px}
   <div class="hero">
     <div class="hero-status"><span id="heroSpin" class="spin" style="display:none"></span><span id="heroStatus">…</span></div>
     <div class="hero-sub" id="heroSub">…</div>
+    <div class="hero-sub" id="heroTask" style="margin-top:2px"></div>
     <div class="hero-actions">
       <button id="syncBtn2" onclick="startSync(false)">立即热更新</button>
       <span class="hint" id="lastSuccess">…</span>
@@ -1226,7 +1379,7 @@ color:var(--text);padding:8px 10px;border-radius:8px;width:220px}
         <div class="m"><div class="lbl">ETF</div><div class="val" id="cCountEtf">…</div></div>
         <div class="m"><div class="lbl">覆盖</div><div class="val" id="cCoverage" style="font-size:14px">…</div></div>
       </div>
-      <div class="hint" style="margin-top:8px">数据最新 <span id="cLatest2">…</span></div>
+      <div class="hint" style="margin-top:8px">本地数据 <span id="cLocalDate">…</span> ｜ 镜像数据 <span id="cMirrorDate">…</span></div>
     </div>
   </div>
 
@@ -1248,6 +1401,7 @@ color:var(--text);padding:8px 10px;border-radius:8px;width:220px}
       <div class="hc"><div class="lbl">行情服务</div><div class="st"><i id="hcSvcDot"></i><span id="hcSvc">…</span></div><div class="sub" id="hcSvcSub">…</div></div>
       <div class="hc"><div class="lbl">Docker</div><div class="st"><i id="hcDkrDot"></i><span id="hcDkr">…</span></div><div class="sub" id="hcDkrSub">…</div></div>
       <div class="hc"><div class="lbl">自动任务</div><div class="st"><i id="hcSchedDot"></i><span id="hcSched">…</span></div><div class="sub" id="hcSchedSub">…</div></div>
+      <div class="hc"><div class="lbl">同步能力</div><div class="st"><i id="hcCapDot"></i><span id="hcCap">…</span></div><div class="sub" id="hcCapSub">…</div></div>
     </div>
     <div id="dkrWarn" class="warn-card" style="display:none">
       <div class="t">Docker 管理不可用</div>
@@ -1265,12 +1419,17 @@ color:var(--text);padding:8px 10px;border-radius:8px;width:220px}
       <div class="it"><span class="lk">容器状态</span><span id="cState">—</span></div>
       <div class="it"><span class="lk">运行时长</span><span id="cUptime">—</span></div>
       <div class="it"><span class="lk">同步节点</span><span id="cSource">—</span></div>
+      <div class="it"><span class="lk">WebUI 版本</span><span id="cVer">—</span></div>
+      <div class="it"><span class="lk">WebUI 启动</span><span id="cStart">—</span></div>
+      <div class="it"><span class="lk">调度心跳</span><span id="cHeartbeat">—</span></div>
+      <div class="it"><span class="lk">数据目录</span><span id="cDataDir">—</span></div>
+      <div class="it"><span class="lk">最近同步</span><span id="cLastSyncInfo">—</span></div>
     </div>
   </div>
   <div class="card"><div class="card-title">运维工具</div>
     <div class="actions">
-      <button class="btn-ghost" onclick="toggleContainerLogs()">查看容器日志</button>
-      <button class="btn-danger" onclick="restartContainer()">重启 stockdb</button>
+      <button class="btn-ghost" id="btnLogs" disabled onclick="toggleContainerLogs()">查看容器日志</button>
+      <button class="btn-danger" id="btnRestart" disabled onclick="restartContainer()">重启 stockdb</button>
       <span class="hint" id="containerMsg"></span>
     </div>
     <pre id="containerLog" style="display:none;margin-top:10px">（加载中…）</pre>
@@ -1285,6 +1444,7 @@ function pctCls(v){return v>0?'color:#F87171':v<0?'color:#4ADE80':'color:#8FA2BC
 function fmtPct(v){return v==null?'—':(v>0?'+':'')+Number(v).toFixed(2)+'%'}
 function fmtPrice(v){return v==null?'—':Number(v).toFixed(2)}
 function $(id){return document.getElementById(id)}
+function fmtYMD(v){const t=String(v);return t.length===8?t.slice(0,4)+'-'+t.slice(4,6)+'-'+t.slice(6,8):t}
 let _toastTimer=null;
 function toast(msg){const t=$('toast');t.textContent=msg;t.classList.add('show');clearTimeout(_toastTimer);_toastTimer=setTimeout(()=>t.classList.remove('show'),2600)}
 function fmtDur(sec){sec=Math.max(0,Math.floor(sec||0));return String(Math.floor(sec/60)).padStart(2,'0')+':'+String(sec%60).padStart(2,'0')}
@@ -1304,42 +1464,49 @@ function showTab(name,btn){
   (btn||document.querySelector('[data-tab="'+name+'"]')).classList.add('active');
   $('tab-'+name).classList.add('active');
   if(name==='market'&&kchart)kchart.resize();
+  refresh(true); // 切页立即按当前页刷新
 }
 
 const PHASE_STAGE={stopping:'停服中',syncing:'同步数据',verifying:'校验数据完整性',restarting:'重启服务'};
 const PHASE_PCT={stopping:15,syncing:45,verifying:80,restarting:95};
 let _lastExit=null;
 
-async function refresh(){
+// 轮询互斥 + 排队：避免重叠请求；切页 force 触发一次立即刷新
+let _refreshing=false,_refreshQueued=false;
+async function refresh(force){
+  if(_refreshing){if(force)_refreshQueued=true;return}
+  _refreshing=true;
   try{
     const s=await j('/api/status');
-    const cs=s.container||{};
-    const h=await j('/api/health');
-    // 顶部状态
-    $('statusDot').className='dot '+(h.status==='ok'?'ok':h.status==='stale'?'warn':'err');
+    const active=document.querySelector('.tab-panel.active')?.id||'tab-overview';
+    const h=(active==='tab-sync'||active==='tab-system')?await j('/api/health'):null;
+    // 顶部状态（总更新）
+    const hs=h||{};
+    $('statusDot').className='dot '+(hs.status==='ok'?'ok':hs.status==='stale'?'warn':'err');
     const up=s.data_latest?('数据更新至 '+String(s.data_latest).slice(4,6)+'-'+String(s.data_latest).slice(6,8)):'数据未同步';
-    $('brandStatus').textContent=(h.status==='ok'?'服务正常':h.status==='stale'?'有待更新':'服务异常')+' · '+up;
-    // 主状态区
-    renderHero(s,h);
-    // 自动同步
-    renderSchView(s.schedule||{});
-    // 数据概况
-    const cc=s.code_stats||{};
-    $('cCountStk').textContent=cc.stock!=null?cc.stock:'—';
-    $('cCountEtf').textContent=cc.etf!=null?cc.etf:'—';
-    const cov=s.coverage||{};
-    $('cCoverage').textContent=(cov.earliest?String(cov.earliest).slice(0,4)+' ~ '+String(cov.latest).slice(0,4):'—');
-    $('cLatest2').textContent=up;
-    // 系统页
-    renderSystem(s,cs);
-    loadHistory();
-    loadWatchlist();
-    // 日志：运行中或上次失败时展开
-    const lg=await j('/api/log?n=80');
-    $('log').textContent=lg.log;
-    if(s.sync_running||(_lastExit!=null&&_lastExit!==0))$('log').style.display='block';
-    else $('log').style.display='none';
-  }catch(e){$('log').textContent='状态刷新失败: '+e;$('log').style.display='block'}
+    $('brandStatus').textContent=(hs.status==='ok'?'服务正常':hs.status==='stale'?'有待更新':'服务异常')+' · '+up;
+    if(active==='tab-sync'){
+      renderHero(s,h||{});
+      renderSchView(s.schedule||{});
+      renderDataOverview(s);
+      const sched=s.schedule||{};
+      $('schToday').textContent=(sched.enabled&&sched.trading_only)?(s.trading_today?'':'今日非交易日，定时跳过'):'';
+      loadHistory();
+      const lg=await j('/api/log?n=80');
+      $('log').textContent=lg.log;
+      if(s.sync_running||(_lastExit!=null&&_lastExit!==0))$('log').style.display='block';
+      else $('log').style.display='none';
+    }else if(active==='tab-system'){
+      renderSystem(s);
+      loadHistory();
+    }else if(active==='tab-overview'){
+      loadWatchlist();
+    }
+  }catch(e){
+    $('log').textContent='状态刷新失败: '+e;$('log').style.display='block';
+  }
+  _refreshing=false;
+  if(_refreshQueued){_refreshQueued=false;refresh()}
 }
 
 function renderHero(s,h){
@@ -1363,7 +1530,7 @@ function renderHero(s,h){
     $('syncProgress').style.display='none';
     if(h.status==='ok'){
       st.textContent='数据已是最新';st.style.color='var(--ok)';
-      sub.textContent='更新至 '+String(h.latest).slice(0,4)+'-'+String(h.latest).slice(4,6)+'-'+String(h.latest).slice(6,8)+' · 服务正常';
+      sub.textContent='更新至 '+fmtYMD(h.latest)+' · 服务正常';
     }else if(h.status==='stale'){
       st.textContent='数据有待更新';st.style.color='var(--warn)';
       sub.textContent=h.note||'建议执行一次同步';
@@ -1373,6 +1540,15 @@ function renderHero(s,h){
     }
   }
 }
+function renderDataOverview(s){
+  const cc=s.code_stats||{};
+  $('cCountStk').textContent=cc.stock!=null?cc.stock:'—';
+  $('cCountEtf').textContent=cc.etf!=null?cc.etf:'—';
+  const cov=s.coverage||{};
+  $('cCoverage').textContent=(cov.earliest?String(cov.earliest).slice(0,4)+' ~ '+String(cov.latest).slice(0,4):'—');
+  $('cLocalDate').textContent=s.data_latest?fmtYMD(s.data_latest):'—';
+  $('cMirrorDate').textContent=s.mirror||'—';
+}
 function toggleMenu(){const m=$('moreMenu');const show=m.style.display==='none';m.style.display=show?'block':'none';$('menuCaret').textContent=show?'▴':'▾'}
 async function startSync(strict){
   const opt={method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({hot:!strict})};
@@ -1380,15 +1556,16 @@ async function startSync(strict){
   catch(e){toast('启动失败: '+e)}
 }
 
+// 自动同步：编辑模式下不覆盖时间点草稿（防 4s 轮询吞掉未保存的修改）
 function renderSchView(sch){
+  const editing=$('schEdit').style.display==='block';
   $('schEnabled').checked=!!sch.enabled;
   $('schTrading').checked=sch.trading_only!==false;
   const times=sch.times||[];
   $('schTimesView').textContent=times.length?times.join('、'):'（未设置）';
   $('schNext').textContent=sch.enabled?(sch.next_trigger?sch.next_trigger:'（时间点已过，明天触发）'):'定时未启用';
   $('schLast').textContent=(sch.last_trigger&&sch.last_trigger.ts)?('上次触发 '+fmtClock(sch.last_trigger.ts)+(sch.last_trigger.exit===0?' ✅':sch.last_trigger.exit==null?' ⏳':' ❌')):'';
-  $('schToday').textContent=(sch.enabled&&sch.trading_only&&!sch.next_trigger)?'（今日无待执行计划）':'';
-  renderEditTimes(times);
+  if(!editing)renderEditTimes(times);
 }
 function renderEditTimes(times){
   $('schTimesEdit').innerHTML=(times||[]).map(t=>'<span class="times-pill">'+esc(t)+' <a href="#" onclick="rmSchTime(\''+t+'\',event);return false" style="color:var(--err);text-decoration:none">✕</a></span>').join('')||'<span class="hint">（无时间点）</span>';
@@ -1412,12 +1589,12 @@ async function saveScheduleNow(){
   }catch(e){toast('保存失败: '+e)}
 }
 
+// 历史：记录按新 → 旧排序（原文件 append，最新在末尾）
 let _hist=[];
 async function loadHistory(){
   try{
     const h=await j('/api/history');
-    _hist=h.history||[];
-    // 统计行
+    _hist=(h.history||[]).slice().reverse();
     const st=$('histStats');
     if(_hist.length){
       const recent=_hist.slice(0,7),ok=recent.filter(x=>x.exit_code===0).length;
@@ -1425,12 +1602,24 @@ async function loadHistory(){
       const avg=durs.length?Math.round(durs.reduce((a,b)=>a+b,0)/durs.length):null;
       st.textContent='近 7 次：成功 '+ok+' / '+recent.length+(avg!=null?' · 平均 '+avg+'s':'');
     }else st.textContent='';
-    // 上次成功（主状态区）
     const ls=_hist.find(x=>x.exit_code===0);
     $('lastSuccess').textContent=ls?('上次成功：'+fmtClock(ls.ts)):'';
     _lastExit=_hist.length?_hist[0].exit_code:null;
     $('histBody').innerHTML=_hist.map((x,i)=>historyRow(x,i)).join('')||'<tr><td colspan="8" class="hint">（暂无历史）</td></tr>';
     $('histCards').innerHTML=_hist.map(historyCard).join('')||'<div class="hint">（暂无历史）</div>';
+    // 主状态区：同步任务状态（数据状态与同步管道健康分开）
+    const tEl=$('heroTask');
+    if(tEl){
+      if(_hist.length){
+        const x=_hist[0];
+        if(x.exit_code===0)tEl.textContent='同步任务：上次成功 '+fmtClock(x.ts);
+        else if(x.exit_code==null)tEl.textContent='同步任务：进行中';
+        else tEl.innerHTML='同步任务：<span style="color:var(--err)">上次失败 '+fmtClock(x.ts)+'</span> · <span style="color:var(--muted)">'+esc(x.reason||('退出码 '+x.exit_code))+'</span>';
+      }else tEl.textContent='';
+    }
+    // 系统页运行信息：最近同步
+    const ci=$('cLastSyncInfo');
+    if(ci)ci.textContent=_hist.length?(fmtClock(_hist[0].ts)+(_hist[0].exit_code===0?' ✅':_hist[0].exit_code==null?' ⏳':' ❌')+(_hist[0].duration_sec!=null?' · '+_hist[0].duration_sec+'s':'')):'—';
   }catch(e){}
 }
 function trigLabel(t){return t==='scheduled'?'⏰定时':t==='scheduled-retry'?'↻定时·重试':'手动'}
@@ -1465,27 +1654,36 @@ function toggleHistDetail(i){
   rows[i].insertAdjacentHTML('afterend','<tr class="hr-detail"><td colspan="8">'+esc(det)+'</td></tr>');
 }
 
-function renderSystem(s,cs){
-  // 行情服务
+function renderSystem(s){
+  const cs=s.container||{};
   const lat=(s.code_stats&&s.code_stats.latency_ms!=null)?s.code_stats.latency_ms:null;
-  $('hcSvcDot').style.background=s.data_latest?'var(--ok)':'var(--err)';
-  $('hcSvc').textContent=s.data_latest?'正常':'不可用';
+  // 行情服务：以实际请求成功与延迟为准
+  const svcOK=lat!=null;
+  $('hcSvcDot').style.background=svcOK?'var(--ok)':'var(--err)';
+  $('hcSvc').textContent=svcOK?'正常':'不可用';
   $('hcSvcSub').textContent='响应 '+(lat!=null?lat+' ms':'—')+' · 数据至 '+(s.data_latest?String(s.data_latest).slice(4,6)+'-'+String(s.data_latest).slice(6,8):'—');
   // Docker
-  const dkrOK=cs.ok&&cs.status==='running';
-  $('hcDkrDot').style.background=dkrOK?'var(--ok)':(cs.ok?'var(--warn)':'var(--err)');
-  $('hcDkr').textContent=dkrOK?'已连接':(cs.ok?cs.status:'不可用');
+  $('hcDkrDot').style.background=cs.ok?'var(--ok)':'var(--err)';
+  $('hcDkr').textContent=cs.ok?'已连接':'不可用';
   $('hcDkrSub').textContent=cs.ok?('容器 '+cs.status):'未检测到 docker.sock';
   // 自动任务
   const sch=s.schedule||{};
   $('hcSchedDot').style.background=s.scheduler_alive?'var(--ok)':'var(--err)';
   $('hcSched').textContent=s.scheduler_alive?'运行中':'未运行';
   $('hcSchedSub').textContent=(sch.enabled?(sch.next_trigger?'下次 '+sch.next_trigger:'已启用'):'定时未启用')||'—';
+  // 同步能力：更新程序/数据源/数据卷/待重试
+  const cap=s.sync_cap||{ok:false,checks:{}};
+  const fails=Object.values(cap.checks||{}).filter(c=>c&&!c.ok);
+  $('hcCapDot').style.background=cap.ok?'var(--ok)':'var(--err)';
+  $('hcCap').textContent=cap.ok?'可用':'不可用';
+  $('hcCapSub').textContent=fails.length?('受阻：'+fails.map(f=>f.detail).slice(0,2).join('；')):'更新程序 · 数据源 · 数据卷 就绪';
   // 总状态
-  const allOK=!!s.data_latest&&dkrOK&&s.scheduler_alive;
-  $('sysOK').innerHTML='<span class="dot '+(allOK?'ok':'warn')+'"></span> '+(allOK?'系统运行正常':'存在待处理项');
-  // Docker 警告卡
+  const issues=(svcOK?0:1)+(cap.ok?0:1)+(s.scheduler_alive?0:1)+(cs.ok?0:1);
+  $('sysOK').innerHTML='<span class="dot '+(issues===0?'ok':'warn')+'"></span> '+(issues===0?'系统运行正常':'存在待处理项');
+  // Docker 警告卡 + 运维按钮禁用
   $('dkrWarn').style.display=cs.ok?'none':'block';
+  $('btnLogs').disabled=!cs.ok;
+  $('btnRestart').disabled=!cs.ok;
   // 存储
   if(s.disk&&s.disk.total_gb!=null){
     const pct=Math.round(s.disk.used_gb/s.disk.total_gb*100);
@@ -1497,6 +1695,17 @@ function renderSystem(s,cs){
   $('cState').textContent=cs.status||'—';
   $('cUptime').textContent=cs.started?fmtUptime(cs.started):'—';
   $('cSource').textContent=s.source||'—';
+  $('cVer').textContent=(s.webui&&s.webui.version)||'—';
+  $('cStart').textContent=(s.webui&&s.webui.started)?new Date(s.webui.started*1000).toLocaleString('zh-CN',{hour12:false}).replace(/\//g,'-'):'—';
+  const hb=$('cHeartbeat');
+  if(hb){
+    if(s.webui&&s.webui.heartbeat){
+      const sec=Math.floor(Date.now()/1000-s.webui.heartbeat);
+      const t=sec<0?'刚刚':sec<60?sec+' 秒前':sec<3600?Math.floor(sec/60)+' 分钟前':Math.floor(sec/3600)+' 小时前';
+      hb.innerHTML=sec>120?('<span style="color:var(--err)">'+t+'</span>'):t;
+    }else hb.textContent='—';
+  }
+  $('cDataDir').textContent=s.data_dir||'—';
 }
 
 async function loadWatchlist(){
@@ -1591,7 +1800,7 @@ async function toggleContainerLogs(){
   }catch(e){pre.textContent='读取失败: '+e}
 }
 setInterval(()=>{if($('syncProgress')&&$('syncProgress').style.display==='block'&&window._syncStarted){$('progElapsed').textContent='已运行 '+fmtDur(Date.now()/1000-window._syncStarted)}},1000);
-refresh();setInterval(refresh,4000);
+refresh();setInterval(()=>refresh(),4000);
 </script></body></html>"""
 
 
@@ -1689,6 +1898,12 @@ class Handler(BaseHTTPRequestHandler):
             "data_latest": data_latest_date(),
             "code_stats": code_stats(),          # {stock, etf, other, latency_ms}
             "coverage": data_coverage(),         # {earliest, latest} 或 null
+            "sync_cap": sync_capability(),       # {ok, checks:{updater,source,writable,retry_pending}}
+            "mirror": mirror_latest_date(),
+            "webui": {"version": WEBUI_VERSION, "started": _webui_started,
+                      "heartbeat": _scheduler_heartbeat},
+            "data_dir": str(DATA_DIR),
+            "last_sync": last_sync_summary(),
             "schedule": load_schedule(),
             "disk": disk_usage(),
             "scheduler_alive": _scheduler_alive,
