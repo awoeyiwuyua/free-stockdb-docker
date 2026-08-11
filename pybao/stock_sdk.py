@@ -132,7 +132,7 @@ class StockDBClient:
         if not daily_data:
             return []
 
-        # LevelDB 天然按日期升序，无需排序
+        # 上游查询方向已修正(见 _build_time_query),输入按日期升序,无需排序
         sorted_daily = daily_data
 
         # 2. 分组归类
@@ -250,7 +250,7 @@ class StockDBClient:
         if not minute_data:
             return []
 
-        # LevelDB 天然按时间升序，无需排序
+        # 上游查询方向已修正(见 _build_time_query),输入按时间升序,无需排序
         sorted_min = minute_data
         
         interval = int(frequency[:-1]) # '5m' -> 5, '15m' -> 15, '30m' -> 30, '60m' -> 60
@@ -491,7 +491,7 @@ class StockDBClient:
             # 限额截取
             if limit is not None:
                 records = records[:limit]
-                
+
             # 字段投影过滤
             if fields:
                 records = self._filter_fields(records, fields)
