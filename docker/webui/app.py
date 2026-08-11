@@ -276,12 +276,17 @@ def _classify_code(code: str) -> str:
 
 
 def code_stats() -> dict:
-    """全市场标的数量，股票 / ETF 分开统计（其余归 other）。"""
+    """全市场标的数量，股票 / ETF 分开统计（其余归 other），并返回查询延迟 ms。
+
+    延迟 = 拉取全市场代码列表耗时，供系统页「行情服务」健康卡显示。
+    """
     import urllib.request, urllib.parse
+    t0 = time.time()
     try:
         url = f"http://{STOCKDB_HOST}:{STOCKDB_PORT}/?cmd=get&t={urllib.parse.quote('股票代码')}"
         with urllib.request.urlopen(url, timeout=15) as resp:
             data = json.loads(resp.read().decode("utf-8", "replace"))
+        latency_ms = round((time.time() - t0) * 1000)
         codes: list[str] = []
         if isinstance(data, dict):
             for group in data.values():
@@ -290,9 +295,10 @@ def code_stats() -> dict:
         stats = {"stock": 0, "etf": 0, "other": 0}
         for c in set(codes):
             stats[_classify_code(c)] += 1
+        stats["latency_ms"] = latency_ms
         return stats
     except Exception:
-        return {"stock": None, "etf": None, "other": None}
+        return {"stock": None, "etf": None, "other": None, "latency_ms": None}
 
 
 _coverage_cache: dict = {"at": 0.0, "data": None}  # 15 分钟缓存，避免 4s 轮询重复全历史扫描
@@ -602,7 +608,8 @@ def run_sync(hot: bool = True, trigger: str = "manual", retry: bool = False) -> 
     if not _sync_lock.acquire(blocking=False):
         return  # 已在同步中
     _sync_state.update(running=True, exit_code=None, last_start=time.time(), last_end=None,
-                       trigger=trigger, phase="stopping" if not hot else "syncing")
+                       trigger=trigger, phase="stopping" if not hot else "syncing",
+                       fail_reason=None)
     global _last_sync_stdout, _last_verify_result
     _last_sync_stdout = ""
     _last_verify_result = None
@@ -659,6 +666,8 @@ def run_sync(hot: bool = True, trigger: str = "manual", retry: bool = False) -> 
             log(f"  [err] {line}")
         _last_sync_stdout = proc.stdout or ""
         _sync_state["exit_code"] = proc.returncode
+        if proc.returncode != 0:
+            _sync_state["fail_reason"] = f"同步器异常退出（code {proc.returncode}）"
         log(f"→ 数据更新退出码 {proc.returncode}")
 
         # 3. 热更新模式：验证数据完整性（此时 stockdb 仍在运行）
@@ -669,6 +678,7 @@ def run_sync(hot: bool = True, trigger: str = "manual", retry: bool = False) -> 
                 problems = _verify_data(before_date)
                 if problems:
                     _last_verify_result = "fail"
+                    _sync_state["fail_reason"] = "数据完整性验证未通过"
                     log(f"  ⚠️ 完整性验证未通过：{problems}")
                     log("  → 数据异常，自动重启 stockdb 止损 ...")
                     try:
@@ -713,8 +723,9 @@ def run_sync(hot: bool = True, trigger: str = "manual", retry: bool = False) -> 
     except Exception as exc:
         log(f"❌ 同步异常：{exc}")
         _sync_state["exit_code"] = -1
+        _sync_state["fail_reason"] = f"同步异常：{exc}"
     finally:
-        # 记录同步历史（时间/触发来源/模式/结果/耗时/下载删除数/数据最新日期）
+        # 记录同步历史（时间/触发来源/模式/结果/耗时/下载删除数/数据最新日期/失败原因）
         try:
             counts = parse_sync_counts(_last_sync_stdout)
             append_history({
@@ -722,6 +733,7 @@ def run_sync(hot: bool = True, trigger: str = "manual", retry: bool = False) -> 
                 "trigger": _sync_state.get("trigger", "manual"),
                 "mode": "hot" if hot else "strict",
                 "exit_code": _sync_state.get("exit_code"),
+                "reason": _sync_state.get("fail_reason"),
                 "downloads": counts.get("downloads"),
                 "deletes": counts.get("deletes"),
                 "verified": _last_verify_result,
@@ -977,72 +989,166 @@ def stockdb_get(table: str) -> str:
 PAGE = r"""<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>stockdb 管理台</title>
+<title>stockdb 控制台</title>
 <style>
-:root{--bg:#0f172a;--panel:#1e293b;--line:#334155;--text:#e2e8f0;--muted:#94a3b8;
---ok:#22c55e;--warn:#f59e0b;--err:#ef4444;--brand:#38bdf8}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);
+:root{--bg:#0B1120;--panel:#111C2E;--panel2:#162238;--line:#1E2C45;--text:#E5EDF8;--muted:#8FA2BC;
+--ok:#22C55E;--warn:#F59E0B;--err:#EF4444;--brand:#38BDF8}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);
 font:14px/1.6 -apple-system,"PingFang SC","Microsoft YaHei",sans-serif}
-.wrap{max-width:960px;margin:0 auto;padding:24px}
-h1{font-size:20px;display:flex;align-items:center;gap:10px}
-.dot{width:10px;height:10px;border-radius:50%;background:var(--muted);display:inline-block}
-.dot.ok{background:var(--ok)}.dot.err{background:var(--err)}.dot.warn{background:var(--warn)}
-.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;
-padding:16px;margin:14px 0}
-.row{display:flex;gap:16px;flex-wrap:wrap}
+.wrap{max-width:1120px;margin:0 auto;padding:20px 20px 48px}
+
+/* 顶部导航：吸顶 + 横向滚动页签 */
+.topbar{position:sticky;top:0;z-index:50;background:rgba(11,17,32,.94);backdrop-filter:blur(8px);
+border-bottom:1px solid var(--line)}
+.topbar-inner{max-width:1120px;margin:0 auto;padding:10px 20px;display:flex;align-items:center;gap:18px;flex-wrap:wrap}
+.brand{display:flex;align-items:center;gap:10px;font-size:16px;font-weight:700;white-space:nowrap}
+.dot{width:9px;height:9px;border-radius:50%;background:var(--muted);display:inline-block}
+.dot.ok{background:var(--ok);box-shadow:0 0 0 3px rgba(34,197,94,.14)}
+.dot.err{background:var(--err);box-shadow:0 0 0 3px rgba(239,68,68,.14)}
+.dot.warn{background:var(--warn);box-shadow:0 0 0 3px rgba(245,158,11,.14)}
+.brand-status{font-size:12px;color:var(--muted)}
+.tabs{display:flex;gap:2px;overflow-x:auto;flex:1;min-width:0;-webkit-overflow-scrolling:touch;scrollbar-width:none}
+.tabs::-webkit-scrollbar{display:none}
+.tab-btn{background:transparent;border:0;border-bottom:2px solid transparent;color:var(--muted);
+font-size:15px;padding:8px 16px;cursor:pointer;white-space:nowrap}
+.tab-btn.active{color:var(--brand);border-bottom-color:var(--brand);font-weight:700}
+.tab-panel{display:none;padding-top:16px}.tab-panel.active{display:block}
+
+/* 卡片 */
+.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px;margin:14px 0}
+.card-title{font-size:14px;font-weight:600;margin-bottom:10px}
 .k{color:var(--muted);font-size:12px;margin-bottom:2px}
 .v{font-size:16px;font-weight:600}
-button{background:var(--brand);border:0;color:#082f49;font-weight:700;font-size:15px;
-padding:10px 22px;border-radius:8px;cursor:pointer}
-button:disabled{background:var(--line);color:var(--muted);cursor:not-allowed}
-input[type=text],input[type=time],select{background:#0f172a;border:1px solid var(--line);
-color:var(--text);padding:8px 10px;border-radius:6px;width:220px}
-pre{background:#0b1220;border:1px solid var(--line);border-radius:8px;padding:12px;
-max-height:340px;overflow:auto;font:12px/1.5 ui-monospace,monospace;color:#a5f3fc}
-.actions{display:flex;align-items:center;gap:12px}
-.hint{color:var(--muted);font-size:12px}
-table{width:100%;border-collapse:collapse;font-size:13px}
-th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line);white-space:nowrap}
-th{color:var(--muted);font-weight:600}
-#kchart{width:100%;height:460px}
-.badge{padding:2px 8px;border-radius:10px;font-size:12px}
-.b-ok{background:#14532d;color:#86efac}.b-fail{background:#7f1d1d;color:#fca5a5}
-.b-skip{background:#44403c;color:#d6d3d1}
-.tabs{display:flex;gap:2px;border-bottom:1px solid var(--line);margin-bottom:16px}
-.tab-btn{background:transparent;border:0;border-bottom:2px solid transparent;color:var(--muted);
-font-size:15px;padding:8px 18px;cursor:pointer}
-.tab-btn.active{color:var(--brand);border-bottom-color:var(--brand);font-weight:700}
-.tab-panel{display:none}.tab-panel.active{display:block}
+.row{display:flex;gap:16px;flex-wrap:wrap}
 .metrics{display:flex;gap:20px;flex-wrap:wrap}
 .metrics .m{flex:1;min-width:110px}
-.metrics .lbl{color:var(--muted);font-size:12px;margin-bottom:2px}
-.metrics .val{font-size:17px;font-weight:600}
-</style></head><body><div class="wrap">
-<h1><span id="statusDot" class="dot"></span> stockdb 管理台</h1>
+.lbl{color:var(--muted);font-size:12px;margin-bottom:2px}
+.val{font-size:16px;font-weight:600}
 
-<div class="tabs">
-  <button class="tab-btn active" data-tab="overview" onclick="showTab('overview',this)">概览</button>
-  <button class="tab-btn" data-tab="market" onclick="showTab('market',this)">行情</button>
-  <button class="tab-btn" data-tab="sync" onclick="showTab('sync',this)">同步</button>
-  <button class="tab-btn" data-tab="system" onclick="showTab('system',this)">系统</button>
-</div>
+/* 按钮 */
+button{background:var(--brand);border:0;color:#082F49;font-weight:700;font-size:15px;
+padding:10px 22px;border-radius:8px;cursor:pointer;min-height:40px}
+button:disabled{background:var(--line);color:var(--muted);cursor:not-allowed}
+.btn-ghost{background:transparent;border:1px solid var(--line);color:var(--text);font-weight:500}
+.btn-ghost:hover{border-color:var(--muted)}
+.btn-danger{background:transparent;border:1px solid var(--err);color:var(--err);font-weight:600}
+.btn-danger:hover{background:rgba(239,68,68,.08)}
+.btn-sm{padding:6px 12px;font-size:13px;min-height:32px}
+
+/* 开关 */
+.switch{position:relative;display:inline-block;width:40px;height:22px;flex-shrink:0}
+.switch input{opacity:0;width:0;height:0}
+.switch .sl{position:absolute;inset:0;background:var(--panel2);border:1px solid var(--line);border-radius:20px;transition:.2s;cursor:pointer}
+.switch .sl:before{content:"";position:absolute;width:16px;height:16px;left:2px;top:2px;border-radius:50%;background:var(--muted);transition:.2s}
+.switch input:checked+.sl{background:rgba(56,189,248,.22);border-color:var(--brand)}
+.switch input:checked+.sl:before{transform:translateX(18px);background:var(--brand)}
+
+/* 主状态区 */
+.hero{background:linear-gradient(180deg,var(--panel) 0%,#0E1830 100%);border:1px solid var(--line);border-radius:12px;padding:20px;margin:14px 0}
+.hero-status{display:flex;align-items:center;gap:10px;font-size:20px;font-weight:700}
+.hero-sub{color:var(--muted);font-size:13px;margin-top:6px}
+.hero-actions{display:flex;align-items:center;gap:12px;margin-top:14px;flex-wrap:wrap}
+
+/* 两列布局 */
+.cols{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin:14px 0}
+@media(max-width:760px){.cols{grid-template-columns:1fr}}
+
+/* 进度 */
+.progress{display:flex;gap:10px;align-items:center;font-size:13px;color:var(--muted);margin-top:12px}
+.bar{flex:1;height:6px;border-radius:3px;background:var(--panel2);overflow:hidden}
+.bar i{display:block;height:100%;width:0;background:var(--brand);border-radius:3px;transition:width .4s}
+.spin{display:inline-block;width:14px;height:14px;border:2px solid var(--brand);border-top-color:transparent;border-radius:50%;animation:spin .8s linear infinite;vertical-align:-2px}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+/* Toast */
+#toast{position:fixed;left:50%;bottom:28px;transform:translateX(-50%) translateY(20px);background:var(--panel2);
+border:1px solid var(--line);color:var(--text);padding:10px 18px;border-radius:10px;font-size:14px;
+opacity:0;pointer-events:none;transition:.25s;z-index:100;box-shadow:0 8px 24px rgba(0,0,0,.4)}
+#toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+
+/* 历史 */
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{text-align:left;padding:7px 8px;border-bottom:1px solid var(--line);white-space:nowrap}
+th{color:var(--muted);font-weight:600}
+tr.hr-row{cursor:pointer}
+tr.hr-row:hover{background:rgba(56,189,248,.04)}
+.hr-detail{background:var(--panel2);font-size:12px;color:var(--muted)}
+.dot-ok{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--ok);margin-right:6px}
+.dot-fail{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--err);margin-right:6px}
+.hr-cards{display:none}
+@media(max-width:760px){table{display:none}.hr-cards{display:block}}
+.hr-card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:12px 14px;margin:10px 0}
+.hr-card .row1{display:flex;justify-content:space-between;align-items:center}
+.hr-card .row2{color:var(--muted);font-size:12px;margin-top:4px}
+.hr-card .row3{color:var(--muted);font-size:12px;margin-top:2px}
+
+/* 存储条 */
+.storage-bar{height:8px;border-radius:4px;background:var(--panel2);overflow:hidden;margin-top:8px}
+.storage-bar i{display:block;height:100%;border-radius:4px;background:var(--brand)}
+.storage-bar i.high{background:var(--warn)}
+
+/* 系统健康卡 */
+.hc-cards{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin:12px 0 4px}
+@media(max-width:760px){.hc-cards{grid-template-columns:1fr}}
+.hc{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px 16px}
+.hc .lbl{font-size:12px;color:var(--muted);margin-bottom:6px}
+.hc .st{font-weight:700;display:flex;align-items:center;gap:8px}
+.hc .st i{display:inline-block;width:9px;height:9px;border-radius:50%}
+.hc .sub{font-size:12px;color:var(--muted);margin-top:6px}
+
+/* 警告卡 */
+.warn-card{background:rgba(245,158,11,.07);border:1px solid rgba(245,158,11,.35);border-radius:12px;padding:14px 16px;margin:14px 0}
+.warn-card .t{color:var(--warn);font-weight:700}
+.warn-card .d{color:var(--muted);font-size:13px;margin-top:4px}
+
+.info-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px 24px}
+@media(max-width:760px){.info-grid{grid-template-columns:1fr}}
+.info-grid .it{display:flex;justify-content:space-between;gap:12px;font-size:13px}
+.info-grid .it .lk{color:var(--muted)}
+
+pre{background:#0A0F1C;border:1px solid var(--line);border-radius:10px;padding:12px;
+max-height:340px;overflow:auto;font:12px/1.5 ui-monospace,monospace;color:#A5D8F8}
+.actions{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.hint{color:var(--muted);font-size:12px}
+input[type=text],input[type=time],select{background:#0A0F1C;border:1px solid var(--line);
+color:var(--text);padding:8px 10px;border-radius:8px;width:220px}
+#kchart{width:100%;height:460px}
+.setting-row{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 0;border-bottom:1px solid var(--line)}
+.setting-row:last-child{border-bottom:0}
+.setting-row .lbl{font-size:13px;color:var(--text)}
+.setting-row .dsc{font-size:12px;color:var(--muted)}
+.times-pill{display:inline-block;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:2px 10px;font-size:13px;margin:2px 4px 2px 0}
+</style></head><body>
+<div class="topbar"><div class="topbar-inner">
+  <div class="brand"><span id="statusDot" class="dot"></span> stockdb</div>
+  <div class="brand-status" id="brandStatus">加载中…</div>
+  <nav class="tabs">
+    <button class="tab-btn active" data-tab="overview" onclick="showTab('overview',this)">概览</button>
+    <button class="tab-btn" data-tab="market" onclick="showTab('market',this)">行情</button>
+    <button class="tab-btn" data-tab="sync" onclick="showTab('sync',this)">数据同步</button>
+    <button class="tab-btn" data-tab="system" onclick="showTab('system',this)">系统</button>
+  </nav>
+</div></div>
+<div class="wrap">
+<div id="toast"></div>
 
 <!-- 概览：大盘 + 自选股 -->
 <div id="tab-overview" class="tab-panel active">
-  <div class="card"><div class="metrics">
+  <div class="card"><div class="card-title">概览</div><div class="metrics">
     <div class="m"><div class="lbl">大盘指数</div><div class="row" id="idxRow" style="gap:14px"><span class="hint">…</span></div></div>
     <div class="m"><div class="lbl">自选股（点代码看K线）</div><div class="row" id="wlRow" style="gap:14px"><span class="hint">…</span></div></div>
   </div>
-  <div style="margin-top:10px;display:flex;gap:8px">
+  <div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap">
     <input type="text" id="wlAdd" placeholder="加自选，如 600633,000967" style="width:280px">
-    <button onclick="addWatch()" style="background:#334155;color:#e2e8f0">加入自选</button>
+    <button class="btn-ghost" onclick="addWatch()">加入自选</button>
     <span id="wlMsg" class="hint"></span>
   </div></div>
 </div>
 
 <!-- 行情：K线图 + 原始查询 -->
 <div id="tab-market" class="tab-panel">
-  <div class="card"><div class="k">K 线图</div>
+  <div class="card"><div class="card-title">K 线图</div>
     <div style="display:flex;gap:8px;margin:8px 0;flex-wrap:wrap;align-items:center">
       <input type="text" id="kcode" value="600633" placeholder="股票代码" style="width:120px">
       <select id="kfreq"><option value="day">日K</option><option value="minute">分钟K</option></select>
@@ -1053,335 +1159,438 @@ font-size:15px;padding:8px 18px;cursor:pointer}
     </div>
     <div id="kchart"></div>
   </div>
-  <div class="card"><div class="k">行情原始查询（代理 stockdb HTTP API）</div>
-    <div style="display:flex;gap:8px;margin:8px 0">
+  <div class="card"><div class="card-title">行情原始查询（代理 stockdb HTTP API）</div>
+    <div style="display:flex;gap:8px;margin:8px 0;flex-wrap:wrap">
       <select id="qtype">
         <option value="股票代码">股票代码</option>
         <option value="日k:600633:20260810">日K 示例</option>
         <option value="分钟k:600633:20260810140000">分钟K 示例</option>
         <option value="复权:600633:2026*">复权 示例</option>
       </select>
-      <button onclick="doQuery()" style="background:#334155;color:#e2e8f0">查询</button>
+      <button class="btn-ghost" onclick="doQuery()">查询</button>
     </div>
     <pre id="qres">（查询结果）</pre>
   </div>
 </div>
 
-<!-- 同步：①数据库状态判断 ②手动同步 ③自动同步 + 历史 + 日志 -->
+<!-- 数据同步：主状态区 + 两列辅助 + 历史 + 日志 -->
 <div id="tab-sync" class="tab-panel">
-  <div class="card"><div class="k">数据库状态</div>
-    <div class="metrics">
-      <div class="m"><div class="lbl">数据健康度</div><div class="val" id="cLatest" style="font-size:13px">…</div></div>
-      <div class="m"><div class="lbl">标的数量</div><div class="val" id="cCount" style="font-size:13px">…</div></div>
-      <div class="m"><div class="lbl">数据覆盖</div><div class="val" id="cCoverage" style="font-size:13px">…</div></div>
-      <div class="m"><div class="lbl">上次同步</div><div class="val" id="cLastSync" style="font-size:13px">…</div></div>
-      <div class="m"><div class="lbl">数据源</div><div class="val" id="cSource" style="font-size:12px">…</div></div>
+  <div class="hero">
+    <div class="hero-status"><span id="heroSpin" class="spin" style="display:none"></span><span id="heroStatus">…</span></div>
+    <div class="hero-sub" id="heroSub">…</div>
+    <div class="hero-actions">
+      <button id="syncBtn2" onclick="startSync(false)">立即热更新</button>
+      <span class="hint" id="lastSuccess">…</span>
+      <span style="flex:1"></span>
+      <button class="btn-ghost btn-sm" onclick="toggleMenu()">更多操作 <span id="menuCaret">▾</span></button>
+    </div>
+    <div id="moreMenu" style="display:none;margin-top:12px">
+      <div class="hint" style="margin-bottom:8px">默认热更新不中断行情服务；以下为故障兜底。</div>
+      <button class="btn-danger btn-sm" onclick="startSync(true)">停服同步（备用）</button>
+    </div>
+    <div id="syncProgress" style="display:none;margin-top:14px">
+      <div style="display:flex;gap:8px;align-items:center;font-size:14px">
+        <span class="spin"></span><span id="progPhase">正在同步数据</span>
+        <span style="flex:1"></span><span class="hint" id="progElapsed">已运行 00:00</span>
+      </div>
+      <div class="progress"><span id="progStage">准备中</span><div class="bar"><i id="progBar"></i></div><span id="progPct">0%</span></div>
     </div>
   </div>
-  <div class="card"><div class="k">手动同步</div>
-    <div class="actions" style="margin-top:8px">
-      <button id="syncBtn2" onclick="doSync()">开始同步</button>
-      <span id="phaseBadge" class="badge b-skip" style="display:none"></span>
-      <label class="hint" style="display:flex;align-items:center;gap:6px">
-        <input type="checkbox" id="hotMode" checked> 热更新（不停服务，默认）
-      </label>
-      <span id="syncMsg" class="hint">热更新=服务保持运行直接增量同步；严格模式=停服后同步</span>
+
+  <div class="cols">
+    <div class="card"><div class="card-title">自动同步</div>
+      <div id="schView">
+        <div class="setting-row"><span class="lbl">自动同步</span><label class="switch"><input type="checkbox" id="schEnabled" onchange="saveScheduleNow()"><span class="sl"></span></label></div>
+        <div class="setting-row"><span class="lbl">仅交易日 <span class="dsc">周末 / 法定休市不执行</span></span><label class="switch"><input type="checkbox" id="schTrading" onchange="saveScheduleNow()"><span class="sl"></span></label></div>
+        <div class="setting-row"><span class="lbl">执行时间</span><span class="hint" id="schTimesView">…</span></div>
+        <div class="setting-row"><span class="lbl">下次执行</span><span class="hint" id="schNext">…</span></div>
+        <div style="margin-top:10px;text-align:right"><button class="btn-ghost btn-sm" onclick="toggleSchEdit(true)">编辑计划</button></div>
+      </div>
+      <div id="schEdit" style="display:none">
+        <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px;flex-wrap:wrap">
+          <input type="time" id="schTime" value="15:30" style="width:140px">
+          <button class="btn-ghost btn-sm" onclick="addSchTime()">添加时间点</button>
+        </div>
+        <div id="schTimesEdit" style="margin-bottom:10px"></div>
+        <div style="display:flex;gap:8px;justify-content:flex-end">
+          <button class="btn-ghost btn-sm" onclick="toggleSchEdit(false)">取消</button>
+          <button class="btn-sm" onclick="saveScheduleNow()">保存计划</button>
+        </div>
+      </div>
+      <div class="hint" style="margin-top:8px" id="schLast"></div>
+      <div class="hint" id="schToday"></div>
+    </div>
+    <div class="card"><div class="card-title">数据概况</div>
+      <div class="metrics" style="gap:10px">
+        <div class="m"><div class="lbl">股票</div><div class="val" id="cCountStk">…</div></div>
+        <div class="m"><div class="lbl">ETF</div><div class="val" id="cCountEtf">…</div></div>
+        <div class="m"><div class="lbl">覆盖</div><div class="val" id="cCoverage" style="font-size:14px">…</div></div>
+      </div>
+      <div class="hint" style="margin-top:8px">数据最新 <span id="cLatest2">…</span></div>
     </div>
   </div>
-  <div class="card"><div class="k">自动同步 <span id="cSched" style="font-weight:normal;font-size:12px"></span></div>
-    <div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-      <label class="hint"><input type="checkbox" id="schEnabled" onchange="saveScheduleNow()"> 启用</label>
-      <label class="hint"><input type="checkbox" id="schTrading" onchange="saveScheduleNow()"> 仅交易日</label>
-      <input type="time" id="schTime" value="15:30">
-      <button onclick="addSchTime()" style="background:#334155;color:#e2e8f0">添加时间点</button>
-      <span id="schTimes" style="display:flex;gap:6px;flex-wrap:wrap"></span>
-      <span id="schMsg" class="hint"></span>
-    </div>
-    <div class="hint" style="margin-top:8px" id="schNext"></div>
-    <div class="hint" style="margin-top:4px" id="schLast"></div>
-    <div class="hint" style="margin-top:2px" id="schToday"></div>
-  </div>
-  <div class="card"><div class="k">同步历史（最近 30 次）</div>
-    <div id="histStats" class="hint" style="margin-bottom:6px"></div>
+
+  <div class="card"><div class="card-title">最近同步 <span class="hint" style="font-weight:normal;margin-left:6px" id="histStats"></span></div>
     <table><thead><tr><th>时间</th><th>触发</th><th>模式</th><th>结果</th><th>下载</th><th>验证</th><th>耗时</th><th>数据最新</th></tr></thead>
     <tbody id="histBody"><tr><td colspan="8" class="hint">（暂无历史）</td></tr></tbody></table>
+    <div class="hr-cards" id="histCards"></div>
   </div>
-  <div class="card"><div class="k">同步日志（自动刷新）</div><pre id="log">（暂无）</pre></div>
+  <div class="card"><div class="card-title">同步日志 <span class="hint" style="font-weight:normal;margin-left:6px">（运行中或失败时自动展开）</span></div>
+    <pre id="log" style="display:none">（暂无）</pre>
+  </div>
 </div>
 
-<!-- 系统：容器/磁盘/运维动作 -->
+<!-- 系统：健康检查面板 -->
 <div id="tab-system" class="tab-panel">
-  <div class="card"><div class="metrics">
-    <div class="m"><div class="lbl">stockdb 容器</div><div class="val" id="cState" style="font-size:15px">…</div></div>
-    <div class="m"><div class="lbl">镜像</div><div class="val" id="cImage" style="font-size:13px">…</div></div>
-    <div class="m"><div class="lbl">运行时长</div><div class="val" id="cUptime" style="font-size:13px">…</div></div>
-    <div class="m"><div class="lbl">磁盘用量</div><div class="val" id="cDisk" style="font-size:13px">…</div></div>
+  <div class="card"><div class="card-title">系统健康检查</div>
+    <div id="sysOK" style="display:flex;align-items:center;gap:8px;font-weight:700;font-size:16px;margin-bottom:4px">…</div>
+    <div class="hc-cards">
+      <div class="hc"><div class="lbl">行情服务</div><div class="st"><i id="hcSvcDot"></i><span id="hcSvc">…</span></div><div class="sub" id="hcSvcSub">…</div></div>
+      <div class="hc"><div class="lbl">Docker</div><div class="st"><i id="hcDkrDot"></i><span id="hcDkr">…</span></div><div class="sub" id="hcDkrSub">…</div></div>
+      <div class="hc"><div class="lbl">自动任务</div><div class="st"><i id="hcSchedDot"></i><span id="hcSched">…</span></div><div class="sub" id="hcSchedSub">…</div></div>
+    </div>
+    <div id="dkrWarn" class="warn-card" style="display:none">
+      <div class="t">Docker 管理不可用</div>
+      <div class="d">未检测到 /var/run/docker.sock。行情查询仍可使用，但无法重启容器或执行停服同步。</div>
+    </div>
   </div>
-  <div class="hint" style="margin-top:8px" id="cStateNote">…</div>
-  <div class="actions" style="margin-top:12px;gap:10px">
-    <button onclick="restartContainer()" style="background:#334155;color:#e2e8f0">重启 stockdb</button>
-    <button onclick="toggleContainerLogs()" style="background:#334155;color:#e2e8f0">查看容器日志</button>
-    <span id="containerMsg" class="hint"></span>
+  <div class="card"><div class="card-title">存储空间</div>
+    <div id="cDisk" style="font-size:15px;font-weight:600">…</div>
+    <div class="storage-bar"><i id="diskBar"></i></div>
+    <div class="hint" style="margin-top:6px">挂载点 /data（数据卷）</div>
   </div>
-  <pre id="containerLog" style="margin-top:10px;display:none">（加载中…）</pre></div>
+  <div class="card"><div class="card-title">运行信息</div>
+    <div class="info-grid">
+      <div class="it"><span class="lk">镜像</span><span id="cImage">—</span></div>
+      <div class="it"><span class="lk">容器状态</span><span id="cState">—</span></div>
+      <div class="it"><span class="lk">运行时长</span><span id="cUptime">—</span></div>
+      <div class="it"><span class="lk">同步节点</span><span id="cSource">—</span></div>
+    </div>
+  </div>
+  <div class="card"><div class="card-title">运维工具</div>
+    <div class="actions">
+      <button class="btn-ghost" onclick="toggleContainerLogs()">查看容器日志</button>
+      <button class="btn-danger" onclick="restartContainer()">重启 stockdb</button>
+      <span class="hint" id="containerMsg"></span>
+    </div>
+    <pre id="containerLog" style="display:none;margin-top:10px">（加载中…）</pre>
+  </div>
 </div>
 </div>
 <script src="/static/echarts.min.js"></script>
 <script>
 async function j(url,opt){const r=await fetch(url,opt);if(!r.ok)throw new Error(r.status);return r.json()}
 function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
-function pctCls(v){return v>0?'color:#f87171':v<0?'color:#4ade80':'color:#94a3b8'}
+function pctCls(v){return v>0?'color:#F87171':v<0?'color:#4ADE80':'color:#8FA2BC'}
 function fmtPct(v){return v==null?'—':(v>0?'+':'')+Number(v).toFixed(2)+'%'}
 function fmtPrice(v){return v==null?'—':Number(v).toFixed(2)}
+function $(id){return document.getElementById(id)}
+let _toastTimer=null;
+function toast(msg){const t=$('toast');t.textContent=msg;t.classList.add('show');clearTimeout(_toastTimer);_toastTimer=setTimeout(()=>t.classList.remove('show'),2600)}
+function fmtDur(sec){sec=Math.max(0,Math.floor(sec||0));return String(Math.floor(sec/60)).padStart(2,'0')+':'+String(sec%60).padStart(2,'0')}
+function fmtClock(ts){
+  if(!ts)return '';
+  const d=new Date(ts.replace(' ','T'));if(isNaN(d))return ts;
+  const now=new Date(),day0=new Date(now.getFullYear(),now.getMonth(),now.getDate());
+  const dd=new Date(d.getFullYear(),d.getMonth(),d.getDate());
+  const hm=String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0');
+  const diff=Math.round((day0-dd)/86400000);
+  if(diff===0)return '今天 '+hm;if(diff===1)return '昨天 '+hm;
+  return String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0')+' '+hm;
+}
 function showTab(name,btn){
   document.querySelectorAll('.tab-btn').forEach(b=>b.classList.remove('active'));
   document.querySelectorAll('.tab-panel').forEach(p=>p.classList.remove('active'));
   (btn||document.querySelector('[data-tab="'+name+'"]')).classList.add('active');
-  document.getElementById('tab-'+name).classList.add('active');
+  $('tab-'+name).classList.add('active');
   if(name==='market'&&kchart)kchart.resize();
 }
+
+const PHASE_STAGE={stopping:'停服中',syncing:'同步数据',verifying:'校验数据完整性',restarting:'重启服务'};
+const PHASE_PCT={stopping:15,syncing:45,verifying:80,restarting:95};
+let _lastExit=null;
+
 async function refresh(){
   try{
     const s=await j('/api/status');
-    // 系统页：容器状态 + 镜像 + 运行时长 + 数据源
     const cs=s.container||{};
-    document.getElementById('cState').textContent=cs.status||'unknown';
-    document.getElementById('cImage').textContent=cs.image||'—';
-    document.getElementById('cUptime').textContent=cs.started?fmtUptime(cs.started):'—';
-    document.getElementById('cStateNote').textContent=cs.note||(cs.ok?'':'docker 不可用，同步按钮将无法停/启容器');
-    document.getElementById('cSource').textContent=s.source||'—';
-    // 标的数量（股票/ETF 分开）
-    const cc=s.code_stats||{};
-    const cCount=document.getElementById('cCount');
-    if(cCount)cCount.textContent=(cc.stock!=null?('股票 '+cc.stock+' ｜ ETF '+(cc.etf||0))+(cc.other?' ｜ 其他 '+(cc.other||0):''):'—');
-    // 数据覆盖范围（最早~最新）
-    const cov=s.coverage||{};
-    const cCov=document.getElementById('cCoverage');
-    if(cCov)cCov.textContent=(cov.earliest?String(cov.earliest).slice(0,4)+'-'+String(cov.earliest).slice(4,6)+'-'+String(cov.earliest).slice(6,8)+' ~ '+String(cov.latest).slice(0,4)+'-'+String(cov.latest).slice(4,6)+'-'+String(cov.latest).slice(6,8):'—');
-    const d=document.getElementById('statusDot');
-    d.className='dot '+(cs.status==='running'?'ok':(cs.ok?'err':'warn'));
-    // 同步页：健康度 + 定时调度器 + 磁盘 + 阶段徽章
-    loadHealth();
-    const schedInfo=s.schedule||{};
-    document.getElementById('cSched').innerHTML='<span style="color:'+(s.scheduler_alive?'var(--ok)':'var(--err)')+'">'+(s.scheduler_alive?'运行中':'未运行')+'</span>'+(schedInfo.enabled&&schedInfo.times?' ｜ 每日 '+schedInfo.times.join('、'):'');
-    if(s.disk&&s.disk.total_gb!=null)document.getElementById('cDisk').textContent=s.disk.used_gb+' / '+s.disk.total_gb+' GB';
-    const b=document.getElementById('syncBtn2');if(b)b.disabled=s.sync_running;
-    document.getElementById('syncMsg').textContent=s.sync_running?'同步进行中，请勿重复点击…':'热更新=服务保持运行直接增量同步；严格模式=停服后同步';
-    const pb=document.getElementById('phaseBadge');
-    if(pb){
-      if(s.sync_running&&s.sync_phase!=='idle'){
-        pb.style.display='inline-block';
-        pb.className='badge '+(s.sync_phase==='verifying'?'b-ok':(s.sync_phase==='stopping'||s.sync_phase==='restarting')?'b-skip':'b-run');
-        pb.textContent=(PHASE_LABEL[s.sync_phase]||s.sync_phase)+'…';
-      }else pb.style.display='none';
-    }
-    const td=document.getElementById('schToday');
-    if(td)td.textContent=(schedInfo.enabled&&schedInfo.trading_only)?(s.trading_today?'今日为交易日，到点将自动同步':'今日非交易日（周末/休市），定时跳过')
-      :(schedInfo.enabled&&schedInfo.times?'（未限定交易日）':'');
-    renderSchTimes(schedInfo);
-    const lg=await j('/api/log?n=100');document.getElementById('log').textContent=lg.log;
-    loadWatchlist();loadHistory();
-  }catch(e){document.getElementById('log').textContent='状态刷新失败: '+e}
-}
-let _schRendered="";  // 避免 4s 轮询重复渲染/自动保存
-function renderSchTimes(sch){
-  const el=document.getElementById('schTimes');
-  if(!el)return;
-  document.getElementById('schEnabled').checked=sch.enabled;
-  document.getElementById('schTrading').checked=sch.trading_only!==false;
-  const times=sch.times||[];
-  if(JSON.stringify(times)!==_schRendered){
-    _schRendered=JSON.stringify(times);
-    el.innerHTML=times.map(t=>'<span style="background:#0f172a;border:1px solid var(--line);border-radius:6px;padding:2px 8px;font-size:13px">'+esc(t)+' <a href="#" onclick="rmSchTime(\''+t+'\',event);return false" style="color:var(--err);text-decoration:none">✕</a></span>').join('')||'<span class="hint">（无时间点）</span>';
-  }
-  // 下次 / 上次触发
-  const nxt=document.getElementById('schNext'),lst=document.getElementById('schLast');
-  if(nxt)nxt.textContent=sch.enabled?(sch.next_trigger?'下次触发：'+sch.next_trigger:'（时间点已过，明天触发）'):'定时未启用';
-  if(lst){
-    const l=sch.last_trigger;
-    lst.textContent=l?('上次定时触发 '+l.ts+' ｜ '+(l.exit===0?'✅ 成功':l.exit==null?'（进行中）':'❌ 退出码 '+l.exit)):'';
-  }
-}
-function schTimeChanged(){
-  const times=[...document.querySelectorAll('#schTimes span')].map(s=>s.textContent.replace(/✕.*/,'').trim()).filter(t=>/^\d{2}:\d{2}$/.test(t));
-  saveScheduleNow();
-}
-function addSchTime(){
-  const t=document.getElementById('schTime').value;
-  if(!t){document.getElementById('schMsg').textContent='请选择时间';return;}
-  const cur=[...(document.getElementById('schTimes').textContent.match(/\d{2}:\d{2}/g)||[]),t];
-  document.getElementById('schTime').value='';
-  saveScheduleNow([...new Set(cur)]);
-}
-function rmSchTime(t,ev){
-  ev.preventDefault();
-  const cur=(document.getElementById('schTimes').textContent.match(/\d{2}:\d{2}/g)||[]).filter(x=>x!==t);
-  saveScheduleNow(cur);
-}
-async function saveScheduleNow(times){
-  const enabled=document.getElementById('schEnabled').checked;
-  const trading=document.getElementById('schTrading').checked;
-  const t=(times||(document.getElementById('schTimes').textContent.match(/\d{2}:\d{2}/g)||[]));
-  try{
-    const r=await j('/api/schedule?action=save&enabled='+enabled+'&trading_only='+trading+'&times='+encodeURIComponent(t.join(',')));
-    document.getElementById('schMsg').textContent=r.msg||'已保存';
-    document.getElementById('schNext').textContent=r.schedule&&r.schedule.next_trigger?'下次触发：'+r.schedule.next_trigger:'';
-  }catch(e){document.getElementById('schMsg').textContent='保存失败: '+e;}
-}
-async function loadHealth(){
-  try{
     const h=await j('/api/health');
-    const el=document.getElementById('cLatest');
-    const color=h.status==='ok'?'var(--ok)':h.status==='warn'?'var(--warn)':'var(--err)';
-    el.innerHTML='<span style="color:'+color+'">'+esc(h.note||'—')+'</span>';
+    // 顶部状态
+    $('statusDot').className='dot '+(h.status==='ok'?'ok':h.status==='stale'?'warn':'err');
+    const up=s.data_latest?('数据更新至 '+String(s.data_latest).slice(4,6)+'-'+String(s.data_latest).slice(6,8)):'数据未同步';
+    $('brandStatus').textContent=(h.status==='ok'?'服务正常':h.status==='stale'?'有待更新':'服务异常')+' · '+up;
+    // 主状态区
+    renderHero(s,h);
+    // 自动同步
+    renderSchView(s.schedule||{});
+    // 数据概况
+    const cc=s.code_stats||{};
+    $('cCountStk').textContent=cc.stock!=null?cc.stock:'—';
+    $('cCountEtf').textContent=cc.etf!=null?cc.etf:'—';
+    const cov=s.coverage||{};
+    $('cCoverage').textContent=(cov.earliest?String(cov.earliest).slice(0,4)+' ~ '+String(cov.latest).slice(0,4):'—');
+    $('cLatest2').textContent=up;
+    // 系统页
+    renderSystem(s,cs);
+    loadHistory();
+    loadWatchlist();
+    // 日志：运行中或上次失败时展开
+    const lg=await j('/api/log?n=80');
+    $('log').textContent=lg.log;
+    if(s.sync_running||(_lastExit!=null&&_lastExit!==0))$('log').style.display='block';
+    else $('log').style.display='none';
+  }catch(e){$('log').textContent='状态刷新失败: '+e;$('log').style.display='block'}
+}
+
+function renderHero(s,h){
+  const spin=$('heroSpin'),st=$('heroStatus'),sub=$('heroSub');
+  $('syncBtn2').disabled=s.sync_running;
+  if(s.sync_running){
+    window._syncStarted=s.sync_started;
+    spin.style.display='inline-block';
+    st.textContent='正在同步数据';st.style.color='';
+    sub.textContent='当前：'+(PHASE_STAGE[s.sync_phase]||'处理中');
+    $('syncProgress').style.display='block';
+    const pct=PHASE_PCT[s.sync_phase]||45;
+    $('progPhase').textContent='正在同步数据';
+    $('progStage').textContent=PHASE_STAGE[s.sync_phase]||'处理中';
+    $('progBar').style.width=pct+'%';
+    $('progPct').textContent=pct+'%';
+    $('progElapsed').textContent='已运行 '+fmtDur((Date.now()/1000)-(s.sync_started||Date.now()/1000));
+    $('log').style.display='block';
+  }else{
+    spin.style.display='none';
+    $('syncProgress').style.display='none';
+    if(h.status==='ok'){
+      st.textContent='数据已是最新';st.style.color='var(--ok)';
+      sub.textContent='更新至 '+String(h.latest).slice(0,4)+'-'+String(h.latest).slice(4,6)+'-'+String(h.latest).slice(6,8)+' · 服务正常';
+    }else if(h.status==='stale'){
+      st.textContent='数据有待更新';st.style.color='var(--warn)';
+      sub.textContent=h.note||'建议执行一次同步';
+    }else{
+      st.textContent='数据状态未知';st.style.color='var(--err)';
+      sub.textContent=h.note||'无法获取数据最新日期';
+    }
+  }
+}
+function toggleMenu(){const m=$('moreMenu');const show=m.style.display==='none';m.style.display=show?'block':'none';$('menuCaret').textContent=show?'▴':'▾'}
+async function startSync(strict){
+  const opt={method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({hot:!strict})};
+  try{const r=await j('/api/sync',opt);toast(r.msg||'已启动同步');toggleMenu();}
+  catch(e){toast('启动失败: '+e)}
+}
+
+function renderSchView(sch){
+  $('schEnabled').checked=!!sch.enabled;
+  $('schTrading').checked=sch.trading_only!==false;
+  const times=sch.times||[];
+  $('schTimesView').textContent=times.length?times.join('、'):'（未设置）';
+  $('schNext').textContent=sch.enabled?(sch.next_trigger?sch.next_trigger:'（时间点已过，明天触发）'):'定时未启用';
+  $('schLast').textContent=(sch.last_trigger&&sch.last_trigger.ts)?('上次触发 '+fmtClock(sch.last_trigger.ts)+(sch.last_trigger.exit===0?' ✅':sch.last_trigger.exit==null?' ⏳':' ❌')):'';
+  $('schToday').textContent=(sch.enabled&&sch.trading_only&&!sch.next_trigger)?'（今日无待执行计划）':'';
+  renderEditTimes(times);
+}
+function renderEditTimes(times){
+  $('schTimesEdit').innerHTML=(times||[]).map(t=>'<span class="times-pill">'+esc(t)+' <a href="#" onclick="rmSchTime(\''+t+'\',event);return false" style="color:var(--err);text-decoration:none">✕</a></span>').join('')||'<span class="hint">（无时间点）</span>';
+}
+function toggleSchEdit(open){$('schView').style.display=open?'none':'block';$('schEdit').style.display=open?'block':'none'}
+function addSchTime(){
+  const t=$('schTime').value;if(!t){toast('请选择时间');return}
+  const cur=[...($('schTimesEdit').textContent.match(/\d{2}:\d{2}/g)||[]),t];
+  $('schTime').value='';
+  renderEditTimes([...new Set(cur)]);
+}
+function rmSchTime(t,ev){ev.preventDefault();const cur=($('schTimesEdit').textContent.match(/\d{2}:\d{2}/g)||[]).filter(x=>x!==t);renderEditTimes(cur)}
+async function saveScheduleNow(){
+  const enabled=$('schEnabled').checked,trading=$('schTrading').checked;
+  const times=[...($('schTimesEdit').textContent.match(/\d{2}:\d{2}/g)||[])];
+  try{
+    const r=await j('/api/schedule?action=save&enabled='+enabled+'&trading_only='+trading+'&times='+encodeURIComponent(times.join(',')));
+    toast(r.msg||'自动同步计划已保存');
+    if($('schEdit').style.display==='block')toggleSchEdit(false);
+    renderSchView(r.schedule||{});
+  }catch(e){toast('保存失败: '+e)}
+}
+
+let _hist=[];
+async function loadHistory(){
+  try{
+    const h=await j('/api/history');
+    _hist=h.history||[];
+    // 统计行
+    const st=$('histStats');
+    if(_hist.length){
+      const recent=_hist.slice(0,7),ok=recent.filter(x=>x.exit_code===0).length;
+      const durs=recent.filter(x=>x.duration_sec!=null).map(x=>x.duration_sec);
+      const avg=durs.length?Math.round(durs.reduce((a,b)=>a+b,0)/durs.length):null;
+      st.textContent='近 7 次：成功 '+ok+' / '+recent.length+(avg!=null?' · 平均 '+avg+'s':'');
+    }else st.textContent='';
+    // 上次成功（主状态区）
+    const ls=_hist.find(x=>x.exit_code===0);
+    $('lastSuccess').textContent=ls?('上次成功：'+fmtClock(ls.ts)):'';
+    _lastExit=_hist.length?_hist[0].exit_code:null;
+    $('histBody').innerHTML=_hist.map((x,i)=>historyRow(x,i)).join('')||'<tr><td colspan="8" class="hint">（暂无历史）</td></tr>';
+    $('histCards').innerHTML=_hist.map(historyCard).join('')||'<div class="hint">（暂无历史）</div>';
   }catch(e){}
 }
+function trigLabel(t){return t==='scheduled'?'⏰定时':t==='scheduled-retry'?'↻定时·重试':'手动'}
+function resultCell(x){
+  if(x.exit_code===0)return '<span class="dot-ok"></span>成功';
+  if(x.exit_code==null)return '<span class="spin" style="width:8px;height:8px;border-width:2px;border-color:var(--brand);border-top-color:transparent"></span>运行中';
+  return '<span class="dot-fail"></span>失败';
+}
+function historyRow(x,i){
+  return `<tr class="hr-row" onclick="toggleHistDetail(${i})">
+    <td>${esc(x.ts)}</td><td>${trigLabel(x.trigger)}</td><td>${x.mode==='hot'?'热更新':'严格'}</td>
+    <td>${resultCell(x)}</td><td>${x.downloads==null?'—':x.downloads}</td>
+    <td>${x.verified==='pass'?'通过':x.verified==='fail'?'失败':x.verified==='skipped'?'跳过':'—'}</td>
+    <td>${x.duration_sec==null?'—':esc(x.duration_sec)+'s'}</td><td>${esc(x.data_latest||'—')}</td></tr>`;
+}
+function historyCard(x){
+  const reason=x.reason?(' · '+esc(x.reason)):'';
+  return `<div class="hr-card">
+    <div class="row1"><span>${resultCell(x)}</span><span class="hint">${trigLabel(x.trigger)}</span></div>
+    <div class="row2">${esc((x.ts||'').slice(0,16))} · ${x.mode==='hot'?'热更新':'严格'}</div>
+    <div class="row3">${x.downloads!=null?('下载 '+x.downloads+' 个文件 · '):''}${x.verified==='pass'?'校验通过':x.verified==='fail'?'校验失败':x.verified==='skipped'?'未校验':''}${x.duration_sec!=null?(' · '+x.duration_sec+' 秒'):''}${reason}</div>
+    <div class="row3">数据更新至 ${esc(x.data_latest||'—')}</div>
+  </div>`;
+}
+function toggleHistDetail(i){
+  const x=_hist[i];if(!x)return;
+  const rows=document.querySelectorAll('#histBody tr.hr-row');
+  if(!rows[i])return;
+  let n=rows[i].nextElementSibling;
+  if(n&&n.classList.contains('hr-detail')){n.remove();return}
+  const det='失败原因：'+(x.reason||'—')+' ｜ 下载 '+(x.downloads==null?'—':x.downloads)+' 个 ｜ 删除 '+(x.deletes==null?'—':x.deletes)+' 个 ｜ 数据最新 '+(x.data_latest||'—');
+  rows[i].insertAdjacentHTML('afterend','<tr class="hr-detail"><td colspan="8">'+esc(det)+'</td></tr>');
+}
+
+function renderSystem(s,cs){
+  // 行情服务
+  const lat=(s.code_stats&&s.code_stats.latency_ms!=null)?s.code_stats.latency_ms:null;
+  $('hcSvcDot').style.background=s.data_latest?'var(--ok)':'var(--err)';
+  $('hcSvc').textContent=s.data_latest?'正常':'不可用';
+  $('hcSvcSub').textContent='响应 '+(lat!=null?lat+' ms':'—')+' · 数据至 '+(s.data_latest?String(s.data_latest).slice(4,6)+'-'+String(s.data_latest).slice(6,8):'—');
+  // Docker
+  const dkrOK=cs.ok&&cs.status==='running';
+  $('hcDkrDot').style.background=dkrOK?'var(--ok)':(cs.ok?'var(--warn)':'var(--err)');
+  $('hcDkr').textContent=dkrOK?'已连接':(cs.ok?cs.status:'不可用');
+  $('hcDkrSub').textContent=cs.ok?('容器 '+cs.status):'未检测到 docker.sock';
+  // 自动任务
+  const sch=s.schedule||{};
+  $('hcSchedDot').style.background=s.scheduler_alive?'var(--ok)':'var(--err)';
+  $('hcSched').textContent=s.scheduler_alive?'运行中':'未运行';
+  $('hcSchedSub').textContent=(sch.enabled?(sch.next_trigger?'下次 '+sch.next_trigger:'已启用'):'定时未启用')||'—';
+  // 总状态
+  const allOK=!!s.data_latest&&dkrOK&&s.scheduler_alive;
+  $('sysOK').innerHTML='<span class="dot '+(allOK?'ok':'warn')+'"></span> '+(allOK?'系统运行正常':'存在待处理项');
+  // Docker 警告卡
+  $('dkrWarn').style.display=cs.ok?'none':'block';
+  // 存储
+  if(s.disk&&s.disk.total_gb!=null){
+    const pct=Math.round(s.disk.used_gb/s.disk.total_gb*100);
+    $('cDisk').textContent=s.disk.used_gb+' GB / '+s.disk.total_gb+' GB · '+pct+'%'+(s.disk.free_gb!=null?'（'+s.disk.free_gb+' GB 可用）':'');
+    const bar=$('diskBar');bar.style.width=pct+'%';bar.className=pct>80?'high':'';
+  }
+  // 运行信息
+  $('cImage').textContent=cs.image||'—';
+  $('cState').textContent=cs.status||'—';
+  $('cUptime').textContent=cs.started?fmtUptime(cs.started):'—';
+  $('cSource').textContent=s.source||'—';
+}
+
 async function loadWatchlist(){
   try{
     const w=await j('/api/watchlist');
-    const idx=w.indices||[], wl=w.quotes||[];
-    const irow=document.getElementById('idxRow');
-    if(idx.length) irow.innerHTML=idx.map(x=>'<div><div class="k">'+esc(x.name)+'</div><div class="v" style="'+pctCls(x.pct_chg)+'">'+fmtPrice(x.close)+' <span style="font-size:12px">'+fmtPct(x.pct_chg)+'</span></div></div>').join('');
+    const idx=w.indices||[],wl=w.quotes||[];
+    const irow=$('idxRow');
+    if(idx.length)irow.innerHTML=idx.map(x=>'<div><div class="k">'+esc(x.name)+'</div><div class="v" style="'+pctCls(x.pct_chg)+'">'+fmtPrice(x.close)+' <span style="font-size:12px">'+fmtPct(x.pct_chg)+'</span></div></div>').join('');
     else irow.innerHTML='<span class="hint">（指数数据未取到）</span>';
-    const wrow=document.getElementById('wlRow');
-    if(wl.length) wrow.innerHTML=wl.map(x=>'<div style="cursor:pointer" onclick="showKline(\''+x.code+'\')"><div class="k">'+esc(x.name)+' '+esc(x.code)+'</div><div class="v" style="'+pctCls(x.pct_chg)+'">'+fmtPrice(x.close)+' <span style="font-size:12px">'+fmtPct(x.pct_chg)+'</span></div></div>').join('');
+    const wrow=$('wlRow');
+    if(wl.length)wrow.innerHTML=wl.map(x=>'<div style="cursor:pointer" onclick="showKline(\''+x.code+'\')"><div class="k">'+esc(x.name)+' '+esc(x.code)+'</div><div class="v" style="'+pctCls(x.pct_chg)+'">'+fmtPrice(x.close)+' <span style="font-size:12px">'+fmtPct(x.pct_chg)+'</span></div></div>').join('');
     else wrow.innerHTML='<span class="hint">（空，下方添加自选）</span>';
   }catch(e){}
 }
 async function addWatch(){
-  const codes=document.getElementById('wlAdd').value.trim();
-  if(!codes){return}
+  const codes=$('wlAdd').value.trim();if(!codes)return;
   try{
     const cur=await j('/api/watchlist');
     const merged=[...new Set((cur.codes||[]).concat(codes.split(/[,，\s]+/)))];
     const r=await j('/api/watchlist?action=set&codes='+encodeURIComponent(merged.join(',')));
-    document.getElementById('wlMsg').textContent='已保存 '+r.codes.length+' 只';
-    document.getElementById('wlAdd').value='';
+    $('wlMsg').textContent='已保存 '+r.codes.length+' 只';
+    $('wlAdd').value='';
     loadWatchlist();
-  }catch(e){document.getElementById('wlMsg').textContent='保存失败: '+e;}
-}
-async function loadHistory(){
-  try{
-    const h=await j('/api/history');
-    const hist=h.history||[];
-    const tb=document.getElementById('histBody');
-    const st=document.getElementById('histStats');
-    if(st){
-      if(hist.length){
-        const recent=hist.slice(0,7);
-        const ok=recent.filter(x=>x.exit_code===0).length;
-        const durs=recent.filter(x=>x.duration_sec!=null).map(x=>x.duration_sec);
-        const avg=durs.length?Math.round(durs.reduce((a,b)=>a+b,0)/durs.length):null;
-        const lastOk=hist.find(x=>x.exit_code===0);
-        st.textContent='近 7 次：成功 '+ok+' / '+recent.length+'，平均耗时 '+(avg==null?'—':avg+'s')
-          +(lastOk?'，最近成功 '+lastOk.ts:'')+(hist.length>7?'；更早记录请往下滚动日志/历史': '');
-      }else st.textContent='';
-    }
-    // 数据库状态卡「上次同步」摘要（取最新一条历史）
-    const cLastSync=document.getElementById('cLastSync');
-    if(cLastSync){
-      cLastSync.textContent=hist.length
-        ?(hist[0].ts.slice(5,16)+(hist[0].exit_code===0?' ✅':hist[0].exit_code==null?' ⏳':' ❌ '+hist[0].exit_code))
-        :'（暂无）';
-    }
-    if(!hist.length){tb.innerHTML='<tr><td colspan="8" class="hint">（暂无历史）</td></tr>';return;}
-    tb.innerHTML=hist.map(x=>`<tr>
-      <td>${esc(x.ts)}</td>
-      <td>${x.trigger==='scheduled'?'⏰定时':x.trigger==='scheduled-retry'?'↻定时·重试':'手动'}</td>
-      <td>${x.mode==='hot'?'热更新':'严格'}</td>
-      <td>${x.exit_code===0?'✅':'❌ '+esc(x.exit_code)}</td>
-      <td>${x.downloads==null?'—':x.downloads}</td>
-      <td>${x.verified==='pass'?'<span class="badge b-ok">通过</span>':x.verified==='fail'?'<span class="badge b-fail">失败</span>':x.verified==='skipped'?'<span class="badge b-skip">跳过</span>':'—'}</td>
-      <td>${x.duration_sec==null?'—':esc(x.duration_sec)+'s'}</td>
-      <td>${esc(x.data_latest||'—')}</td></tr>`).join('');
-  }catch(e){}
-}
-async function doSync(){
-  const hot=document.getElementById('hotMode').checked;
-  const opt={method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({hot:hot})};
-  try{const r=await j('/api/sync',opt);document.getElementById('syncMsg').textContent=r.msg;}
-  catch(e){document.getElementById('syncMsg').textContent='启动失败: '+e;}
+  }catch(e){$('wlMsg').textContent='保存失败: '+e}
 }
 async function doQuery(){
-  const q=document.getElementById('qtype').value;
+  const q=$('qtype').value;
   const r=await fetch('/api/query?t='+encodeURIComponent(q));
-  const d=await r.text();
-  document.getElementById('qres').textContent=d;
+  $('qres').textContent=await r.text();
 }
 let kchart=null;
-function showKline(code){document.getElementById('kcode').value=code;loadKline();}
+function showKline(code){$('kcode').value=code;loadKline()}
 function ma(data,n){return data.map((v,i)=>i<n-1?null:+((data.slice(i-n+1,i+1).reduce((a,b)=>a+b,0)/n).toFixed(3)))}
 async function loadKline(){
-  const code=document.getElementById('kcode').value.trim();
-  const freq=document.getElementById('kfreq').value;
-  const adj=document.getElementById('kadj').value;
-  const months=document.getElementById('kmonths').value;
+  const code=$('kcode').value.trim(),freq=$('kfreq').value,adj=$('kadj').value,months=$('kmonths').value;
   try{
     const d=await j('/api/klines?code='+code+'&freq='+freq+'&months='+months+'&adj='+adj);
     const rows=d.rows||[];
-    if(!rows.length){document.getElementById('qres').textContent='（该区间无K线数据）';return;}
-    const dates=rows.map(r=>String(r.date));
-    const closes=rows.map(r=>+r.close);
+    if(!rows.length){$('qres').textContent='（该区间无K线数据）';return}
+    const dates=rows.map(r=>String(r.date)),closes=rows.map(r=>+r.close);
     const kd=rows.map(r=>[+r.open,+r.close,+r.low,+r.high]);
-    const showMA=document.getElementById('kma').checked;
+    const showMA=$('kma').checked;
     const series=[
       {name:'K线',type:'candlestick',data:kd,
-       itemStyle:{color:'#f87171',color0:'#4ade80',borderColor:'#f87171',borderColor0:'#4ade80'}},
+       itemStyle:{color:'#F87171',color0:'#4ADE80',borderColor:'#F87171',borderColor0:'#4ADE80'}},
       {name:'成交量',type:'bar',xAxisIndex:1,yAxisIndex:1,
-       data:rows.map(r=>r.volume||0),itemStyle:{color:'#38bdf8'}}
+       data:rows.map(r=>r.volume||0),itemStyle:{color:'#38BDF8'}}
     ];
     if(showMA&&freq==='day'){
-      series.push({name:'MA5',type:'line',data:ma(closes,5),smooth:true,showSymbol:false,lineStyle:{width:1,color:'#fbbf24'}});
-      series.push({name:'MA20',type:'line',data:ma(closes,20),smooth:true,showSymbol:false,lineStyle:{width:1,color:'#a78bfa'}});
+      series.push({name:'MA5',type:'line',data:ma(closes,5),smooth:true,showSymbol:false,lineStyle:{width:1,color:'#FBBF24'}});
+      series.push({name:'MA20',type:'line',data:ma(closes,20),smooth:true,showSymbol:false,lineStyle:{width:1,color:'#A78BFA'}});
     }
-    if(!kchart)kchart=echarts.init(document.getElementById('kchart'),'dark');
+    if(!kchart)kchart=echarts.init($('kchart'),'dark');
     kchart.setOption({
       backgroundColor:'transparent',
-      title:{text:code+' '+(freq==='day'?'日K':'分钟K')+(adj!=='none'?(adj==='qfq'?' 前复权':' 后复权'):''),left:8,top:4,textStyle:{fontSize:13,color:'#94a3b8'}},
+      title:{text:code+' '+(freq==='day'?'日K':'分钟K')+(adj!=='none'?(adj==='qfq'?' 前复权':' 后复权'):''),left:8,top:4,textStyle:{fontSize:13,color:'#8FA2BC'}},
       tooltip:{trigger:'axis',axisPointer:{type:'cross'}},
-      legend:{right:8,top:4,textStyle:{color:'#94a3b8',fontSize:11}},
+      legend:{right:8,top:4,textStyle:{color:'#8FA2BC',fontSize:11}},
       grid:[{left:60,right:16,top:34,height:'62%'},{left:60,right:16,top:'72%',height:'18%'}],
-      xAxis:[{type:'category',data:dates,axisLine:{lineStyle:{color:'#334155'}}},
-             {type:'category',gridIndex:1,data:dates,axisLabel:{show:false},axisLine:{lineStyle:{color:'#334155'}}}],
-      yAxis:[{scale:true,splitLine:{lineStyle:{color:'#1e293b'}}},
+      xAxis:[{type:'category',data:dates,axisLine:{lineStyle:{color:'#1E2C45'}}},
+             {type:'category',gridIndex:1,data:dates,axisLabel:{show:false},axisLine:{lineStyle:{color:'#1E2C45'}}}],
+      yAxis:[{scale:true,splitLine:{lineStyle:{color:'#162238'}}},
              {gridIndex:1,splitNumber:2,axisLabel:{show:false},splitLine:{show:false}}],
       dataZoom:[{type:'inside',xAxisIndex:[0,1],start:40,end:100}],
       series
     });
-  }catch(e){document.getElementById('qres').textContent='K线加载失败: '+e;}
+  }catch(e){$('qres').textContent='K线加载失败: '+e}
 }
-// 系统页：容器运行时长 / 重启 / 日志
-const PHASE_LABEL={idle:'空闲',stopping:'停服中',syncing:'同步中',verifying:'验证中',restarting:'重启中',done:'完成'};
 function fmtUptime(iso){
   try{
     const s=new Date(iso),t=Date.now();
     if(isNaN(s))return iso;
     let sec=Math.floor((t-s.getTime())/1000);if(sec<0)sec=0;
     const d=Math.floor(sec/86400),h=Math.floor(sec%86400/3600),m=Math.floor(sec%3600/60);
-    return (d>0?d+'天 ':'')+(h>0?h+'小时 ':'')+m+'分钟';
+    return (d>0?d+' 天 ':'')+(h>0?h+' 小时 ':'')+m+' 分钟';
   }catch(e){return iso}
 }
 async function restartContainer(){
-  if(!confirm('确定重启 stockdb 容器？重启期间行情服务会短暂中断。')){
-    document.getElementById('containerMsg').textContent='已取消';
-    return;
-  }
-  const m=document.getElementById('containerMsg');
-  try{const r=await j('/api/container/restart',{method:'POST'});m.textContent=r.msg||'已执行';}
-  catch(e){m.textContent='重启失败: '+e;}
+  if(!confirm('确定重启 stockdb 容器？重启期间行情服务会短暂中断。')){$('containerMsg').textContent='已取消';return}
+  try{const r=await j('/api/container/restart',{method:'POST'});$('containerMsg').textContent=r.msg||'已执行';toast(r.msg||'已执行')}
+  catch(e){$('containerMsg').textContent='重启失败: '+e}
 }
 async function toggleContainerLogs(){
-  const pre=document.getElementById('containerLog');
-  if(pre.style.display!=='none'){pre.style.display='none';return;}
+  const pre=$('containerLog');
+  if(pre.style.display!=='none'){pre.style.display='none';return}
   pre.style.display='block';pre.textContent='（加载中…）';
-  const m=document.getElementById('containerMsg');
   try{
     const r=await j('/api/container/logs?tail=150');
     pre.textContent=r.log||'（容器无日志输出）';
     if(r.error)pre.textContent+='\n\n'+r.error;
-    m.textContent='';
-  }catch(e){pre.textContent='读取失败: '+e;}
+    $('containerMsg').textContent='';
+  }catch(e){pre.textContent='读取失败: '+e}
 }
+setInterval(()=>{if($('syncProgress')&&$('syncProgress').style.display==='block'&&window._syncStarted){$('progElapsed').textContent='已运行 '+fmtDur(Date.now()/1000-window._syncStarted)}},1000);
 refresh();setInterval(refresh,4000);
 </script></body></html>"""
 
@@ -1475,9 +1684,10 @@ class Handler(BaseHTTPRequestHandler):
             "source": src,
             "sync_running": _sync_state["running"],
             "sync_phase": _sync_state.get("phase", "idle"),
+            "sync_started": _sync_state.get("last_start"),
             "exit_code": _sync_state["exit_code"],
             "data_latest": data_latest_date(),
-            "code_stats": code_stats(),          # {stock, etf, other}
+            "code_stats": code_stats(),          # {stock, etf, other, latency_ms}
             "coverage": data_coverage(),         # {earliest, latest} 或 null
             "schedule": load_schedule(),
             "disk": disk_usage(),
