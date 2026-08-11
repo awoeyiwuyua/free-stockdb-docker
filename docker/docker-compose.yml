@@ -63,7 +63,7 @@ services:
   # webui 管理台：行情查询 + 一键同步（挂载 docker socket 以操控 stockdb 容器）
   # 极空间无终端时，日常更新数据 = 浏览器打开 http://<NAS_IP>:18080 点「开始同步」
   webui:
-    image: ghcr.io/awoeyiwuyua/free-stockdb-webui:0.1.0
+    image: ghcr.io/awoeyiwuyua/free-stockdb-webui:0.2.0
     container_name: stockdb-webui
     restart: unless-stopped
     ports:

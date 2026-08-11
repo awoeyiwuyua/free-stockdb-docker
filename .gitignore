@@ -8,3 +8,5 @@ __pycache__/
 *.pyc
 .zcode/
 docker/webui/.dev-data/
+
+.DS_Store
