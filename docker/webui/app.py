@@ -24,7 +24,7 @@ import subprocess
 import sys
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs, unquote
@@ -78,7 +78,12 @@ def load_schedule() -> dict:
         return {"enabled": False, "time": "15:30"}
     try:
         data = json.loads(SCHEDULE_FILE.read_text(encoding="utf-8"))
-        return {"enabled": bool(data.get("enabled")), "time": str(data.get("time") or "15:30")}
+        return {
+            "enabled": bool(data.get("enabled")),
+            "time": str(data.get("time") or "15:30"),
+            "last_run": str(data.get("last_run") or ""),
+            "last_exit": data.get("last_exit"),
+        }
     except Exception:
         return {"enabled": False, "time": "15:30"}
 
@@ -86,10 +91,33 @@ def load_schedule() -> dict:
 def save_schedule(enabled: bool, time_str: str) -> dict:
     cfg = {"enabled": bool(enabled), "time": str(time_str)}
     try:
+        # 保留已有执行元信息（last_run/last_exit），不因保存配置而清空
+        if SCHEDULE_FILE.exists():
+            try:
+                old = json.loads(SCHEDULE_FILE.read_text(encoding="utf-8"))
+                if isinstance(old, dict):
+                    for k in ("last_run", "last_exit"):
+                        if k in old:
+                            cfg[k] = old[k]
+            except Exception:
+                pass
         SCHEDULE_FILE.write_text(json.dumps(cfg, ensure_ascii=False, indent=1), encoding="utf-8")
     except Exception as exc:
         raise RuntimeError(f"定时配置写入失败: {exc}")
     return cfg
+
+
+def save_schedule_meta(**kwargs) -> None:
+    """记录最近一次定时触发的执行结果（last_run/last_exit），落盘可回看。"""
+    try:
+        if SCHEDULE_FILE.exists():
+            data = json.loads(SCHEDULE_FILE.read_text(encoding="utf-8"))
+        else:
+            data = {}
+        data.update(kwargs)
+        SCHEDULE_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+    except Exception:
+        pass
 
 
 def parse_sync_counts(stdout: str) -> dict:
@@ -110,20 +138,24 @@ def parse_sync_counts(stdout: str) -> dict:
 
 
 def data_latest_date() -> str | None:
-    """数据最新交易日：查上证指数日K前缀，取最大日期。"""
+    """数据最新交易日：查上证指数日K，取最大日期（近3月前缀，跨年安全）。"""
     import urllib.request, urllib.parse
-    try:
-        url = f"http://{STOCKDB_HOST}:{STOCKDB_PORT}/?cmd=vals&t={urllib.parse.quote('日k:000001:2026*')}"
-        with urllib.request.urlopen(url, timeout=10) as resp:
-            raw = resp.read().decode("utf-8", "replace")
-        rows = json.loads(raw)
-        dates = []
-        for row in rows if isinstance(rows, list) else []:
-            if isinstance(row, dict) and row.get("date"):
-                dates.append(str(row["date"]))
-        return max(dates) if dates else None
-    except Exception:
-        return None
+    from datetime import datetime as dt, timedelta
+    today = dt.now()
+    start = (today - timedelta(days=95)).strftime("%Y%m%d")
+    end = today.strftime("%Y%m%d")
+    dates = []
+    for prefix in _month_prefixes(start, end):
+        try:
+            url = f"http://{STOCKDB_HOST}:{STOCKDB_PORT}/?cmd=vals&t={urllib.parse.quote(f'日k:000001:{prefix}*')}"
+            with urllib.request.urlopen(url, timeout=10) as resp:
+                rows = json.loads(resp.read().decode("utf-8", "replace"))
+            for row in rows if isinstance(rows, list) else []:
+                if isinstance(row, dict) and row.get("date"):
+                    dates.append(str(row["date"]))
+        except Exception:
+            continue
+    return max(dates) if dates else None
 
 
 def load_watchlist() -> list[str]:
@@ -146,8 +178,25 @@ def save_watchlist(codes: list[str]) -> list[str]:
     return cleaned
 
 
+def _workday_lag(today, latest_dt) -> int:
+    """latest 距 today 之间的工作日数（跳过周六日）。法定节假日按近似处理。"""
+    lag = 0
+    d = latest_dt + timedelta(days=1)
+    while d <= today:
+        if d.weekday() < 5:
+            lag += 1
+        d += timedelta(days=1)
+    return lag
+
+
 def health_status() -> dict:
-    """数据健康度：最新日期、落后交易日天数（周末自动跳过）、状态。"""
+    """数据健康度：用工作日计数判定落后（跨周末不误报），盘前宽容。
+
+    状态：
+      ok    —— 数据已到最近交易日（周六/周日查周五数据=ok；交易日盘中查昨日数据=ok）
+      warn  —— 落后 1 个交易日
+      stale —— 落后 2 个及以上交易日，建议同步
+    """
     latest = data_latest_date()
     if not latest:
         return {"latest": None, "lag_days": None, "status": "unknown", "note": "无法获取数据最新日期"}
@@ -155,21 +204,19 @@ def health_status() -> dict:
         from datetime import datetime as dt
         latest_dt = dt.strptime(latest, "%Y%m%d").date()
         today = dt.now().date()
-        # 计算"最近一个交易日之前"的落后天数：跳过周末（法定节假日简化处理）
-        ref = today
-        while ref.weekday() >= 5:  # 周六5/周日6
-            ref -= datetime.timedelta(days=1)
-        lag = (ref - latest_dt).days
-        if lag <= 0:
-            status = "ok"
-            note = f"数据最新 {latest_dt}（交易日，正常）"
-        elif lag <= 2:
-            status = "warn"
-            note = f"数据落后 {lag} 个交易日（{latest_dt}）"
-        else:
-            status = "stale"
-            note = f"数据落后 {lag} 个交易日（{latest_dt}），建议立即同步"
-        return {"latest": latest, "lag_days": lag, "status": status, "note": note}
+        lag = _workday_lag(today, latest_dt)
+        if lag == 0:
+            return {"latest": latest, "lag_days": 0, "status": "ok",
+                    "note": f"数据最新 {latest}（已是最新交易日）"}
+        if lag == 1:
+            # 交易日盘中/盘前：今日数据要等收盘后同步，属正常
+            if today.weekday() < 5 and dt.now().hour < 16:
+                return {"latest": latest, "lag_days": 0, "status": "ok",
+                        "note": f"数据至 {latest}（今日待收盘后同步）"}
+            return {"latest": latest, "lag_days": 1, "status": "warn",
+                    "note": f"数据落后 1 个交易日（{latest}）"}
+        return {"latest": latest, "lag_days": lag, "status": "stale",
+                "note": f"数据落后 {lag} 个交易日（{latest}），建议立即同步"}
     except Exception as exc:
         return {"latest": latest, "lag_days": None, "status": "unknown", "note": f"健康度计算失败: {exc}"}
 
@@ -275,7 +322,7 @@ def _verify_data() -> list[str]:
     return problems
 
 
-def run_sync(hot: bool = True) -> None:
+def run_sync(hot: bool = True, trigger: str = "manual") -> None:
     """同步数据。串行执行，防并发点击。
 
     hot=True（默认，热更新）：不停服务直接增量同步——同步器下载到 .part 临时文件、
@@ -284,15 +331,19 @@ def run_sync(hot: bool = True) -> None:
     同步后自动做完整性验证，失败则重启 stockdb 止损。
 
     hot=False（严格模式）：按官方要求先停服务 → 同步 → 重启，作为兜底。
+
+    trigger=manual|scheduled：记录触发来源（手动按钮 / 定时线程），
+    写入同步历史，便于回看"某次同步是不是定时自动跑的"。
     """
     if not _sync_lock.acquire(blocking=False):
         return  # 已在同步中
-    _sync_state.update(running=True, exit_code=None, last_start=time.time(), last_end=None)
+    _sync_state.update(running=True, exit_code=None, last_start=time.time(), last_end=None,
+                       trigger=trigger)
     global _last_sync_stdout, _last_verify_result
     _last_sync_stdout = ""
     _last_verify_result = None
     try:
-        log(f"=== 同步开始 {now()}（{'热更新' if hot else '严格模式(停服)'}）===")
+        log(f"=== 同步开始 {now()}（{'热更新' if hot else '严格模式(停服)'}｜{'定时' if trigger == 'scheduled' else '手动'}）===")
 
         # 1.（严格模式）停 stockdb；热更新模式不停
         if not hot:
@@ -385,11 +436,12 @@ def run_sync(hot: bool = True) -> None:
         log(f"❌ 同步异常：{exc}")
         _sync_state["exit_code"] = -1
     finally:
-        # 记录同步历史（时间/模式/结果/耗时/下载删除数/数据最新日期）
+        # 记录同步历史（时间/触发来源/模式/结果/耗时/下载删除数/数据最新日期）
         try:
             counts = parse_sync_counts(_last_sync_stdout)
             append_history({
                 "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "trigger": _sync_state.get("trigger", "manual"),
                 "mode": "hot" if hot else "strict",
                 "exit_code": _sync_state.get("exit_code"),
                 "downloads": counts.get("downloads"),
@@ -399,6 +451,9 @@ def run_sync(hot: bool = True) -> None:
                 if _sync_state.get("last_start") else None,
                 "data_latest": data_latest_date(),
             })
+            if _sync_state.get("trigger") == "scheduled":
+                save_schedule_meta(last_run=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                   last_exit=_sync_state.get("exit_code"))
         except Exception:
             pass
         _sync_state["running"] = False
@@ -425,7 +480,7 @@ def tail_log(n: int = 200) -> str:
 
 # ==================== 定时自动同步 ====================
 def scheduler_loop() -> None:
-    """后台定时线程：每 30s 检查一次定时配置，到点触发热更新同步。"""
+    """后台定时线程：每 30s 检查一次定时配置，到点触发热更新同步（记录触发日志）。"""
     last_fired = ""
     while True:
         try:
@@ -434,8 +489,9 @@ def scheduler_loop() -> None:
                 now_str = datetime.now().strftime("%H:%M")
                 if now_str == cfg["time"] and now_str != last_fired:
                     last_fired = now_str
-                    log(f"⏰ 定时同步触发（{cfg['time']}）")
-                    threading.Thread(target=run_sync, kwargs={"hot": True}, daemon=True).start()
+                    log(f"⏰ 定时同步触发（{cfg['time']}）——stockdb 保持运行，热更新")
+                    threading.Thread(target=run_sync, kwargs={"hot": True, "trigger": "scheduled"},
+                                     daemon=True).start()
                 elif now_str != cfg["time"]:
                     last_fired = ""
         except Exception as exc:
@@ -615,92 +671,105 @@ th{color:var(--muted);font-weight:600}
 .badge{padding:2px 8px;border-radius:10px;font-size:12px}
 .b-ok{background:#14532d;color:#86efac}.b-fail{background:#7f1d1d;color:#fca5a5}
 .b-skip{background:#44403c;color:#d6d3d1}
+.tabs{display:flex;gap:2px;border-bottom:1px solid var(--line);margin-bottom:16px}
+.tab-btn{background:transparent;border:0;border-bottom:2px solid transparent;color:var(--muted);
+font-size:15px;padding:8px 18px;cursor:pointer}
+.tab-btn.active{color:var(--brand);border-bottom-color:var(--brand);font-weight:700}
+.tab-panel{display:none}.tab-panel.active{display:block}
+.metrics{display:flex;gap:20px;flex-wrap:wrap}
+.metrics .m{flex:1;min-width:110px}
+.metrics .lbl{color:var(--muted);font-size:12px;margin-bottom:2px}
+.metrics .val{font-size:17px;font-weight:600}
 </style></head><body><div class="wrap">
 <h1><span id="statusDot" class="dot"></span> stockdb 管理台</h1>
 
-<div class="card"><div class="row">
-  <div><div class="k">stockdb 容器</div><div class="v" id="cState">…</div></div>
-  <div><div class="k">数据源</div><div class="v" id="cSource">…</div></div>
-  <div><div class="k">数据健康度</div><div class="v" id="cLatest" style="font-size:14px">…</div></div>
-  <div><div class="k">最近同步</div><div class="v" id="cSync">…</div></div>
-  <div><div class="k">同步退出码</div><div class="v" id="cCode">…</div></div>
-</div></div>
-
-<div class="card"><div class="k">大盘指数快照</div>
-  <div class="row" id="idxRow" style="margin-top:8px"><span class="hint">加载中…</span></div>
+<div class="tabs">
+  <button class="tab-btn active" data-tab="overview" onclick="showTab('overview',this)">概览</button>
+  <button class="tab-btn" data-tab="market" onclick="showTab('market',this)">行情</button>
+  <button class="tab-btn" data-tab="sync" onclick="showTab('sync',this)">同步</button>
+  <button class="tab-btn" data-tab="system" onclick="showTab('system',this)">系统</button>
 </div>
 
-<div class="card"><div class="k">自选股（点代码看K线）<span class="hint" style="margin-left:8px">保存到 /data/watchlist.json</span></div>
-  <div class="row" id="wlRow" style="margin-top:8px;align-items:center;gap:8px"><span class="hint">（空）</span></div>
-  <div style="margin-top:8px;display:flex;gap:8px">
-    <input type="text" id="wlAdd" placeholder="如 600633,000967,002600" style="width:300px">
+<!-- 概览：健康度 + 大盘 + 自选股 -->
+<div id="tab-overview" class="tab-panel active">
+  <div class="card"><div class="metrics">
+    <div class="m"><div class="lbl">数据健康度</div><div class="val" id="cLatest" style="font-size:14px">…</div></div>
+    <div class="m"><div class="lbl">大盘</div><div class="row" id="idxRow" style="gap:14px"><span class="hint">…</span></div></div>
+    <div class="m"><div class="lbl">自选股（点代码看K线）</div><div class="row" id="wlRow" style="gap:14px"><span class="hint">…</span></div></div>
+  </div>
+  <div style="margin-top:10px;display:flex;gap:8px">
+    <input type="text" id="wlAdd" placeholder="加自选，如 600633,000967" style="width:280px">
     <button onclick="addWatch()" style="background:#334155;color:#e2e8f0">加入自选</button>
     <span id="wlMsg" class="hint"></span>
   </div>
+  <div class="actions" style="margin-top:12px">
+    <button id="syncBtn" onclick="showTab('sync',document.querySelector('[data-tab=sync]'))">→ 到「同步」页</button>
+  </div></div>
 </div>
 
-<div class="card">
-  <div class="actions">
-    <button id="syncBtn" onclick="doSync()">开始同步</button>
-    <label class="hint" style="display:flex;align-items:center;gap:6px">
-      <input type="checkbox" id="hotMode" checked> 热更新（不停服务，默认）
-    </label>
-    <span id="syncMsg" class="hint">热更新=服务保持运行直接增量同步；严格模式=停服后同步</span>
+<!-- 行情：K线图 + 原始查询 -->
+<div id="tab-market" class="tab-panel">
+  <div class="card"><div class="k">K 线图</div>
+    <div style="display:flex;gap:8px;margin:8px 0;flex-wrap:wrap;align-items:center">
+      <input type="text" id="kcode" value="600633" placeholder="股票代码" style="width:120px">
+      <select id="kfreq"><option value="day">日K</option><option value="minute">分钟K</option></select>
+      <select id="kadj"><option value="none">不复权</option><option value="qfq">前复权</option><option value="hfq">后复权</option></select>
+      <select id="kmonths"><option value="1">近1月</option><option value="3" selected>近3月</option><option value="6">近6月</option><option value="12">近1年</option></select>
+      <button onclick="loadKline()">加载</button>
+      <label class="hint"><input type="checkbox" id="kma" checked> MA5/20</label>
+    </div>
+    <div id="kchart"></div>
   </div>
-  <div class="hint" style="margin-top:8px">同步令牌：<input type="password" id="token" placeholder="留空=未启用保护"></div>
-</div>
-
-<div class="card"><div class="k">定时自动同步</div>
-  <div class="actions" style="margin-top:8px">
-    <label class="hint"><input type="checkbox" id="schEnabled"> 启用每日定时（热更新）</label>
-    <input type="time" id="schTime" value="15:30">
-    <button onclick="saveSchedule()" style="background:#334155;color:#e2e8f0">保存定时</button>
-    <span id="schMsg" class="hint"></span>
+  <div class="card"><div class="k">行情原始查询（代理 stockdb HTTP API）</div>
+    <div style="display:flex;gap:8px;margin:8px 0">
+      <select id="qtype">
+        <option value="股票代码">股票代码</option>
+        <option value="日k:600633:20260810">日K 示例</option>
+        <option value="分钟k:600633:20260810140000">分钟K 示例</option>
+        <option value="复权:600633:2026*">复权 示例</option>
+      </select>
+      <button onclick="doQuery()" style="background:#334155;color:#e2e8f0">查询</button>
+    </div>
+    <pre id="qres">（查询结果）</pre>
   </div>
-  <div class="hint" style="margin-top:6px">到点自动执行「停服/热更新 → 同步 → 启服」，无需手动操作</div>
 </div>
 
-<div class="card"><div class="k">同步历史（最近 30 次）</div>
-  <table><thead><tr><th>时间</th><th>模式</th><th>结果</th><th>下载</th><th>删除</th><th>验证</th><th>耗时</th><th>数据最新</th></tr></thead>
-  <tbody id="histBody"><tr><td colspan="8" class="hint">（暂无历史）</td></tr></tbody></table>
-</div>
-
-<div class="card"><div class="k">同步日志（自动刷新）</div>
-<pre id="log">（暂无）</pre></div>
-
-<div class="card"><div class="k">K 线图（ECharts）</div>
-  <div style="display:flex;gap:8px;margin:8px 0;flex-wrap:wrap;align-items:center">
-    <input type="text" id="kcode" value="600633" placeholder="股票代码" style="width:120px">
-    <select id="kfreq">
-      <option value="day">日K</option>
-      <option value="minute">分钟K（整点样本）</option>
-    </select>
-    <select id="kadj">
-      <option value="none">不复权</option>
-      <option value="qfq">前复权</option>
-      <option value="hfq">后复权</option>
-    </select>
-    <select id="kmonths">
-      <option value="1">近1月</option><option value="3" selected>近3月</option>
-      <option value="6">近6月</option><option value="12">近1年</option>
-    </select>
-    <button onclick="loadKline()">加载K线</button>
-    <label class="hint"><input type="checkbox" id="kma" checked> 均线MA5/20</label>
+<!-- 同步：按钮 + 定时 + 历史 + 日志 -->
+<div id="tab-sync" class="tab-panel">
+  <div class="card">
+    <div class="actions">
+      <button id="syncBtn2" onclick="doSync()">开始同步</button>
+      <label class="hint" style="display:flex;align-items:center;gap:6px">
+        <input type="checkbox" id="hotMode" checked> 热更新（不停服务，默认）
+      </label>
+      <span id="syncMsg" class="hint">热更新=服务保持运行直接增量同步；严格模式=停服后同步</span>
+    </div>
+    <div class="hint" style="margin-top:8px">同步令牌：<input type="password" id="token" placeholder="留空=未启用保护"></div>
   </div>
-  <div id="kchart"></div>
+  <div class="card"><div class="k">定时自动同步</div>
+    <div class="actions" style="margin-top:8px">
+      <label class="hint"><input type="checkbox" id="schEnabled"> 启用每日定时（热更新）</label>
+      <input type="time" id="schTime" value="15:30">
+      <button onclick="saveSchedule()" style="background:#334155;color:#e2e8f0">保存</button>
+      <span id="schMsg" class="hint"></span>
+    </div>
+    <div class="hint" style="margin-top:6px" id="schLast"></div>
+  </div>
+  <div class="card"><div class="k">同步历史（最近 30 次）</div>
+    <table><thead><tr><th>时间</th><th>触发</th><th>模式</th><th>结果</th><th>下载</th><th>验证</th><th>耗时</th><th>数据最新</th></tr></thead>
+    <tbody id="histBody"><tr><td colspan="8" class="hint">（暂无历史）</td></tr></tbody></table>
+  </div>
+  <div class="card"><div class="k">同步日志（自动刷新）</div><pre id="log">（暂无）</pre></div>
 </div>
 
-<div class="card"><div class="k">行情原始查询（代理 stockdb HTTP API）</div>
-  <div style="display:flex;gap:8px;margin:8px 0">
-    <select id="qtype">
-      <option value="股票代码">股票代码</option>
-      <option value="日k:600633:20260810">日K 示例</option>
-      <option value="分钟k:600633:20260810140000">分钟K 示例</option>
-      <option value="复权:600633:2026*">复权 示例</option>
-    </select>
-    <button onclick="doQuery()" style="background:#334155;color:#e2e8f0">查询</button>
-  </div>
-  <pre id="qres">（查询结果）</pre>
+<!-- 系统：容器/数据源/健康度详情 -->
+<div id="tab-system" class="tab-panel">
+  <div class="card"><div class="metrics">
+    <div class="m"><div class="lbl">stockdb 容器</div><div class="val" id="cState">…</div></div>
+    <div class="m"><div class="lbl">数据源</div><div class="val" id="cSource" style="font-size:13px">…</div></div>
+    <div class="m"><div class="lbl">最近同步</div><div class="val" id="cSync">…</div></div>
+    <div class="m"><div class="lbl">同步退出码</div><div class="val" id="cCode">…</div></div>
+  </div></div>
 </div>
 </div>
 <script src="/static/echarts.min.js"></script>
@@ -710,6 +779,13 @@ function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','
 function pctCls(v){return v>0?'color:#f87171':v<0?'color:#4ade80':'color:#94a3b8'}
 function fmtPct(v){return v==null?'—':(v>0?'+':'')+Number(v).toFixed(2)+'%'}
 function fmtPrice(v){return v==null?'—':Number(v).toFixed(2)}
+function showTab(name,btn){
+  document.querySelectorAll('.tab-btn').forEach(b=>b.classList.remove('active'));
+  document.querySelectorAll('.tab-panel').forEach(p=>p.classList.remove('active'));
+  (btn||document.querySelector('[data-tab="'+name+'"]')).classList.add('active');
+  document.getElementById('tab-'+name).classList.add('active');
+  if(name==='market'&&kchart)kchart.resize();
+}
 async function refresh(){
   try{
     const s=await j('/api/status');
@@ -720,9 +796,14 @@ async function refresh(){
     document.getElementById('cCode').textContent=s.exit_code==null?'—':String(s.exit_code);
     const d=document.getElementById('statusDot');
     d.className='dot '+(s.container==='running'?'ok':s.container==='docker-unavailable'?'warn':'err');
-    document.getElementById('syncBtn').disabled=s.sync_running;
+    const b=document.getElementById('syncBtn2');if(b)b.disabled=s.sync_running;
     document.getElementById('syncMsg').textContent=s.sync_running?'同步进行中，请勿重复点击…':'热更新=服务保持运行直接增量同步；严格模式=停服后同步';
-    if(s.schedule){document.getElementById('schEnabled').checked=s.schedule.enabled;document.getElementById('schTime').value=s.schedule.time;}
+    if(s.schedule){
+      document.getElementById('schEnabled').checked=s.schedule.enabled;
+      document.getElementById('schTime').value=s.schedule.time;
+      const last=s.schedule.last_run?'上次定时触发 '+s.schedule.last_run+(s.schedule.last_exit===0?' ✅':' ❌ 退出码 '+s.schedule.last_exit):'';
+      const sl=document.getElementById('schLast');if(sl)sl.textContent=last||'';
+    }
     const lg=await j('/api/log?n=100');document.getElementById('log').textContent=lg.log;
     loadHealth();loadWatchlist();loadHistory();
   }catch(e){document.getElementById('log').textContent='状态刷新失败: '+e}
@@ -767,10 +848,10 @@ async function loadHistory(){
     if(!h.history.length){tb.innerHTML='<tr><td colspan="8" class="hint">（暂无历史）</td></tr>';return;}
     tb.innerHTML=h.history.map(x=>`<tr>
       <td>${esc(x.ts)}</td>
+      <td>${x.trigger==='scheduled'?'⏰定时':'手动'}</td>
       <td>${x.mode==='hot'?'热更新':'严格'}</td>
       <td>${x.exit_code===0?'✅':'❌ '+esc(x.exit_code)}</td>
       <td>${x.downloads==null?'—':x.downloads}</td>
-      <td>${x.deletes==null?'—':x.deletes}</td>
       <td>${x.verified==='pass'?'<span class="badge b-ok">通过</span>':x.verified==='fail'?'<span class="badge b-fail">失败</span>':x.verified==='skipped'?'<span class="badge b-skip">跳过</span>':'—'}</td>
       <td>${x.duration_sec==null?'—':esc(x.duration_sec)+'s'}</td>
       <td>${esc(x.data_latest||'—')}</td></tr>`).join('');
@@ -986,7 +1067,7 @@ class Handler(BaseHTTPRequestHandler):
                     rows = apply_adjust(rows, _adjust_map(code), adj)
             else:  # minute
                 end = datetime.now().strftime("%Y%m%d%H%M%S")
-                start = (datetime.now().replace(hour=9, minute=30, second=0) - datetime.timedelta(days=1)).strftime("%Y%m%d%H%M%S")
+                start = (datetime.now().replace(hour=9, minute=30, second=0) - timedelta(days=1)).strftime("%Y%m%d%H%M%S")
                 rows = kline_range(code, "minute", start, end)
             self._send(200, json.dumps({"code": code, "freq": freq, "rows": rows},
                                        ensure_ascii=False))
@@ -1036,9 +1117,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         body = self._read_json()
         hot = bool(body.get("hot", True))  # 默认热更新；前端可传 hot=false 走严格模式
-        threading.Thread(target=run_sync, kwargs={"hot": hot}, daemon=True).start()
+        threading.Thread(target=run_sync, kwargs={"hot": hot, "trigger": "manual"}, daemon=True).start()
         mode = "热更新" if hot else "严格模式(停服)"
-        self._send(200, json.dumps({"msg": f"已启动{mode}同步，日志将实时刷新"}))
+        self._send(200, json.dumps({"msg": f"已启动{mode}同步（手动），日志将实时刷新"}))
 
 
 def main():
