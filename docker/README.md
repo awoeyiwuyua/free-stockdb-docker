@@ -44,7 +44,7 @@ docker build -t ghcr.io/awoeyiwuyua/free-stockdb:0.3.1 .
 
 ### 3. 极空间部署
 1. 极空间 Docker → 项目 → 新建 → 上传/粘贴 `docker-compose.yml`，项目目录建议 `/vol1/docker/stockdb/`
-2. compose 会在项目目录下自动创建 `data/`、`mydb/`、`log/` 子目录（数据持久化）
+2. compose 会在项目目录下自动创建 `data/`、`mydb/`、`research/`、`log/` 子目录（数据持久化）
 3. **首次同步数据**（断点续传，一次可能数 GB，需较长时间，可反复运行）——二选一：
 
    **A. 有主机终端**（SSH / Docker 项目终端，同步须停服务）：
@@ -154,10 +154,58 @@ docker compose pull && docker compose up -d
 
 ---
 
+## 市场复盘 SQLite 研究库
+
+WebUI 使用独立 SQLite 文件 `/research/market_research.sqlite3` 管理每日市场复盘。compose 将宿主机 `./research` 挂载到 `/research`；数据库生命周期由 WebUI 统一管理，不写入 StockDB 的 `./mydb`。
+
+启动时 WebUI 会自动：
+
+1. 创建数据库与表结构；
+2. 启用 WAL、`synchronous=NORMAL`、30 秒 busy timeout 和外键；
+3. 如果数据库为空且存在旧 `market_snapshot_*.json`，迁移最新一份有效快照并升级 schema；
+4. 在系统页显示数据库路径、大小与最新日期。
+
+每次市场研究重算使用一个 SQLite 事务写入：
+
+| 表 | 内容 |
+|---|---|
+| `market_daily` | 每日核心市场指标及完整快照 JSON |
+| `breadth_daily` | 每日上涨比例、MA20 广度、成交额、新高/新低 |
+| `return_distribution_daily` | 七档涨跌幅分布 |
+| `sector_daily` | 全部申万一级行业的中位涨跌、上涨比例与量能变化 |
+| `methodology` | 按研究 Schema 版本保存的计算公式 |
+
+常用查询：
+
+```bash
+sqlite3 ./research/market_research.sqlite3 \
+  'SELECT date,up_ratio,ma20_ratio,breadth_gap_pp FROM market_daily ORDER BY date DESC LIMIT 20;'
+
+sqlite3 ./research/market_research.sqlite3 \
+  'SELECT date,industry,median_pct,up_ratio FROM sector_daily ORDER BY date DESC,median_pct DESC LIMIT 50;'
+```
+
+快照内的 `methodology` 字段保存计算口径：
+
+| 指标 | 计算逻辑 |
+|---|---|
+| A/D | 上涨家数 ÷ 下跌家数 |
+| 上涨－MA20 | 上涨家数占比 − 站上 MA20 占比，单位为百分点 |
+| 1日/5日广度变化 | 当日上涨占比 − N 个交易日前上涨占比 |
+| 较前5日/20日均额 | 当日成交额 ÷ 此前 N 日平均成交额 − 1；基准不含当日 |
+| 涨跌分布 | ≥5%、2~5%、0~2%、平盘、0~-2%、-2~-5%、≤-5% |
+| 行业强弱 | 申万一级成分股等权涨跌中位数；同时计算上涨比例与成交额日变化 |
+
+`≥9.5%` 与 `≤−9.5%` 仅标记为“大涨/大跌”，不直接视为涨停/跌停，避免忽略 ST、科创板、创业板、北交所等不同涨跌停规则。
+
+当前行情源不含独立指数表，`日k:000001:*` 是平安银行而非上证指数，因此复盘页不伪造三大指数卡片。接入真实指数表后再补充指数当日/5日涨跌、MA20/MA60 位置与量能。
+
+---
+
 ## 后续扩展（本版不启用，需求浮现后再加）
 
 - **AI MCP 容器化**：官方 `调用方式/ai_mcp/stockdb_full_mcp.py`（需容器带 Python + pybao C 扩展），或继续用本仓库 `scripts/stockdb_mcp_server.py`（HTTP 只读，NAS 部署后改 `STOCKDB_HOST` 即可，无需容器化）
-- **webui 增强**：当前 webui 是纯标准库最小版（状态+同步+查询代理）；如需 K 线图表/多周期视图，在 `docker/webui/app.py` 的页面里扩展（ECharts 静态引入即可，无需后端框架）
+- **webui 增强**：当前 webui 保持纯标准库后端，已包含市场复盘、因子排行、K 线与多周期视图；后续新增研究模块继续复用本地 ECharts 与 StockDB HTTP API。
 - **定时同步**：极空间计划任务，或 webui 内加定时（后续版本）
 
 ## 风险与备忘
