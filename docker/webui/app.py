@@ -46,6 +46,7 @@ _last_verify_result: str | None = None  # 最近一次完整性验证结果（pa
 
 HISTORY_FILE = DATA_DIR / "sync_history.json"
 SCHEDULE_FILE = DATA_DIR / "sync_schedule.json"
+WATCHLIST_FILE = DATA_DIR / "watchlist.json"
 HISTORY_MAX = 30
 
 
@@ -123,6 +124,65 @@ def data_latest_date() -> str | None:
         return max(dates) if dates else None
     except Exception:
         return None
+
+
+def load_watchlist() -> list[str]:
+    if not WATCHLIST_FILE.exists():
+        return []
+    try:
+        data = json.loads(WATCHLIST_FILE.read_text(encoding="utf-8"))
+        return [str(c) for c in data] if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def save_watchlist(codes: list[str]) -> list[str]:
+    cleaned = []
+    for c in codes:
+        c = str(c).strip()
+        if c and c.isdigit() and len(c) == 6 and c not in cleaned:
+            cleaned.append(c)
+    WATCHLIST_FILE.write_text(json.dumps(cleaned, ensure_ascii=False, indent=1), encoding="utf-8")
+    return cleaned
+
+
+def health_status() -> dict:
+    """数据健康度：最新日期、落后交易日天数（周末自动跳过）、状态。"""
+    latest = data_latest_date()
+    if not latest:
+        return {"latest": None, "lag_days": None, "status": "unknown", "note": "无法获取数据最新日期"}
+    try:
+        from datetime import datetime as dt
+        latest_dt = dt.strptime(latest, "%Y%m%d").date()
+        today = dt.now().date()
+        # 计算"最近一个交易日之前"的落后天数：跳过周末（法定节假日简化处理）
+        ref = today
+        while ref.weekday() >= 5:  # 周六5/周日6
+            ref -= datetime.timedelta(days=1)
+        lag = (ref - latest_dt).days
+        if lag <= 0:
+            status = "ok"
+            note = f"数据最新 {latest_dt}（交易日，正常）"
+        elif lag <= 2:
+            status = "warn"
+            note = f"数据落后 {lag} 个交易日（{latest_dt}）"
+        else:
+            status = "stale"
+            note = f"数据落后 {lag} 个交易日（{latest_dt}），建议立即同步"
+        return {"latest": latest, "lag_days": lag, "status": status, "note": note}
+    except Exception as exc:
+        return {"latest": latest, "lag_days": None, "status": "unknown", "note": f"健康度计算失败: {exc}"}
+
+
+# ==================== 大盘指数快照 ====================
+INDEX_CODES = {"000001": "上证指数", "399001": "深证成指", "399006": "创业板指"}
+
+
+def index_snapshot() -> list[dict]:
+    quotes = latest_quotes(list(INDEX_CODES.keys()))
+    for q in quotes:
+        q["name"] = INDEX_CODES.get(q["code"], q.get("name"))
+    return quotes
 
 
 # ==================== Docker Engine API（unix socket） ====================
@@ -441,6 +501,77 @@ def kline_range(code: str, freq: str, start: str, end: str) -> list[dict]:
         cur += _td(minutes=30)
     rows.sort(key=lambda r: int(r.get("date") or 0))
     return rows
+
+
+def _adjust_map(code: str) -> dict[int, float]:
+    """复权因子表：{日期int: cum}。cum=累计复权因子（后复权方向）。"""
+    import urllib.request, urllib.parse
+    url = f"http://{STOCKDB_HOST}:{STOCKDB_PORT}/?cmd=get&t={urllib.parse.quote(f'复权:{code}:*')}"
+    try:
+        with urllib.request.urlopen(url, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+    except Exception:
+        return {}
+    result: dict[int, float] = {}
+    for item in data if isinstance(data, list) else []:
+        if isinstance(item, list) and len(item) == 2:
+            key, factors = item[0], item[1]
+            try:
+                d = int(str(key).split(":")[-1])
+                cum = float(factors.get("cum") or 1.0)
+                result[d] = cum
+            except Exception:
+                continue
+    return result
+
+
+def apply_adjust(rows: list[dict], adj_map: dict[int, float], mode: str) -> list[dict]:
+    """对日K行应用复权。mode: qfq=前复权（以最新为基准）/ hfq=后复权。"""
+    if not rows or not adj_map or mode == "none":
+        return rows
+    dates = sorted(adj_map.keys())
+    latest_cum = adj_map[dates[-1]]
+    result = []
+    for r in rows:
+        row = dict(r)
+        d = int(row.get("date") or 0)
+        # 找到 ≤ d 的最近复权日的 cum；无则 cum=1（上市初期）
+        cum_t = 1.0
+        for x in reversed(dates):
+            if x <= d:
+                cum_t = adj_map[x]
+                break
+        factor = (latest_cum / cum_t) if mode == "qfq" else cum_t
+        for f in ("open", "close", "high", "low", "pre_close"):
+            if row.get(f) is not None:
+                row[f] = round(float(row[f]) * factor, 3)
+        result.append(row)
+    return result
+
+
+def latest_quotes(codes: list[str]) -> list[dict]:
+    """批量获取股票最新交易日行情（name/close/pct_chg/date）。"""
+    import urllib.request, urllib.parse
+    quotes = []
+    for code in codes:
+        try:
+            url = f"http://{STOCKDB_HOST}:{STOCKDB_PORT}/?cmd=vals&t={urllib.parse.quote(f'日k:{code}:2026*')}"
+            with urllib.request.urlopen(url, timeout=12) as resp:
+                data = json.loads(resp.read().decode("utf-8", "replace"))
+            rows = [r for r in data if isinstance(r, dict) and r.get("date")]
+            if not rows:
+                continue
+            latest = max(rows, key=lambda r: int(r.get("date") or 0))
+            quotes.append({
+                "code": code,
+                "name": latest.get("name") or code,
+                "date": latest.get("date"),
+                "close": latest.get("close"),
+                "pct_chg": latest.get("pct_chg"),
+            })
+        except Exception:
+            continue
+    return quotes
 def stockdb_get(table: str) -> str:
     import urllib.parse
     url = f"http://{STOCKDB_HOST}:{STOCKDB_PORT}/?cmd=get&t={urllib.parse.quote(table)}"
@@ -450,7 +581,7 @@ def stockdb_get(table: str) -> str:
 
 
 # ==================== HTTP 服务 ====================
-PAGE = """<!doctype html>
+PAGE = r"""<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>stockdb 管理台</title>
@@ -490,10 +621,23 @@ th{color:var(--muted);font-weight:600}
 <div class="card"><div class="row">
   <div><div class="k">stockdb 容器</div><div class="v" id="cState">…</div></div>
   <div><div class="k">数据源</div><div class="v" id="cSource">…</div></div>
-  <div><div class="k">数据最新</div><div class="v" id="cLatest">…</div></div>
+  <div><div class="k">数据健康度</div><div class="v" id="cLatest" style="font-size:14px">…</div></div>
   <div><div class="k">最近同步</div><div class="v" id="cSync">…</div></div>
   <div><div class="k">同步退出码</div><div class="v" id="cCode">…</div></div>
 </div></div>
+
+<div class="card"><div class="k">大盘指数快照</div>
+  <div class="row" id="idxRow" style="margin-top:8px"><span class="hint">加载中…</span></div>
+</div>
+
+<div class="card"><div class="k">自选股（点代码看K线）<span class="hint" style="margin-left:8px">保存到 /data/watchlist.json</span></div>
+  <div class="row" id="wlRow" style="margin-top:8px;align-items:center;gap:8px"><span class="hint">（空）</span></div>
+  <div style="margin-top:8px;display:flex;gap:8px">
+    <input type="text" id="wlAdd" placeholder="如 600633,000967,002600" style="width:300px">
+    <button onclick="addWatch()" style="background:#334155;color:#e2e8f0">加入自选</button>
+    <span id="wlMsg" class="hint"></span>
+  </div>
+</div>
 
 <div class="card">
   <div class="actions">
@@ -525,17 +669,23 @@ th{color:var(--muted);font-weight:600}
 <pre id="log">（暂无）</pre></div>
 
 <div class="card"><div class="k">K 线图（ECharts）</div>
-  <div style="display:flex;gap:8px;margin:8px 0;flex-wrap:wrap">
-    <input type="text" id="kcode" value="600633" placeholder="股票代码">
+  <div style="display:flex;gap:8px;margin:8px 0;flex-wrap:wrap;align-items:center">
+    <input type="text" id="kcode" value="600633" placeholder="股票代码" style="width:120px">
     <select id="kfreq">
       <option value="day">日K</option>
       <option value="minute">分钟K（整点样本）</option>
+    </select>
+    <select id="kadj">
+      <option value="none">不复权</option>
+      <option value="qfq">前复权</option>
+      <option value="hfq">后复权</option>
     </select>
     <select id="kmonths">
       <option value="1">近1月</option><option value="3" selected>近3月</option>
       <option value="6">近6月</option><option value="12">近1年</option>
     </select>
     <button onclick="loadKline()">加载K线</button>
+    <label class="hint"><input type="checkbox" id="kma" checked> 均线MA5/20</label>
   </div>
   <div id="kchart"></div>
 </div>
@@ -553,10 +703,13 @@ th{color:var(--muted);font-weight:600}
   <pre id="qres">（查询结果）</pre>
 </div>
 </div>
-<script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+<script src="/static/echarts.min.js"></script>
 <script>
 async function j(url,opt){const r=await fetch(url,opt);if(!r.ok)throw new Error(r.status);return r.json()}
 function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
+function pctCls(v){return v>0?'color:#f87171':v<0?'color:#4ade80':'color:#94a3b8'}
+function fmtPct(v){return v==null?'—':(v>0?'+':'')+Number(v).toFixed(2)+'%'}
+function fmtPrice(v){return v==null?'—':Number(v).toFixed(2)}
 async function refresh(){
   try{
     const s=await j('/api/status');
@@ -571,8 +724,41 @@ async function refresh(){
     document.getElementById('syncMsg').textContent=s.sync_running?'同步进行中，请勿重复点击…':'热更新=服务保持运行直接增量同步；严格模式=停服后同步';
     if(s.schedule){document.getElementById('schEnabled').checked=s.schedule.enabled;document.getElementById('schTime').value=s.schedule.time;}
     const lg=await j('/api/log?n=100');document.getElementById('log').textContent=lg.log;
-    loadHistory();
+    loadHealth();loadWatchlist();loadHistory();
   }catch(e){document.getElementById('log').textContent='状态刷新失败: '+e}
+}
+async function loadHealth(){
+  try{
+    const h=await j('/api/health');
+    const el=document.getElementById('cLatest');
+    const color=h.status==='ok'?'var(--ok)':h.status==='warn'?'var(--warn)':'var(--err)';
+    el.innerHTML='<span style="color:'+color+'">'+esc(h.note||'—')+'</span>';
+  }catch(e){}
+}
+async function loadWatchlist(){
+  try{
+    const w=await j('/api/watchlist');
+    const idx=w.indices||[], wl=w.quotes||[];
+    const irow=document.getElementById('idxRow');
+    if(idx.length) irow.innerHTML=idx.map(x=>'<div><div class="k">'+esc(x.name)+'</div><div class="v" style="'+pctCls(x.pct_chg)+'">'+fmtPrice(x.close)+' <span style="font-size:12px">'+fmtPct(x.pct_chg)+'</span></div></div>').join('');
+    else irow.innerHTML='<span class="hint">（指数数据未取到）</span>';
+    const wrow=document.getElementById('wlRow');
+    if(wl.length) wrow.innerHTML=wl.map(x=>'<div style="cursor:pointer" onclick="showKline(\''+x.code+'\')"><div class="k">'+esc(x.name)+' '+esc(x.code)+'</div><div class="v" style="'+pctCls(x.pct_chg)+'">'+fmtPrice(x.close)+' <span style="font-size:12px">'+fmtPct(x.pct_chg)+'</span></div></div>').join('');
+    else wrow.innerHTML='<span class="hint">（空，下方添加自选）</span>';
+  }catch(e){}
+}
+async function addWatch(){
+  const codes=document.getElementById('wlAdd').value.trim();
+  if(!codes){return}
+  const t=document.getElementById('token').value;
+  try{
+    const cur=await j('/api/watchlist');
+    const merged=[...new Set((cur.codes||[]).concat(codes.split(/[,，\s]+/)))];
+    const r=await j('/api/watchlist?action=set&codes='+encodeURIComponent(merged.join(','))+'&token='+encodeURIComponent(t));
+    document.getElementById('wlMsg').textContent='已保存 '+r.codes.length+' 只';
+    document.getElementById('wlAdd').value='';
+    loadWatchlist();
+  }catch(e){document.getElementById('wlMsg').textContent='保存失败: '+e;}
 }
 async function loadHistory(){
   try{
@@ -613,33 +799,44 @@ async function doQuery(){
   document.getElementById('qres').textContent=d;
 }
 let kchart=null;
+function showKline(code){document.getElementById('kcode').value=code;loadKline();}
+function ma(data,n){return data.map((v,i)=>i<n-1?null:+((data.slice(i-n+1,i+1).reduce((a,b)=>a+b,0)/n).toFixed(3)))}
 async function loadKline(){
   const code=document.getElementById('kcode').value.trim();
   const freq=document.getElementById('kfreq').value;
+  const adj=document.getElementById('kadj').value;
   const months=document.getElementById('kmonths').value;
   try{
-    const d=await j('/api/klines?code='+code+'&freq='+freq+'&months='+months);
+    const d=await j('/api/klines?code='+code+'&freq='+freq+'&months='+months+'&adj='+adj);
     const rows=d.rows||[];
     if(!rows.length){document.getElementById('qres').textContent='（该区间无K线数据）';return;}
     const dates=rows.map(r=>String(r.date));
+    const closes=rows.map(r=>+r.close);
     const kd=rows.map(r=>[+r.open,+r.close,+r.low,+r.high]);
+    const showMA=document.getElementById('kma').checked;
+    const series=[
+      {name:'K线',type:'candlestick',data:kd,
+       itemStyle:{color:'#f87171',color0:'#4ade80',borderColor:'#f87171',borderColor0:'#4ade80'}},
+      {name:'成交量',type:'bar',xAxisIndex:1,yAxisIndex:1,
+       data:rows.map(r=>r.volume||0),itemStyle:{color:'#38bdf8'}}
+    ];
+    if(showMA&&freq==='day'){
+      series.push({name:'MA5',type:'line',data:ma(closes,5),smooth:true,showSymbol:false,lineStyle:{width:1,color:'#fbbf24'}});
+      series.push({name:'MA20',type:'line',data:ma(closes,20),smooth:true,showSymbol:false,lineStyle:{width:1,color:'#a78bfa'}});
+    }
     if(!kchart)kchart=echarts.init(document.getElementById('kchart'),'dark');
     kchart.setOption({
       backgroundColor:'transparent',
-      title:{text:code+' '+(freq==='day'?'日K':'分钟K'),left:8,top:4,textStyle:{fontSize:13,color:'#94a3b8'}},
+      title:{text:code+' '+(freq==='day'?'日K':'分钟K')+(adj!=='none'?(adj==='qfq'?' 前复权':' 后复权'):''),left:8,top:4,textStyle:{fontSize:13,color:'#94a3b8'}},
       tooltip:{trigger:'axis',axisPointer:{type:'cross'}},
+      legend:{right:8,top:4,textStyle:{color:'#94a3b8',fontSize:11}},
       grid:[{left:60,right:16,top:34,height:'62%'},{left:60,right:16,top:'72%',height:'18%'}],
       xAxis:[{type:'category',data:dates,axisLine:{lineStyle:{color:'#334155'}}},
              {type:'category',gridIndex:1,data:dates,axisLabel:{show:false},axisLine:{lineStyle:{color:'#334155'}}}],
       yAxis:[{scale:true,splitLine:{lineStyle:{color:'#1e293b'}}},
              {gridIndex:1,splitNumber:2,axisLabel:{show:false},splitLine:{show:false}}],
       dataZoom:[{type:'inside',xAxisIndex:[0,1],start:40,end:100}],
-      series:[
-        {name:'K线',type:'candlestick',data:kd,
-         itemStyle:{color:'#ef4444',color0:'#22c55e',borderColor:'#ef4444',borderColor0:'#22c55e'}},
-        {name:'成交量',type:'bar',xAxisIndex:1,yAxisIndex:1,
-         data:rows.map(r=>r.volume||0),itemStyle:{color:'#38bdf8'}}
-      ]
+      series
     });
   }catch(e){document.getElementById('qres').textContent='K线加载失败: '+e;}
 }
@@ -662,7 +859,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urlparse(self.path).path
         try:
-            if path in ("/", "/index.html"):
+            if path.startswith("/static/"):
+                self._static(path)
+            elif path in ("/", "/index.html"):
                 self._send(200, PAGE, "text/html; charset=utf-8")
             elif path == "/api/status":
                 self._status()
@@ -672,6 +871,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._schedule()
             elif path == "/api/klines":
                 self._klines()
+            elif path == "/api/health":
+                self._health()
+            elif path == "/api/watchlist":
+                self._watchlist()
             elif path == "/api/log":
                 self._log()
             elif path == "/api/query":
@@ -680,6 +883,19 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(404, json.dumps({"error": "not found"}))
         except Exception as exc:
             self._send(500, json.dumps({"error": str(exc)}))
+
+    def _static(self, path: str):
+        """服务本地静态文件（如 /static/echarts.min.js），离线可用。"""
+        name = path.split("/static/", 1)[-1]
+        if "/" in name or ".." in name:
+            self._send(403, "forbidden")
+            return
+        f = Path(__file__).parent / "static" / name
+        if not f.is_file():
+            self._send(404, "not found")
+            return
+        ctype = "application/javascript; charset=utf-8" if name.endswith(".js") else "application/octet-stream"
+        self._send(200, f.read_bytes().decode("utf-8", "replace"), ctype)
 
     def do_POST(self):
         path = urlparse(self.path).path
@@ -752,6 +968,7 @@ class Handler(BaseHTTPRequestHandler):
         code = q.get("code", [""])[0]
         freq = q.get("freq", ["day"])[0]
         months = int(q.get("months", ["3"])[0]) or 3
+        adj = q.get("adj", ["none"])[0]  # none/qfq/hfq
         if not code:
             self._send(400, "missing code")
             return
@@ -765,6 +982,8 @@ class Handler(BaseHTTPRequestHandler):
                     y -= 1
                 start = f"{y:04d}{m:02d}01"
                 rows = kline_range(code, "day", start, end)
+                if adj in ("qfq", "hfq"):
+                    rows = apply_adjust(rows, _adjust_map(code), adj)
             else:  # minute
                 end = datetime.now().strftime("%Y%m%d%H%M%S")
                 start = (datetime.now().replace(hour=9, minute=30, second=0) - datetime.timedelta(days=1)).strftime("%Y%m%d%H%M%S")
@@ -773,6 +992,26 @@ class Handler(BaseHTTPRequestHandler):
                                        ensure_ascii=False))
         except Exception as exc:
             self._send(500, json.dumps({"error": str(exc)}, ensure_ascii=False))
+
+    def _health(self):
+        self._send(200, json.dumps(health_status(), ensure_ascii=False))
+
+    def _watchlist(self):
+        q = parse_qs(urlparse(self.path).query)
+        action = q.get("action", [""])[0]
+        if action == "set":
+            if not self._token_ok():
+                self._send(403, json.dumps({"msg": "令牌错误"}))
+                return
+            codes_raw = q.get("codes", [""])[0]
+            codes = [c for c in codes_raw.split(",") if c.strip()]
+            codes = save_watchlist(codes)
+            self._send(200, json.dumps({"codes": codes}, ensure_ascii=False))
+            return
+        codes = load_watchlist()
+        quotes = latest_quotes(codes)
+        self._send(200, json.dumps({"codes": codes, "quotes": quotes,
+                                    "indices": index_snapshot()}, ensure_ascii=False))
 
     def _log(self):
         n = int(parse_qs(urlparse(self.path).query).get("n", ["100"])[0])

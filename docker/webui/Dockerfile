@@ -52,6 +52,7 @@ COPY --from=build /out/stockdb/数据更新 /opt/stockdb/数据更新
 COPY --from=build /out/stockdb/sync_url.txt /opt/stockdb/sync_url.txt
 
 COPY app.py entrypoint.sh /opt/webui/
+COPY static/ /opt/webui/static/
 
 WORKDIR /opt/webui
 EXPOSE 8080
