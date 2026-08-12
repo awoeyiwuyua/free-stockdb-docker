@@ -1,0 +1,19 @@
+[project]
+name = "free-stockdb-docker"
+version = "0.3.0"
+description = "free-stockdb 本地量化数据引擎的 Docker 部署 + webui 运维控制台"
+requires-python = ">=3.14"
+dependencies = []
+
+[project.scripts]
+webui = "webui.app:main"
+
+[tool.uv]
+# 统一 Python 版本（本机开发/容器一致）；free-threaded 待上游 pybao abi3t 修复后评估
+package = false
+
+[tool.uv.sources]
+# 无第三方依赖；pybao 写库通过 PYTHONPATH 注入（见 docker/webui/Dockerfile）
+
+[project.optional-dependencies]
+dev = []

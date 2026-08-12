@@ -660,5 +660,63 @@ class TestWatchlistScope(unittest.TestCase):
         self.assertEqual(mod.load_watchlist("etf"), ["510300", "159915"])
 
 
+class TestHKAndMydb(unittest.TestCase):
+    """港股代码识别、表名保留字拦截、港股日K解析。"""
+
+    def test_hk_code_detection(self):
+        self.assertTrue(mod._is_hk_code("00700"))
+        self.assertTrue(mod._is_hk_code("hk00700"))
+        self.assertTrue(mod._is_hk_code("09988"))
+        self.assertFalse(mod._is_hk_code("600633"))  # A股
+        self.assertFalse(mod._is_hk_code("510300"))  # ETF
+        self.assertFalse(mod._is_hk_code("700"))     # 位数不足
+
+    def test_hk_code_normalize(self):
+        self.assertEqual(mod._normalize_hk_code("00700"), "00700")
+        self.assertEqual(mod._normalize_hk_code("hk00700"), "00700")
+        self.assertEqual(mod._normalize_hk_code("700"), "00700")
+        self.assertEqual(mod._normalize_hk_code("09988"), "09988")
+
+    def test_reserved_table_blocked(self):
+        for t in ("日k", "日k:600633", "复权", "股票代码", "分钟k"):
+            with self.assertRaises(ValueError):
+                mod.validate_custom_table(t)
+
+    def test_custom_table_ok(self):
+        self.assertEqual(mod.validate_custom_table("hk日k"), "hk日k")
+        self.assertEqual(mod.validate_custom_table("自定义指标"), "自定义指标")
+        self.assertEqual(mod.validate_custom_table("自定义:因子"), "自定义:因子")
+
+    def test_invalid_table_char(self):
+        with self.assertRaises(ValueError):
+            mod.validate_custom_table("a b")
+        with self.assertRaises(ValueError):
+            mod.validate_custom_table("../etc")
+
+    def test_em_parse(self):
+        # 东财 klines 格式: date,open,close,high,low,volume,amount
+        import json
+        fake = '{"data":{"klines":["2026-08-12,464.600,461.600,467.200,456.200,27593015,12679743488.000"]}}'
+        # 直接用模块内函数解析（mock urlopen）
+        import urllib.request as ur
+        orig = ur.urlopen
+        class FakeResp:
+            def __init__(self, body): self._b = body.encode()
+            def read(self): return self._b
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+        ur.urlopen = lambda url, **kw: FakeResp(fake)
+        try:
+            rows = mod._hk_fetch_daily_em("00700")
+        finally:
+            ur.urlopen = orig
+        self.assertEqual(len(rows), 1)
+        r = rows[0]
+        self.assertEqual(r["date"], 20260812)
+        self.assertEqual(r["close"], 461.6)
+        self.assertEqual(r["high"], 467.2)
+        self.assertEqual(r["amount"], 12679743488.0)
+
+
 if __name__ == "__main__":
     unittest.main()
