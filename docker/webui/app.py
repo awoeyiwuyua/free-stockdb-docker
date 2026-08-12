@@ -1643,8 +1643,29 @@ def container_stop() -> None:
 
 
 def container_restart() -> None:
-    """重启容器（热更新失败止损用）。"""
+    """重启容器（热更新失败止损/加载新快照用）。"""
     docker_request("POST", f"/containers/{STOCKDB_CONTAINER}/restart")
+
+
+def wait_stockdb_ready(timeout: float = 60.0) -> bool:
+    """轮询等待 stockdb HTTP 服务就绪（重启后验证/查询前调用）。
+
+    容器 restart 返回不代表服务已可查询，直接连可能连接拒绝导致误判；
+    轮询 7899 的 /?cmd=get&t=股票代码 直到响应（含健康检查端口映射未生效前的
+    短暂窗口）。超时返回 False。
+    """
+    import urllib.request, urllib.parse
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            url = f"http://{STOCKDB_HOST}:{STOCKDB_PORT}/?cmd=get&t={urllib.parse.quote('股票代码')}"
+            with urllib.request.urlopen(url, timeout=3) as resp:
+                if resp.status == 200:
+                    return True
+        except Exception:
+            pass
+        time.sleep(2)
+    return False
 
 
 def container_logs(tail: int = 150) -> str:
@@ -1738,7 +1759,9 @@ def run_sync(hot: bool = True, trigger: str = "manual", retry: bool = False) -> 
     hot=True（默认，热更新）：不停服务直接增量同步——同步器下载到 .part 临时文件、
     SHA256 校验后原子 rename 替换（Unix rename 对读进程无影响），服务端持续可查。
     官方 DATA_SOURCE.md 保守要求"同步期间停止服务"，但实测与机制均支持热更新；
-    同步后自动做完整性验证，失败则重启 stockdb 止损。
+    上游多点数据源架构下增量下载进 data1/LevelDB，运行中的服务进程持旧快照，
+    故检测到新数据文件（下载数>0）时同步完成后自动重启 stockdb 加载新快照，
+    再自动做完整性验证，失败则再次重启止损。
 
     hot=False（严格模式）：按官方要求先停服务 → 同步 → 重启，作为兜底。
 
@@ -1815,6 +1838,21 @@ def run_sync(hot: bool = True, trigger: str = "manual", retry: bool = False) -> 
             if proc.returncode == 0:
                 _sync_state["phase"] = "verifying"
                 log("→ 热更新完成，验证数据完整性 ...")
+                # 上游新架构（多点数据源）下增量下载进 data1/LevelDB，
+                # 运行中的 stockdb 进程仍持旧快照，须重启才加载新数据。
+                # 无新文件（downloads=0）时数据未变，不必重启。
+                counts = parse_sync_counts(_last_sync_stdout)
+                if counts.get("downloads", 0) > 0 or counts.get("downloads") is None:
+                    _sync_state["phase"] = "restarting"
+                    log("→ 检测到新数据文件，重启 stockdb 加载新快照 ...")
+                    try:
+                        container_restart()
+                        log("  ✅ stockdb 已重启")
+                        if not wait_stockdb_ready():
+                            log("  ⚠️ 重启后服务未在 60s 内就绪，验证可能失败")
+                    except Exception as exc:
+                        log(f"  ❌ 重启失败：{exc}")
+                    _sync_state["phase"] = "verifying"
                 problems = _verify_data(before_date)
                 if problems:
                     _last_verify_result = "fail"
