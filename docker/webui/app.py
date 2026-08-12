@@ -1492,22 +1492,43 @@ def mirror_latest_date() -> str | None:
     return result
 
 
-def load_watchlist() -> list[str]:
+def load_watchlist(scope: str | None = None) -> list[str]:
+    """自选列表。scope=stock|etf 时按代码段过滤（个股/ETF 板块各看各的）；
+    None 返回全量（供迁移/展示）。旧版本未分流数据自动兼容。"""
     if not WATCHLIST_FILE.exists():
         return []
     try:
         data = json.loads(WATCHLIST_FILE.read_text(encoding="utf-8"))
-        return [str(c) for c in data] if isinstance(data, list) else []
+        codes = [str(c) for c in data] if isinstance(data, list) else []
     except Exception:
         return []
+    if scope == "stock":
+        return [c for c in codes if _classify_code(c) == "stock"]
+    if scope == "etf":
+        return [c for c in codes if _classify_code(c) == "etf"]
+    return codes
 
 
-def save_watchlist(codes: list[str]) -> list[str]:
+def save_watchlist(codes: list[str], scope: str | None = None) -> list[str]:
+    """保存自选列表。scope=stock|etf 时只替换该部分，保留另一 scope 的条目
+    （个股/ETF 独立板块互不覆盖）。None 视为全量替换（兼容旧调用）。"""
     cleaned = []
     for c in codes:
         c = str(c).strip()
         if c and c.isdigit() and len(c) == 6 and c not in cleaned:
             cleaned.append(c)
+    if scope in ("stock", "etf"):
+        current = load_watchlist(None)
+        others = [c for c in current if _classify_code(c) != scope]
+        merged = others + cleaned
+        # 去重保序
+        seen: set[str] = set()
+        final = []
+        for c in merged:
+            if c not in seen:
+                seen.add(c)
+                final.append(c)
+        cleaned = final
     WATCHLIST_FILE.write_text(json.dumps(cleaned, ensure_ascii=False, indent=1), encoding="utf-8")
     return cleaned
 
@@ -2237,6 +2258,55 @@ def apply_adjust(rows: list[dict], adj_map: dict[int, float], mode: str) -> list
     return result
 
 
+def _aggregate_kline(rows: list[dict], period: str) -> list[dict]:
+    """按周期聚合日K为周/月K（纯函数，可单测）。
+
+    周=自然周（周一~周日，A股无周日数据），月=自然月。聚合口径：
+    open=周期首日开盘、close=末日收盘、high=max、low=min、
+    volume/amount=求和。日期取周期最后交易日（K线 x 轴归属）。
+    period 非 week/month 时原样返回。
+    """
+    if period not in ("week", "month") or not rows:
+        return rows
+    from datetime import datetime as _dt, timedelta as _td
+
+    def key_fn(date_int: int) -> str:
+        dt = _dt.strptime(str(date_int), "%Y%m%d")
+        if period == "week":
+            # 周一作为周起点（ISO 周序号）
+            iso = dt.isocalendar()
+            return f"{iso[0]}-W{iso[1]:02d}"
+        return f"{dt.year:04d}-{dt.month:02d}"
+
+    grouped: dict[str, list[dict]] = {}
+    order: list[str] = []
+    for r in rows:
+        d = int(r.get("date") or 0)
+        if not d:
+            continue
+        k = key_fn(d)
+        if k not in grouped:
+            grouped[k] = []
+            order.append(k)
+        grouped[k].append(r)
+
+    out = []
+    for k in order:
+        bars = grouped[k]
+        first, last = bars[0], bars[-1]
+        out.append({
+            "date": int(last.get("date") or 0),
+            "open": first.get("open"),
+            "close": last.get("close"),
+            "high": max((b.get("high") for b in bars), default=None),
+            "low": min((b.get("low") for b in bars), default=None),
+            "volume": sum(b.get("volume") or 0 for b in bars),
+            "amount": sum(b.get("amount") or 0 for b in bars),
+            "pct_chg": last.get("pct_chg"),
+        })
+    return out
+
+
 def latest_quotes(codes: list[str]) -> list[dict]:
     """批量获取股票最新交易日行情（name/close/pct_chg/date）。
 
@@ -2496,6 +2566,8 @@ color:var(--text);padding:8px 10px;border-radius:8px;width:220px}
   <div class="brand-status" id="brandStatus">加载中…</div>
   <nav class="tabs">
     <button class="tab-btn active" data-tab="research" onclick="showTab('research',this)">市场研究</button>
+    <button class="tab-btn" data-tab="stock" onclick="showTab('stock',this)">个股研究</button>
+    <button class="tab-btn" data-tab="etf" onclick="showTab('etf',this)">ETF 研究</button>
     <button class="tab-btn" data-tab="sync" onclick="showTab('sync',this)">数据同步</button>
     <button class="tab-btn" data-tab="system" onclick="showTab('system',this)">系统</button>
   </nav>
@@ -2545,14 +2617,17 @@ color:var(--text);padding:8px 10px;border-radius:8px;width:220px}
       <div class="f-cards" id="fCards"></div>
     </div>
   </div>
+</div>
 
-  <div class="card"><div class="card-title">个股研究</div>
+<!-- 个股研究：单股查询 + 股票自选（独立板块） -->
+<div id="tab-stock" class="tab-panel">
+  <div class="card"><div class="card-title">个股研究 <span class="hint" style="font-weight:normal">股票 · 前复权</span></div>
     <div class="filters" style="margin-bottom:0">
-      <input type="text" id="rsCode" placeholder="6 位代码" style="width:120px">
-      <button class="btn-ghost btn-sm" onclick="loadStock()">加载</button>
+      <input type="text" id="rsCode" placeholder="6 位代码，如 600633" style="width:180px">
+      <button class="btn-ghost btn-sm" onclick="loadStock('stock')">加载</button>
       <span class="hint" id="rsMsg"></span>
     </div>
-    <div id="rsEmpty" class="hint" style="margin-top:10px">输入代码或点击排行榜记录加载个股研究。</div>
+    <div id="rsEmpty" class="hint" style="margin-top:10px">输入股票代码或点击自选股加载个股研究。</div>
     <div id="rsDetail" style="display:none">
       <div class="metrics" style="gap:8px">
         <div class="m"><div class="lbl">代码 / 名称</div><div class="v" id="rsName" style="font-size:15px">—</div></div>
@@ -2561,8 +2636,13 @@ color:var(--text);padding:8px 10px;border-radius:8px;width:220px}
         <div class="m"><div class="lbl">成交量 / 成交额</div><div class="v" id="rsVol" style="font-size:15px">—</div></div>
       </div>
       <div class="rs-grid" id="rsFactors"></div>
-      <div class="rs-kline"><div class="lbl">日 K 线（不复权）</div>
+      <div class="rs-kline"><div class="lbl">K 线（前复权）</div>
         <div class="rs-kctl">
+          <select id="rsPeriod">
+            <option value="day" selected>日 K</option>
+            <option value="week">周 K</option>
+            <option value="month">月 K</option>
+          </select>
           <select id="rsMonths">
             <option value="1">近1月</option>
             <option value="3" selected>近3月</option>
@@ -2574,18 +2654,69 @@ color:var(--text);padding:8px 10px;border-radius:8px;width:220px}
         </div>
         <div id="kchart" style="height:420px"></div>
       </div>
-      <div class="rs-trend"><div class="lbl">因子走势（近 60 日：20 日动量 / 20 日波动率）</div>
+      <div class="rs-trend"><div class="lbl">因子走势（近 60 根：20 日动量 / 20 日波动率）</div>
         <div id="tchart"></div>
       </div>
     </div>
   </div>
 
-  <div class="card"><div class="card-title">自选股 <span class="hint" style="font-weight:normal">（点代码跳转个股研究）</span></div>
+  <div class="card"><div class="card-title">自选股 <span class="hint" style="font-weight:normal">（点代码加载个股研究）</span></div>
     <div class="row" id="wlRow" style="gap:14px"><span class="hint">…</span></div>
     <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">
-      <input type="text" id="wlAdd" placeholder="加自选，如 600633,000967" style="width:260px">
-      <button class="btn-ghost" onclick="addWatch()">加入自选</button>
+      <input type="text" id="wlAdd" placeholder="加自选股，如 600633,000967" style="width:260px">
+      <button class="btn-ghost" onclick="addWatch('stock')">加入自选</button>
       <span id="wlMsg" class="hint"></span>
+    </div>
+  </div>
+</div>
+
+<!-- ETF 研究：ETF 查询 + ETF 自选（独立板块） -->
+<div id="tab-etf" class="tab-panel">
+  <div class="card"><div class="card-title">ETF 研究 <span class="hint" style="font-weight:normal">ETF · 前复权</span></div>
+    <div class="filters" style="margin-bottom:0">
+      <input type="text" id="etfCode" placeholder="6 位代码，如 510300" style="width:180px">
+      <button class="btn-ghost btn-sm" onclick="loadStock('etf')">加载</button>
+      <span class="hint" id="etfMsg"></span>
+    </div>
+    <div id="etfEmpty" class="hint" style="margin-top:10px">输入 ETF 代码或点击下方自选 ETF 加载。</div>
+    <div id="etfDetail" style="display:none">
+      <div class="metrics" style="gap:8px">
+        <div class="m"><div class="lbl">代码 / 名称</div><div class="v" id="etfName" style="font-size:15px">—</div></div>
+        <div class="m"><div class="lbl">最新交易日</div><div class="v" id="etfDate" style="font-size:15px">—</div></div>
+        <div class="m"><div class="lbl">收盘 / 涨跌幅</div><div class="v" id="etfPx" style="font-size:15px">—</div></div>
+        <div class="m"><div class="lbl">成交量 / 成交额</div><div class="v" id="etfVol" style="font-size:15px">—</div></div>
+      </div>
+      <div class="rs-grid" id="etfFactors"></div>
+      <div class="rs-kline"><div class="lbl">K 线（前复权）</div>
+        <div class="rs-kctl">
+          <select id="etfPeriod">
+            <option value="day" selected>日 K</option>
+            <option value="week">周 K</option>
+            <option value="month">月 K</option>
+          </select>
+          <select id="etfMonths">
+            <option value="1">近1月</option>
+            <option value="3" selected>近3月</option>
+            <option value="6">近6月</option>
+            <option value="12">近12月</option>
+          </select>
+          <button class="btn-ghost btn-sm" onclick="renderEtfKline()">刷新</button>
+          <label class="hint"><input type="checkbox" id="etfMA" checked> MA5/20/60</label>
+        </div>
+        <div id="etfKchart" style="height:420px"></div>
+      </div>
+      <div class="rs-trend"><div class="lbl">因子走势（近 60 根：20 日动量 / 20 日波动率）</div>
+        <div id="etfTchart"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card"><div class="card-title">自选 ETF <span class="hint" style="font-weight:normal">（点代码加载 ETF 研究）</span></div>
+    <div class="row" id="etfWlRow" style="gap:14px"><span class="hint">…</span></div>
+    <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">
+      <input type="text" id="etfWlAdd" placeholder="加自选 ETF，如 510300,159915" style="width:260px">
+      <button class="btn-ghost" onclick="addWatch('etf')">加入自选</button>
+      <span id="etfWlMsg" class="hint"></span>
     </div>
   </div>
 </div>
@@ -2748,6 +2879,12 @@ function showTab(name,btn){
   if(name==='research'){
     loadResearchOnce();
     if(kchart)kchart.resize();
+  }else if(name==='stock'){
+    loadResearchOnce();
+    if(kchart)kchart.resize();
+  }else if(name==='etf'){
+    loadResearchOnce();
+    if(etfKchart)etfKchart.resize();
   }
   refresh(true); // 切页立即按当前页刷新
 }
@@ -2779,6 +2916,8 @@ async function refresh(force){
     $('brandStatus').textContent=topSt+' · '+up;
     if(active==='tab-research'){
       loadResearchOnce();   // 首次进入/页面初始加载时加载市场研究（_rsLoaded 防重复）
+    }else if(active==='tab-stock'||active==='tab-etf'){
+      loadResearchOnce();   // 个股/ETF 板块：自选列表与查询共用研究数据源
     }else if(active==='tab-sync'){
       renderHero(s,h||{});
       renderSchView(s.schedule||{});
@@ -3027,34 +3166,46 @@ function renderSystem(s){
   }
 }
 
-async function loadWatchlist(){
+// 自选股/自选ETF：按 scope（stock|etf）各自维护，watchlist 存全量由后端分流
+async function loadWatchlist(scope){
+  const S=scope==='etf'?{
+    row:'etfWlRow',add:'etfWlAdd',msg:'etfWlMsg',onOpen:'loadStockByCode',ph:'加自选 ETF，如 510300,159915',scope:'etf'
+  }:{
+    row:'wlRow',add:'wlAdd',msg:'wlMsg',onOpen:'loadStockByCode',ph:'加自选股，如 600633,000967',scope:'stock'
+  };
   try{
-    const w=await j('/api/watchlist');
+    const w=await j('/api/watchlist?scope='+S.scope);
     const wl=w.quotes||[];
-    const wrow=$('wlRow');
-    if(wl.length)wrow.innerHTML=wl.map(x=>'<div style="cursor:pointer" onclick="loadStockByCode(\''+x.code+'\')"><div class="k">'+esc(x.name)+' '+esc(x.code)+'</div><div class="v" style="'+pctCls(x.pct_chg)+'">'+fmtPrice(x.close)+' <span style="font-size:12px">'+fmtPct(x.pct_chg)+'</span></div><div class="wl-del" onclick="event.stopPropagation();delWatch(\''+x.code+'\')" title="移除">✕</div></div>').join('');
-    else wrow.innerHTML='<span class="hint">（空，下方添加自选）</span>';
+    const wrow=$(S.row);
+    if(wl.length)wrow.innerHTML=wl.map(x=>'<div style="cursor:pointer" onclick="'+S.onOpen+'(\''+x.code+'\',\''+S.scope+'\')"><div class="k">'+esc(x.name)+' '+esc(x.code)+'</div><div class="v" style="'+pctCls(x.pct_chg)+'">'+fmtPrice(x.close)+' <span style="font-size:12px">'+fmtPct(x.pct_chg)+'</span></div><div class="wl-del" onclick="event.stopPropagation();delWatch(\''+x.code+'\',\''+S.scope+'\')" title="移除">✕</div></div>').join('');
+    else wrow.innerHTML='<span class="hint">（空，下方添加'+(scope==='etf'?' ETF':'自选股')+'）</span>';
   }catch(e){}
 }
-async function delWatch(code){
+async function delWatch(code,scope){
+  const msg=scope==='etf'?'etfWlMsg':'wlMsg';
   try{
-    const cur=await j('/api/watchlist');
+    const cur=await j('/api/watchlist?scope='+scope);
     const codes=(cur.codes||[]).filter(c=>c!==code);
-    const r=await j('/api/watchlist?action=set&codes='+encodeURIComponent(codes.join(',')));
-    $('wlMsg').textContent='已移除 '+code;
-    loadWatchlist();
-  }catch(e){$('wlMsg').textContent='移除失败: '+e}
+    const r=await j('/api/watchlist?action=set&scope='+scope+'&codes='+encodeURIComponent(codes.join(',')));
+    $(msg).textContent='已移除 '+code;
+    loadWatchlist(scope);
+  }catch(e){$(msg).textContent='移除失败: '+e}
 }
-async function addWatch(){
-  const codes=$('wlAdd').value.trim();if(!codes)return;
+async function addWatch(scope){
+  const addId=scope==='etf'?'etfWlAdd':'wlAdd';
+  const msg=scope==='etf'?'etfWlMsg':'wlMsg';
+  const codes=$(addId).value.trim();if(!codes)return;
   try{
-    const cur=await j('/api/watchlist');
+    const cur=await j('/api/watchlist?scope='+scope);
     const merged=[...new Set((cur.codes||[]).concat(codes.split(/[,，\s]+/)))];
-    const r=await j('/api/watchlist?action=set&codes='+encodeURIComponent(merged.join(',')));
-    $('wlMsg').textContent='已保存 '+r.codes.length+' 只';
-    $('wlAdd').value='';
-    loadWatchlist();
-  }catch(e){$('wlMsg').textContent='保存失败: '+e}
+    const r=await j('/api/watchlist?action=set&scope='+scope+'&codes='+encodeURIComponent(merged.join(',')));
+    // r.codes 是全量列表；消息按当前 scope 过滤显示本板块条目数（口径同后端 _classify_code）
+    const isEtf=c=>/^(51|52|56|58)/.test(c)||c.slice(0,3)==='159';
+    const inScope=r.codes.filter(c=>scope==='etf'?isEtf(c):!isEtf(c));
+    $(msg).textContent='已保存 '+inScope.length+' 只';
+    $(addId).value='';
+    loadWatchlist(scope);
+  }catch(e){$(msg).textContent='保存失败: '+e}
 }
 async function doQuery(){
   const q=$('qtype').value;
@@ -3071,7 +3222,8 @@ let _stockRows=[];   // 当前排行数据（供搜索/联动）
 function loadResearchOnce(){
   if(_rsLoaded){return}
   _rsLoaded=true;
-  loadWatchlist();
+  loadWatchlist('stock');
+  loadWatchlist('etf');
   loadResearchStatus();
   loadResearchMarket();
   loadFactors();
@@ -3235,7 +3387,7 @@ function factorRow(r,i){
   const f=$('fFactor').value;
   const val=f==='vr520'?fmtNum(r[f],2):fmtPctShort(r[f]);
   const pct=r[f+'_pct'];
-  return `<tr class="hr-row" onclick="loadStockByCode('${r.code}')">
+  return `<tr class="hr-row" onclick="openRankStock('${r.code}')">
     <td>${r.rank!=null?r.rank:i+1}</td><td>${esc(r.code)}</td><td>${esc(r.name)}</td>
     <td style="font-weight:700">${val}</td>
     <td>${pct!=null?Math.round(pct)+'%':'—'}</td>
@@ -3247,10 +3399,17 @@ function factorRow(r,i){
 function factorCard(r){
   const f=$('fFactor').value;
   const val=f==='vr520'?fmtNum(r[f],2):fmtPctShort(r[f]);
-  return `<div class="f-card" onclick="loadStockByCode('${r.code}')">
+  return `<div class="f-card" onclick="openRankStock('${r.code}')">
     <div class="r1"><span style="font-weight:700">${r.rank!=null?r.rank:i+1}. ${esc(r.name)} ${esc(r.code)}</span><span style="font-weight:700;color:var(--brand)">${val}</span></div>
     <div class="r2"><span>分位 ${r[f+'_pct']!=null?Math.round(r[f+'_pct'])+'%':'—'}</span><span style="color:${(r.pct_chg||0)>0?'var(--ok)':(r.pct_chg||0)<0?'var(--err)':'var(--muted)'}">${fmtPct(r.pct_chg)}</span><span>收盘 ${fmtNum(r.close)}</span></div>
   </div>`;
+}
+function openRankStock(code){
+  // 从排行榜跳转：按当前排行榜 scope（全部股票/ETF）切到对应研究板块
+  const scope=$('fScope').value==='etf'?'etf':'stock';
+  const tabBtn=document.querySelector('[data-tab="'+scope+'"]');
+  if(tabBtn)showTab(scope,tabBtn);
+  loadStockByCode(code,scope);
 }
 function rebuildResearch(){
   if(!confirm('重新计算全市场因子？（后台执行，可能耗时数分钟）'))return;
@@ -3259,36 +3418,57 @@ function rebuildResearch(){
   }catch(e){toast('启动失败: '+e)}
 }
 
-// 个股研究
-function loadStockByCode(code){
-  $('rsCode').value=code;
-  $('rsMsg').textContent='';
-  const det=$('rsDetail');det.style.display='block';
-  $('rsEmpty').style.display='none';
-  const el=$('rsDetail').closest('.card');
+// ==================== 个股/ETF 研究（scope: stock|etf） ====================
+// DOM id 前缀：个股 rs* / kchart / tchart / wlRow；ETF etf* / etfKchart / etfTchart / etfWlRow
+const RS_SCOPE={
+  stock:{code:'rsCode',msg:'rsMsg',empty:'rsEmpty',detail:'rsDetail',name:'rsName',date:'rsDate',px:'rsPx',vol:'rsVol',
+         factors:'rsFactors',period:'rsPeriod',months:'rsMonths',ma:'rsMA',kchart:'kchart',tchart:'tchart',title:'日K/周K/月K'},
+  etf:{code:'etfCode',msg:'etfMsg',empty:'etfEmpty',detail:'etfDetail',name:'etfName',date:'etfDate',px:'etfPx',vol:'etfVol',
+       factors:'etfFactors',period:'etfPeriod',months:'etfMonths',ma:'etfMA',kchart:'etfKchart',tchart:'etfTchart',title:'日K/周K/月K'},
+};
+let kchart=null,_tchart=null,etfKchart=null,etfTchart=null;
+window._rsStock={};  // {scope:{code,trend,klines,period}}
+
+function loadStockByCode(code,scope){
+  const S=RS_SCOPE[scope||'stock'];
+  $(S.code).value=code;
+  $(S.msg).textContent='';
+  const det=$(S.detail);det.style.display='block';
+  $(S.empty).style.display='none';
+  const el=det.closest('.card');
   if(el)el.scrollIntoView({behavior:'smooth',block:'start'});
-  loadStock();
+  loadStock(scope);
 }
-async function loadStock(){
-  const code=$('rsCode').value.trim();
-  if(!code||!/^\d{6}$/.test(code)){$('rsMsg').textContent='请输入 6 位代码';return}
-  $('rsMsg').textContent='加载中…';
-  // 展开详情区（与 loadStockByCode 一致）：否则 K 线图在 display:none 容器中
-  // 初始化会被 ECharts 压成 100px 宽，且后续 setOption 不会自动重排。
-  const det=$('rsDetail');det.style.display='block';
-  $('rsEmpty').style.display='none';
+async function loadStock(scope){
+  const S=RS_SCOPE[scope||'stock'];
+  const code=$(S.code).value.trim();
+  if(!code||!/^\d{6}$/.test(code)){$(S.msg).textContent='请输入 6 位代码';return}
+  $(S.msg).textContent='加载中…';
+  // 展开详情区（K 线图在 display:none 容器初始化会被压成 100px 宽）
+  const det=$(S.detail);det.style.display='block';
+  $(S.empty).style.display='none';
+  const period=$(S.period).value||'day';
   try{
-    const d=await j('/api/research/stock?code='+code);
-    if(d.error){$('rsMsg').textContent=d.error;return}
-    $('rsMsg').textContent='';
-    renderStock(d);
-  }catch(e){$('rsMsg').textContent='加载失败: '+e}
+    const d=await j('/api/research/stock?code='+code+'&period='+period+'&adj=qfq');
+    if(d.error){$(S.msg).textContent=d.error;return}
+    $(S.msg).textContent='';
+    renderStock(d,scope);
+  }catch(e){$(S.msg).textContent='加载失败: '+e}
 }
-function renderStock(d){
-  $('rsName').textContent=d.name+' '+d.code;
-  $('rsDate').textContent=fmtYMD(d.date);
-  $('rsPx').innerHTML=fmtNum(d.close)+' <span style="color:'+pctCls(d.pct_chg)+';font-size:13px">'+fmtPct(d.pct_chg)+'</span>';
-  $('rsVol').textContent=(d.volume!=null?fmtAmount(d.volume)+' / ':'—')+(d.amount!=null?fmtAmount(d.amount):'');
+// 成交量：原始单位为股，A 股习惯展示为手（÷100）
+function fmtHands(v){
+  if(v==null)return '—';
+  const hands=v/100;
+  if(hands>=1e8)return (hands/1e8).toFixed(2)+' 亿手';
+  if(hands>=1e4)return (hands/1e4).toFixed(2)+' 万手';
+  return Math.round(hands).toLocaleString('zh-CN')+' 手';
+}
+function renderStock(d,scope){
+  const S=RS_SCOPE[scope||'stock'];
+  $(S.name).textContent=d.name+' '+d.code;
+  $(S.date).textContent=fmtYMD(d.date);
+  $(S.px).innerHTML=fmtNum(d.close)+' <span style="color:'+pctCls(d.pct_chg)+';font-size:13px">'+fmtPct(d.pct_chg)+'</span>';
+  $(S.vol).textContent=(d.volume!=null?fmtHands(d.volume)+' / ':'—')+(d.amount!=null?fmtAmount(d.amount):'');
   const f=d.factors||{},p=d.percentiles||{};
   const items=[
     ['20 日动量',fmtPctShort(f.mom20),p.mom20_pct],
@@ -3296,57 +3476,66 @@ function renderStock(d){
     ['5/20 日量比',fmtNum(f.vr520,2),p.vr520_pct],
     ['60 日回撤',fmtPctShort(f.dd60),p.dd60_pct],
   ];
-  $('rsFactors').innerHTML=items.map(([l,v,pc])=>`<div class="rs-it"><div class="lbl">${l}</div><div class="v">${v}<span class="hint" style="font-size:11px">${pc!=null?' 分位 '+Math.round(pc)+'%':'（分位计算中）'}</span></div></div>`).join('');
-  window._rsStock={code:d.code,trend:d.trend||[],klines:d.klines||[]};
-  renderStockKline();
-  renderTrend();
+  $(S.factors).innerHTML=items.map(([l,v,pc])=>`<div class="rs-it"><div class="lbl">${l}</div><div class="v">${v}<span class="hint" style="font-size:11px">${pc!=null?' 分位 '+Math.round(pc)+'%':'（分位计算中）'}</span></div></div>`).join('');
+  if(!window._rsStock)window._rsStock={};
+  window._rsStock[scope]= {code:d.code,trend:d.trend||[],klines:d.klines||[],period:d.period||'day'};
+  renderStockKline(scope);
+  renderTrend(scope);
 }
-let kchart=null;
-function renderStockKline(){
-  if(!window._rsStock)return;
-  const rows=window._rsStock.klines||[];
-  const months=parseInt($('rsMonths').value||'3');
-  const cut=rows.length-months*21;
+const PERIOD_LABEL={day:'日K',week:'周K',month:'月K'};
+function renderStockKline(scope){
+  const S=RS_SCOPE[scope||'stock'];
+  const st=window._rsStock&&window._rsStock[scope];
+  if(!st)return;
+  const rows=st.klines||[];
+  const months=parseInt($(S.months).value||'3');
+  // 周期不同每根代表天数不同：日1/周5/月21
+  const per={day:1,week:5,month:21}[st.period||'day']||1;
+  const cut=rows.length-months*21/per;
   const k=rows.slice(Math.max(0,cut));
   if(!k.length){return}
   const dates=k.map(r=>String(r.date)),closes=k.map(r=>+r.close);
   const kd=k.map(r=>[+r.open,+r.close,+r.low,+r.high]);
-  const showMA=$('rsMA').checked;
+  const showMA=$(S.ma).checked;
   const series=[
     {name:'K线',type:'candlestick',data:kd,
      itemStyle:{color:'#F87171',color0:'#4ADE80',borderColor:'#F87171',borderColor0:'#4ADE80'}},
-    {name:'成交量',type:'bar',xAxisIndex:1,yAxisIndex:1,data:k.map(r=>r.volume||0),itemStyle:{color:'#38BDF8'}}
+    {name:'成交量(手)',type:'bar',xAxisIndex:1,yAxisIndex:1,data:k.map(r=>(r.volume||0)/100),itemStyle:{color:'#38BDF8'}}
   ];
   if(showMA){
     series.push({name:'MA5',type:'line',data:ma(closes,5),smooth:true,showSymbol:false,lineStyle:{width:1,color:'#FBBF24'}});
     series.push({name:'MA20',type:'line',data:ma(closes,20),smooth:true,showSymbol:false,lineStyle:{width:1,color:'#A78BFA'}});
     series.push({name:'MA60',type:'line',data:ma(closes,60),smooth:true,showSymbol:false,lineStyle:{width:1,color:'#8FA2BC'}});
   }
-  if(!kchart)kchart=echarts.init($('kchart'),'dark');
-  kchart.setOption({
+  let ch=scope==='etf'?etfKchart:kchart;
+  if(!ch){ch=echarts.init($(S.kchart),'dark');if(scope==='etf')etfKchart=ch;else kchart=ch;}
+  ch.setOption({
     backgroundColor:'transparent',
-    title:{text:window._rsStock.code+' 日K（不复权）',left:8,top:4,textStyle:{fontSize:13,color:'#8FA2BC'}},
-    tooltip:{trigger:'axis',axisPointer:{type:'cross'}},
+    title:{text:st.code+' '+(PERIOD_LABEL[st.period]||'日K')+'（前复权）',left:8,top:4,textStyle:{fontSize:13,color:'#8FA2BC'}},
+    tooltip:{trigger:'axis',axisPointer:{type:'cross'},
+      valueFormatter:(v,idx)=>idx==null?v:(v!=null&&v>1e4)?(v/1e4).toFixed(2)+' 万手':(v!=null?v.toFixed(0)+' 手':'—')},
     legend:{right:8,top:4,textStyle:{color:'#8FA2BC',fontSize:11}},
     grid:[{left:56,right:14,top:34,height:'60%'},{left:56,right:14,top:'74%',height:'18%'}],
     xAxis:[{type:'category',data:dates,axisLine:{lineStyle:{color:'#1E2C45'}}},
            {type:'category',gridIndex:1,data:dates,axisLabel:{show:false},axisLine:{lineStyle:{color:'#1E2C45'}}}],
     yAxis:[{scale:true,splitLine:{lineStyle:{color:'#162238'}}},
-           {gridIndex:1,splitNumber:2,axisLabel:{show:false},splitLine:{show:false}}],
+           {gridIndex:1,splitNumber:2,axisLabel:{formatter:v=>v>=1e4?(v/1e4).toFixed(1)+'万':v+'',color:'#8FA2BC',fontSize:10},splitLine:{show:false}}],
     dataZoom:[{type:'inside',xAxisIndex:[0,1],start:30,end:100}],
     series
   });
   // 容器从 display:none 变为可见后必须显式 resize，否则画布停留在初始化时的 100px 宽
-  kchart.resize();
+  ch.resize();
 }
-let _tchart=null;
-function renderTrend(){
-  if(!window._rsStock)return;
-  const t=window._rsStock.trend||[];
+function renderTrend(scope){
+  const S=RS_SCOPE[scope||'stock'];
+  const st=window._rsStock&&window._rsStock[scope];
+  if(!st)return;
+  const t=st.trend||[];
   if(!t.length)return;
   const dates=t.map(x=>String(x.date).slice(4));
-  if(!_tchart)_tchart=echarts.init($('tchart'),'dark');
-  _tchart.setOption({
+  let ch=scope==='etf'?etfTchart:_tchart;
+  if(!ch){ch=echarts.init($(S.tchart),'dark');if(scope==='etf')etfTchart=ch;else _tchart=ch;}
+  ch.setOption({
     backgroundColor:'transparent',
     tooltip:{trigger:'axis'},
     legend:{right:4,top:0,textStyle:{color:'#8FA2BC',fontSize:11}},
@@ -3359,8 +3548,7 @@ function renderTrend(){
       {name:'20日波动率',type:'line',yAxisIndex:1,data:t.map(x=>x.vol20),showSymbol:false,lineStyle:{width:1.5,color:'#F59E0B'}}
     ]
   });
-  // 容器从 display:none 变为可见后必须显式 resize，否则画布停留在初始化时的 100px 宽
-  _tchart.resize();
+  ch.resize();
 }
 function ma(data,n){return data.map((v,i)=>i<n-1?null:+((data.slice(i-n+1,i+1).reduce((a,b)=>a+b,0)/n).toFixed(3)))}
 
@@ -3395,6 +3583,8 @@ window.addEventListener('resize',()=>{
   if(window._wchart2)window._wchart2.resize();
   if(kchart)kchart.resize();
   if(_tchart)_tchart.resize();
+  if(etfKchart)etfKchart.resize();
+  if(etfTchart)etfTchart.resize();
 });
 refresh();setInterval(()=>refresh(),4000);
 </script></body></html>"""
@@ -3605,11 +3795,19 @@ class Handler(BaseHTTPRequestHandler):
         if not code or not (code.isdigit() and len(code) == 6):
             self._send(400, json.dumps({"error": "缺少或非法 code（需 6 位数字）"}))
             return
-        # 个股研究：直连 stockdb 实时查询（单股，快），不依赖全市场缓存
+        period = q.get("period", ["day"])[0]
+        if period not in ("day", "week", "month"):
+            period = "day"
+        adj = q.get("adj", ["qfq"])[0]
+        if adj not in ("qfq", "hfq", "none"):
+            adj = "qfq"
+        # 个股/ETF 研究：直连 stockdb 实时查询（单标的，快），不依赖全市场缓存
         import urllib.request, urllib.parse
         from datetime import datetime as _dt, timedelta as _td
         today = _dt.now()
-        months = _month_prefixes((today - _td(days=190)).strftime("%Y%m%d"),
+        # 拉取范围随周期扩大：日线~7个月 / 周线~3年 / 月线~5年（聚合后均≥60 根）
+        lookback_days = {"day": 190, "week": 1100, "month": 1850}.get(period, 190)
+        months = _month_prefixes((today - _td(days=lookback_days)).strftime("%Y%m%d"),
                                  today.strftime("%Y%m%d"))
         rows = []
         for prefix in months:
@@ -3624,17 +3822,20 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, json.dumps({"error": f"未找到 {code} 的日K数据"}, ensure_ascii=False))
             return
         rows.sort(key=_bar_date)
-        bars = rows[-140:]  # 最近约 7 个月，足够 60 日回撤
+        # 前复权/后复权后按周期聚合（不复权则直接聚合）
+        adj_rows = apply_adjust(rows, _adjust_map(code), adj)
+        period_rows = _aggregate_kline(adj_rows, period)
+        bars = period_rows[-160:]  # 足够展示（日160根≈8月，周160≈3年，月160≈13年）
         factors = compute_factors(bars)
-        name = _stock_name(bars, code)
+        name = _stock_name(rows, code)
         close = bars[-1].get("close")
         pct = bars[-1].get("pct_chg")
         latest_date = _bar_date(bars[-1])
-        # 最新日K明细（K线图表用）
+        # K线明细（K线图表用）
         krows = [{"date": b.get("date"), "open": b.get("open"), "close": b.get("close"),
                   "high": b.get("high"), "low": b.get("low"), "volume": b.get("volume")}
                  for b in bars]
-        # 因子走势（近60日 20日动量 / 20日波动率）
+        # 因子走势（近60根 20日动量 / 20日波动率，按当前周期）
         trend = []
         for i in range(max(0, len(bars) - 60), len(bars)):
             seg = bars[:i + 1]
@@ -3653,6 +3854,7 @@ class Handler(BaseHTTPRequestHandler):
             "code": code, "name": name, "date": str(latest_date), "close": close,
             "pct_chg": pct, "volume": bars[-1].get("volume"),
             "amount": bars[-1].get("amount"),
+            "period": period, "adj": adj,
             "factors": factors, "percentiles": pcts,
             "klines": krows, "trend": trend,
         }, ensure_ascii=False))
@@ -3667,15 +3869,18 @@ class Handler(BaseHTTPRequestHandler):
     def _watchlist(self):
         q = parse_qs(urlparse(self.path).query)
         action = q.get("action", [""])[0]
+        scope = q.get("scope", [""])[0]
+        if scope not in ("stock", "etf"):
+            scope = None
         if action == "set":
             codes_raw = q.get("codes", [""])[0]
             codes = [c for c in codes_raw.split(",") if c.strip()]
-            codes = save_watchlist(codes)
+            codes = save_watchlist(codes, scope)
             self._send(200, json.dumps({"codes": codes}, ensure_ascii=False))
             return
-        codes = load_watchlist()
+        codes = load_watchlist(scope)
         quotes = latest_quotes(codes)
-        self._send(200, json.dumps({"codes": codes, "quotes": quotes,
+        self._send(200, json.dumps({"codes": codes, "scope": scope, "quotes": quotes,
                                     "indices": index_snapshot()}, ensure_ascii=False))
 
     def _log(self):

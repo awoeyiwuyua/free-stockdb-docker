@@ -548,5 +548,117 @@ class TestReloadStockdb(unittest.TestCase):
         self.assertEqual(ok, [])
 
 
+class TestAggregateKline(unittest.TestCase):
+    """周/月 K 聚合：由日 K 按自然周/月聚合 OHLCV。"""
+
+    def _day(self, date, o, c, h, l, v=1000):
+        return {"date": date, "open": o, "close": c, "high": h, "low": l,
+                "volume": v, "amount": v * 10, "pct_chg": 0.0}
+
+    def test_day_returns_unchanged(self):
+        rows = [self._day(20260810, 10, 11, 11, 10)]
+        self.assertEqual(mod._aggregate_kline(rows, "day"), rows)
+
+    def test_week_aggregation(self):
+        # 2026-08-10(周一)~08-14(周五) 同属自然周 → 1 根周K
+        rows = [
+            self._day(20260810, 10.0, 10.5, 10.8, 9.9, 100),
+            self._day(20260811, 10.5, 10.2, 10.9, 10.0, 200),
+            self._day(20260812, 10.2, 10.6, 11.2, 10.1, 300),
+            self._day(20260813, 10.6, 10.9, 11.0, 10.4, 150),
+            self._day(20260814, 10.9, 11.2, 11.5, 10.8, 250),
+        ]
+        out = mod._aggregate_kline(rows, "week")
+        self.assertEqual(len(out), 1)
+        w = out[0]
+        self.assertEqual(w["open"], 10.0)     # 周首日开
+        self.assertEqual(w["close"], 11.2)    # 周末日收
+        self.assertEqual(w["high"], 11.5)     # 周内最高
+        self.assertEqual(w["low"], 9.9)       # 周内最低
+        self.assertEqual(w["volume"], 1000)   # 周内求和
+        self.assertEqual(w["date"], 20260814)  # 取周末日
+
+    def test_week_two_groups(self):
+        # 08-17 是下一周周一 → 分两组
+        rows = [
+            self._day(20260814, 10, 11, 11, 10),   # 周五（上周）
+            self._day(20260817, 11, 12, 12, 10.5),  # 下周一
+        ]
+        out = mod._aggregate_kline(rows, "week")
+        self.assertEqual(len(out), 2)
+        self.assertEqual(out[0]["date"], 20260814)
+        self.assertEqual(out[1]["date"], 20260817)
+
+    def test_month_aggregation(self):
+        rows = [
+            self._day(20260731, 10, 10.5, 10.8, 9.9, 100),
+            self._day(20260803, 10.5, 11.0, 11.2, 10.4, 200),
+            self._day(20260828, 11.0, 11.8, 12.0, 10.9, 300),
+        ]
+        out = mod._aggregate_kline(rows, "month")
+        self.assertEqual(len(out), 2)
+        # 7 月组
+        self.assertEqual(out[0]["open"], 10.0)
+        self.assertEqual(out[0]["close"], 10.5)
+        # 8 月组：首日 08-03 开、末日 08-28 收
+        self.assertEqual(out[1]["open"], 10.5)
+        self.assertEqual(out[1]["close"], 11.8)
+        self.assertEqual(out[1]["high"], 12.0)
+        self.assertEqual(out[1]["low"], 10.4)
+        self.assertEqual(out[1]["volume"], 500)
+        self.assertEqual(out[1]["date"], 20260828)
+
+    def test_empty_input(self):
+        self.assertEqual(mod._aggregate_kline([], "week"), [])
+
+
+class TestWatchlistScope(unittest.TestCase):
+    """自选列表按代码段分流（个股/ETF 独立板块互不覆盖）。"""
+
+    def setUp(self):
+        self._orig_file = mod.WATCHLIST_FILE
+        import tempfile
+        self._tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
+        mod.WATCHLIST_FILE = type("P", (), {"exists": lambda self: True,
+                                            "read_text": lambda self, **k: "[]",
+                                            "write_text": lambda self, s, **k: None})()
+        # 用真实文件模拟，简单起见直接用临时路径
+        mod.WATCHLIST_FILE = __import__("pathlib").Path(self._tmp.name)
+        mod.WATCHLIST_FILE.write_text("[]", encoding="utf-8")
+
+    def tearDown(self):
+        mod.WATCHLIST_FILE = self._orig_file
+
+    def _codes(self):
+        return mod.load_watchlist(None)
+
+    def test_classify_code(self):
+        self.assertEqual(mod._classify_code("600633"), "stock")
+        self.assertEqual(mod._classify_code("000001"), "stock")
+        self.assertEqual(mod._classify_code("510300"), "etf")
+        self.assertEqual(mod._classify_code("159915"), "etf")
+
+    def test_save_stock_preserves_etf(self):
+        mod.save_watchlist(["600633", "000001"], "stock")
+        self.assertEqual(mod.load_watchlist("stock"), ["600633", "000001"])
+        self.assertEqual(mod.load_watchlist("etf"), [])
+
+    def test_save_etf_preserves_stock(self):
+        mod.save_watchlist(["600633", "000001"], "stock")
+        mod.save_watchlist(["510300", "159915"], "etf")
+        self.assertEqual(mod.load_watchlist("stock"), ["600633", "000001"])
+        self.assertEqual(mod.load_watchlist("etf"), ["510300", "159915"])
+        # 全量包含两者
+        self.assertEqual(sorted(mod.load_watchlist(None)), ["000001", "159915", "510300", "600633"])
+
+    def test_del_in_scope_keeps_other(self):
+        mod.save_watchlist(["600633", "000001"], "stock")
+        mod.save_watchlist(["510300", "159915"], "etf")
+        # stock 删除 600633 不影响 etf
+        mod.save_watchlist(["000001"], "stock")
+        self.assertEqual(mod.load_watchlist("stock"), ["000001"])
+        self.assertEqual(mod.load_watchlist("etf"), ["510300", "159915"])
+
+
 if __name__ == "__main__":
     unittest.main()
