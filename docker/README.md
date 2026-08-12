@@ -140,17 +140,17 @@ docker compose start stockdb
 
 1. **拉上游**：本 fork 仓库 GitHub 页 → `Sync fork` → `Update branch`（上游发新版时）
 2. **改版本号**：`docker/Dockerfile` 顶部 `ARG VERSION=0.3.1` → 新版号；**SHA256 必须同步更新**（上游 Releases 页面 `.SHA256.txt`）；若上游 tag 名变化，同步改 `ARG GH_TAG_ENCODED`
-3. **重建镜像**：`Actions → Run workflow`（构建 `:新版本` tag；旧 tag 保留）
-4. **NAS 升级**：compose 里 `image: ghcr.io/awoeyiwuyua/free-stockdb:<新版本>` → `docker compose pull && docker compose up -d`（`data/` 卷不动，数据不丢）
+3. **重建镜像**：`Actions → Run workflow`（构建 `:新版本` + `:latest` 双 tag；旧 tag 保留）
+4. **NAS 升级**：compose 已用 `:latest`，无需改配置，直接 `docker compose pull && docker compose up -d` 即拉取最新（`data/` 卷不动，数据不丢）。若想固定某版本，把 compose 里 `image: ...:latest` 改回 `:<具体版本>` 即可
 
 ---
 
 ## 四、回滚
 
 ```bash
-# 把 compose 里 image tag 改回旧版本，然后：
+# 把 compose 里 image tag 改回旧版本（如 :0.3.0 / :0.3.1），然后：
 docker compose pull && docker compose up -d
-# 旧 tag 一直保留在 ghcr，天然回滚点
+# 版本 tag 一直保留在 ghcr，天然回滚点；:latest 仅指向最近一次构建
 ```
 
 ---
