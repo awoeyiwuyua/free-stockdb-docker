@@ -47,7 +47,7 @@ _last_verify_result: str | None = None  # 最近一次完整性验证结果（pa
 _scheduler_alive = False             # 定时线程心跳（每次循环更新时间戳）
 _scheduler_heartbeat = 0.0           # 定时线程最近一次心跳时间戳（unix）
 _webui_started = time.time()         # webui 进程启动时间戳
-WEBUI_VERSION = "0.2.0"
+WEBUI_VERSION = "0.3.0"
 
 HISTORY_FILE = DATA_DIR / "sync_history.json"
 SCHEDULE_FILE = DATA_DIR / "sync_schedule.json"
@@ -353,6 +353,19 @@ def parse_sync_counts(stdout: str) -> dict:
             except Exception:
                 pass
     return {"downloads": d, "deletes": r}
+
+
+def _sync_effective(before_date, after_date, counts) -> bool:
+    """判定一次同步是否真正生效（纯函数，可单测）。
+
+    同步器（数据更新）退出码 0 不代表有增量：镜像清单协议升级/清单损坏等
+    情况下，更新器可能 0 下载且不改数据（2026-08-12 事故：manifest 解析失败
+    零下载却退出码 0）。以「待下载数>0」或「本地数据日期确实前进」为准——
+    两者都无则视为未生效，避免 webui 误报同步成功。
+    """
+    if counts and counts.get("downloads") not in (None, 0):
+        return True
+    return bool(before_date) and bool(after_date) and after_date > before_date
 
 
 def data_latest_date() -> str | None:
@@ -1855,6 +1868,11 @@ def run_sync(hot: bool = True, trigger: str = "manual", retry: bool = False) -> 
         # 记录同步历史（时间/触发来源/模式/结果/耗时/下载删除数/数据最新日期/失败原因）
         try:
             counts = parse_sync_counts(_last_sync_stdout)
+            after_date = data_latest_date()
+            effective = _sync_effective(before_date, after_date, counts)
+            warn = None
+            if _sync_state.get("exit_code") == 0 and not effective:
+                warn = "同步未生效：下载 0 文件且数据未更新（镜像清单可能已变更）"
             append_history({
                 "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "trigger": _sync_state.get("trigger", "manual"),
@@ -1866,12 +1884,13 @@ def run_sync(hot: bool = True, trigger: str = "manual", retry: bool = False) -> 
                 "verified": _last_verify_result,
                 "duration_sec": round(time.time() - _sync_state["last_start"], 1)
                 if _sync_state.get("last_start") else None,
-                "data_latest": data_latest_date(),
+                "data_latest": after_date,
+                "warn": warn,
             })
             if _sync_state.get("trigger", "").startswith("scheduled"):
                 _update_schedule_trigger_exit(_sync_state.get("exit_code"), retry=retry)
             # 同步成功后使市场研究缓存失效并后台重算（仅当数据确实更新）
-            if _sync_state.get("exit_code") == 0:
+            if _sync_state.get("exit_code") == 0 and effective:
                 invalidate_research_cache(reason="同步成功")
         except Exception:
             pass
@@ -2283,7 +2302,9 @@ tr.hr-row{cursor:pointer}
 tr.hr-row:hover{background:rgba(56,189,248,.04)}
 .hr-detail{background:var(--panel2);font-size:12px;color:var(--muted)}
 .dot-ok{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--ok);margin-right:6px}
+.dot-warn{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--warn);margin-right:6px}
 .dot-fail{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--err);margin-right:6px}
+.warn-text{color:var(--warn);font-size:12px;margin-top:4px}
 .hr-cards{display:none}
 @media(max-width:760px){table{display:none}.hr-cards{display:block}}
 .hr-card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:12px 14px;margin:10px 0}
@@ -2823,7 +2844,8 @@ async function loadHistory(){
     if(tEl){
       if(_hist.length){
         const x=_hist[0];
-        if(x.exit_code===0)tEl.textContent='同步任务：上次成功 '+fmtClock(x.ts);
+        if(x.exit_code===0&&x.warn)tEl.innerHTML='同步任务：<span style="color:var(--warn)">上次未生效 '+fmtClock(x.ts)+'</span> · <span style="color:var(--muted)">'+esc(x.warn)+'</span>';
+        else if(x.exit_code===0)tEl.textContent='同步任务：上次成功 '+fmtClock(x.ts);
         else if(x.exit_code==null)tEl.textContent='同步任务：进行中';
         else tEl.innerHTML='同步任务：<span style="color:var(--err)">上次失败 '+fmtClock(x.ts)+'</span> · <span style="color:var(--muted)">'+esc(x.reason||('退出码 '+x.exit_code))+'</span>';
       }else tEl.textContent='';
@@ -2835,6 +2857,7 @@ async function loadHistory(){
 }
 function trigLabel(t){return t==='scheduled'?'⏰定时':t==='scheduled-retry'?'↻定时·重试':'手动'}
 function resultCell(x){
+  if(x.exit_code===0&&x.warn)return '<span class="dot-warn"></span>未生效';
   if(x.exit_code===0)return '<span class="dot-ok"></span>成功';
   if(x.exit_code==null)return '<span class="spin" style="width:8px;height:8px;border-width:2px;border-color:var(--brand);border-top-color:transparent"></span>运行中';
   return '<span class="dot-fail"></span>失败';
@@ -2848,11 +2871,12 @@ function historyRow(x,i){
 }
 function historyCard(x){
   const reason=x.reason?(' · '+esc(x.reason)):'';
+  const warnHtml=x.warn?('<div class="warn-text">⚠ '+esc(x.warn)+'</div>'):'';
   return `<div class="hr-card">
     <div class="row1"><span>${resultCell(x)}</span><span class="hint">${trigLabel(x.trigger)}</span></div>
     <div class="row2">${esc((x.ts||'').slice(0,16))} · ${x.mode==='hot'?'热更新':'严格'}</div>
     <div class="row3">${x.downloads!=null?('下载 '+x.downloads+' 个文件 · '):''}${x.verified==='pass'?'校验通过':x.verified==='fail'?'校验失败':x.verified==='skipped'?'未校验':''}${x.duration_sec!=null?(' · '+x.duration_sec+' 秒'):''}${reason}</div>
-    <div class="row3">数据更新至 ${esc(x.data_latest||'—')}</div>
+    <div class="row3">数据更新至 ${esc(x.data_latest||'—')}</div>${warnHtml}
   </div>`;
 }
 function toggleHistDetail(i){
