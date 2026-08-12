@@ -79,6 +79,7 @@ jobs:
           push: true
           tags: |
             ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}
+            ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -117,5 +118,6 @@ jobs:
           push: true
           tags: |
             ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.WEBUI_IMAGE_NAME }}:${{ env.WEBUI_VERSION }}
+            ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.WEBUI_IMAGE_NAME }}:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
