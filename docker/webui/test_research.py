@@ -488,5 +488,65 @@ class TestSyncEffective(unittest.TestCase):
         self.assertFalse(mod._sync_effective(None, "20260812", {"downloads": 0, "deletes": 0}))
 
 
+class TestReloadStockdb(unittest.TestCase):
+    """reload 热重载：向运行中的 stockdb 发命令重载快照（零中断）。"""
+
+    def _fake(self, responses):
+        """构造假 urlopen：按 URL 的 t 参数返回预设 JSON。"""
+        import urllib.request, io
+
+        class FakeResp:
+            def __init__(self, body):
+                self._b = body.encode()
+            def read(self): return self._b
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+
+        class FakeUrlOpener:
+            def __init__(self): self.calls = []
+            def __call__(self, url, timeout=10):
+                self.calls.append(url)
+                for key, body in responses.items():
+                    if ("t=" + key) in url:
+                        return FakeResp(body)
+                raise urllib.error.HTTPError(url, 500, "bad", {}, io.BytesIO())
+
+        return FakeUrlOpener()
+
+    def test_both_remotes_reload(self):
+        opener = self._fake({"0": '{"ok":true,"remote":0}', "1": '{"ok":true,"remote":1}'})
+        import urllib.request
+        orig = urllib.request.urlopen
+        urllib.request.urlopen = opener
+        try:
+            ok = mod.reload_stockdb()
+        finally:
+            urllib.request.urlopen = orig
+        self.assertEqual(sorted(ok), ["0", "1"])
+
+    def test_partial_failure(self):
+        # remote 1 失败 → 只返回成功的 0；不抛异常
+        opener = self._fake({"0": '{"ok":true,"remote":0}', "1": "boom"})
+        import urllib.request
+        orig = urllib.request.urlopen
+        urllib.request.urlopen = opener
+        try:
+            ok = mod.reload_stockdb()
+        finally:
+            urllib.request.urlopen = orig
+        self.assertEqual(ok, ["0"])
+
+    def test_all_fail_returns_empty(self):
+        import urllib.request
+        orig = urllib.request.urlopen
+        def boom(*a, **k): raise ConnectionError("conn refused")
+        urllib.request.urlopen = boom
+        try:
+            ok = mod.reload_stockdb()
+        finally:
+            urllib.request.urlopen = orig
+        self.assertEqual(ok, [])
+
+
 if __name__ == "__main__":
     unittest.main()

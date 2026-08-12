@@ -1668,6 +1668,28 @@ def wait_stockdb_ready(timeout: float = 60.0) -> bool:
     return False
 
 
+def reload_stockdb() -> list[str]:
+    """向运行中的 stockdb 发送 reload 命令，热重载 dataN 快照（零中断）。
+
+    上游同步器设计为同步后向本地 127.0.0.1:7899 发 GET /?cmd=reload&t=<remote>
+    让运行中的服务重载 LevelDB（同步日志 "reload 1 skipped: local program is
+    unavailable" 即因容器内 127.0.0.1 指向自身而非 stockdb）。webui 容器内代发
+    到 STOCKDB_HOST 即可。返回成功重载的 remote 列表（如 ["0","1"]）。
+    """
+    import urllib.request, urllib.parse
+    ok: list[str] = []
+    for remote in ("0", "1"):
+        try:
+            url = f"http://{STOCKDB_HOST}:{STOCKDB_PORT}/?cmd=reload&t={remote}"
+            with urllib.request.urlopen(url, timeout=10) as resp:
+                body = resp.read().decode("utf-8", "replace")
+            if '"ok":true' in body or '"ok": true' in body:
+                ok.append(remote)
+        except Exception:
+            continue
+    return ok
+
+
 def container_logs(tail: int = 150) -> str:
     """读取 stockdb 容器日志尾部。
 
@@ -1839,20 +1861,26 @@ def run_sync(hot: bool = True, trigger: str = "manual", retry: bool = False) -> 
                 _sync_state["phase"] = "verifying"
                 log("→ 热更新完成，验证数据完整性 ...")
                 # 上游新架构（多点数据源）下增量下载进 data1/LevelDB，
-                # 运行中的 stockdb 进程仍持旧快照，须重启才加载新数据。
-                # 无新文件（downloads=0）时数据未变，不必重启。
+                # 运行中的 stockdb 进程仍持旧快照。优先用上游 reload 命令热重载
+                # （零中断）；reload 不可用（老版本/连接失败）则降级重启。
+                # 无新文件（downloads=0）时数据未变，跳过加载。
                 counts = parse_sync_counts(_last_sync_stdout)
                 if counts.get("downloads", 0) > 0 or counts.get("downloads") is None:
                     _sync_state["phase"] = "restarting"
-                    log("→ 检测到新数据文件，重启 stockdb 加载新快照 ...")
-                    try:
-                        container_restart()
-                        log("  ✅ stockdb 已重启")
-                        if not wait_stockdb_ready():
-                            log("  ⚠️ 重启后服务未在 60s 内就绪，验证可能失败")
-                    except Exception as exc:
-                        log(f"  ❌ 重启失败：{exc}")
-                    _sync_state["phase"] = "verifying"
+                    reloaded = reload_stockdb()
+                    if reloaded:
+                        _sync_state["phase"] = "verifying"
+                        log(f"  ✅ stockdb 热重载成功（remote {','.join(reloaded)}），零中断")
+                    else:
+                        log("→ reload 不可用（老版本/命令失败），降级重启 stockdb 加载新快照 ...")
+                        try:
+                            container_restart()
+                            log("  ✅ stockdb 已重启")
+                            if not wait_stockdb_ready():
+                                log("  ⚠️ 重启后服务未在 60s 内就绪，验证可能失败")
+                        except Exception as exc:
+                            log(f"  ❌ 重启失败：{exc}")
+                        _sync_state["phase"] = "verifying"
                 problems = _verify_data(before_date)
                 if problems:
                     _last_verify_result = "fail"
@@ -2286,6 +2314,10 @@ font-size:15px;padding:8px 16px;cursor:pointer;white-space:nowrap}
 .k{color:var(--muted);font-size:12px;margin-bottom:2px}
 .v{font-size:16px;font-weight:600}
 .row{display:flex;gap:16px;flex-wrap:wrap}
+#wlRow>div{position:relative;padding:8px 10px;border:1px solid var(--line);border-radius:8px;min-width:120px;transition:border-color .15s}
+#wlRow>div:hover{border-color:rgba(56,189,248,.4)}
+.wl-del{position:absolute;top:2px;right:6px;color:rgba(143,162,188,.45);font-size:11px;cursor:pointer;line-height:1;transition:color .15s}
+.wl-del:hover{color:var(--err)}
 .metrics{display:flex;gap:20px;flex-wrap:wrap}
 .metrics .m{flex:1;min-width:110px}
 .lbl{color:var(--muted);font-size:12px;margin-bottom:2px}
@@ -3000,9 +3032,18 @@ async function loadWatchlist(){
     const w=await j('/api/watchlist');
     const wl=w.quotes||[];
     const wrow=$('wlRow');
-    if(wl.length)wrow.innerHTML=wl.map(x=>'<div style="cursor:pointer" onclick="loadStockByCode(\''+x.code+'\')"><div class="k">'+esc(x.name)+' '+esc(x.code)+'</div><div class="v" style="'+pctCls(x.pct_chg)+'">'+fmtPrice(x.close)+' <span style="font-size:12px">'+fmtPct(x.pct_chg)+'</span></div></div>').join('');
+    if(wl.length)wrow.innerHTML=wl.map(x=>'<div style="cursor:pointer" onclick="loadStockByCode(\''+x.code+'\')"><div class="k">'+esc(x.name)+' '+esc(x.code)+'</div><div class="v" style="'+pctCls(x.pct_chg)+'">'+fmtPrice(x.close)+' <span style="font-size:12px">'+fmtPct(x.pct_chg)+'</span></div><div class="wl-del" onclick="event.stopPropagation();delWatch(\''+x.code+'\')" title="移除">✕</div></div>').join('');
     else wrow.innerHTML='<span class="hint">（空，下方添加自选）</span>';
   }catch(e){}
+}
+async function delWatch(code){
+  try{
+    const cur=await j('/api/watchlist');
+    const codes=(cur.codes||[]).filter(c=>c!==code);
+    const r=await j('/api/watchlist?action=set&codes='+encodeURIComponent(codes.join(',')));
+    $('wlMsg').textContent='已移除 '+code;
+    loadWatchlist();
+  }catch(e){$('wlMsg').textContent='移除失败: '+e}
 }
 async function addWatch(){
   const codes=$('wlAdd').value.trim();if(!codes)return;
@@ -3232,6 +3273,10 @@ async function loadStock(){
   const code=$('rsCode').value.trim();
   if(!code||!/^\d{6}$/.test(code)){$('rsMsg').textContent='请输入 6 位代码';return}
   $('rsMsg').textContent='加载中…';
+  // 展开详情区（与 loadStockByCode 一致）：否则 K 线图在 display:none 容器中
+  // 初始化会被 ECharts 压成 100px 宽，且后续 setOption 不会自动重排。
+  const det=$('rsDetail');det.style.display='block';
+  $('rsEmpty').style.display='none';
   try{
     const d=await j('/api/research/stock?code='+code);
     if(d.error){$('rsMsg').textContent=d.error;return}
@@ -3291,6 +3336,8 @@ function renderStockKline(){
     dataZoom:[{type:'inside',xAxisIndex:[0,1],start:30,end:100}],
     series
   });
+  // 容器从 display:none 变为可见后必须显式 resize，否则画布停留在初始化时的 100px 宽
+  kchart.resize();
 }
 let _tchart=null;
 function renderTrend(){
@@ -3312,6 +3359,8 @@ function renderTrend(){
       {name:'20日波动率',type:'line',yAxisIndex:1,data:t.map(x=>x.vol20),showSymbol:false,lineStyle:{width:1.5,color:'#F59E0B'}}
     ]
   });
+  // 容器从 display:none 变为可见后必须显式 resize，否则画布停留在初始化时的 100px 宽
+  _tchart.resize();
 }
 function ma(data,n){return data.map((v,i)=>i<n-1?null:+((data.slice(i-n+1,i+1).reduce((a,b)=>a+b,0)/n).toFixed(3)))}
 
