@@ -456,5 +456,37 @@ class TestBuildWithPlaceholders(unittest.TestCase):
         self.assertEqual(ma_hist, 10.0)
 
 
+class TestSyncEffective(unittest.TestCase):
+    """同步是否真正生效的判定（零下载且数据未前进 → 未生效，防误报成功）。"""
+
+    def test_downloads_gt_zero_effective(self):
+        # 有下载即生效，即使日期未前进（如补历史）
+        self.assertTrue(mod._sync_effective("20260811", "20260811", {"downloads": 5, "deletes": 0}))
+        self.assertTrue(mod._sync_effective(None, "20260812", {"downloads": 1, "deletes": 0}))
+
+    def test_date_advanced_effective(self):
+        # 日期前进即生效，即使下载数未解析出来（不同版本同步器输出差异）
+        self.assertTrue(mod._sync_effective("20260811", "20260812", {"downloads": None, "deletes": None}))
+        self.assertTrue(mod._sync_effective("20260811", "20260812", {"downloads": 0, "deletes": 0}))
+
+    def test_zero_download_same_date_ineffective(self):
+        # 本次事故场景：manifest 解析失败，0 下载且日期未前进 → 未生效
+        self.assertFalse(mod._sync_effective("20260811", "20260811", {"downloads": 0, "deletes": 0}))
+        self.assertFalse(mod._sync_effective("20260811", "20260811", {"downloads": None, "deletes": None}))
+
+    def test_missing_dates_ineffective_when_no_downloads(self):
+        # 下载数为空且前后日期未知 → 无法证明生效
+        self.assertFalse(mod._sync_effective(None, None, {"downloads": None, "deletes": None}))
+        self.assertFalse(mod._sync_effective(None, None, {"downloads": 0, "deletes": 0}))
+
+    def test_counts_empty_dict(self):
+        self.assertTrue(mod._sync_effective("20260811", "20260812", {}))
+        self.assertFalse(mod._sync_effective("20260811", "20260811", {}))
+
+    def test_before_missing_after_present_no_downloads(self):
+        # 无 before 快照（首次同步失败），无下载 → 不能算成功
+        self.assertFalse(mod._sync_effective(None, "20260812", {"downloads": 0, "deletes": 0}))
+
+
 if __name__ == "__main__":
     unittest.main()

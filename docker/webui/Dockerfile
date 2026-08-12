@@ -25,10 +25,10 @@ RUN set -eu; \
     case "${TARGETARCH}" in \
       amd64) \
         PLATFORM=manylinux-x64; \
-        SHA256=953e2b1efcd06cee8968f14dcb699cd9bd7142897761cc9f6656d7d9364ea09d ;; \
+        SHA256=16eef82d88dceb3724a81701872277a115df7c3cac171fe041eb5de64db8e525 ;; \
       arm64) \
         PLATFORM=alpine-arm64; \
-        SHA256=2799f4a61830868bf6f856942f3dbda67bba4aa51dab5e4fd0b848952269f66b ;; \
+        SHA256=eba14a57d6debf4db57070816b30f7e18374b58f08ce134628e2bbcb98f467b3 ;; \
       *) \
         echo "unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
     esac; \
