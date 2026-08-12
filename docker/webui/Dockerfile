@@ -1,18 +1,24 @@
 # syntax=docker/dockerfile:1
 #
-# free-stockdb webui 容器 — 自建 UI（行情查询 + 同步管理）
+# free-stockdb webui 容器 — 自建 UI（行情查询 + 同步管理 + mydb 私有写入 + 港股）
 #
-# 功能（纯 Python 标准库，零第三方依赖）：
+# 功能（纯 Python 标准库 + pybao 写库，零 pip 第三方依赖）：
 #   - 行情查询：调 stockdb 的 7899 HTTP API（日K/分钟K/复权）
 #   - 同步管理：挂载 docker socket + /data 卷，网页按钮一键完成
 #     「停 stockdb → 容器内跑数据更新（增量同步）→ 重启 stockdb」
-#   - 日志查看：同步过程实时输出 /data/sync.log
+#   - mydb 私有写入：pybao 客户端连 7899 执行 rd.set/mset（自定义表/港股落盘）
+#   - 港股研究：东财/腾讯实时拉取 + 写入 hk日k: 表
 #
-# 与上游零冲突：独立于 free-stockdb 源码，只通过 7899 HTTP 与 docker 交互。
+# 架构说明：
+#   - 基础镜像 python:3.14-alpine（musl）：arm64 发布包的 pybao 是 musl 构建
+#     （依赖 libc.so），NAS(arm64) 可直接加载；amd64 发布包 pybao 是 glibc 构建，
+#     在 alpine 下加载失败时 webui 优雅降级（mydb 写入不可用，A 股功能不受影响）。
+#   - Python 3.14 GIL：上游 3.14t(free-threaded) 的 abi3t 变体实测 ABI 不匹配
+#     （_PyType_FromSlots 符号缺失），待上游修复后评估升级。
 
 ARG VERSION=0.3.1
 
-# ================= 构建阶段：下载 stockdb 发布包取「数据更新」同步器 =================
+# ================= 构建阶段：下载 stockdb 发布包取同步器 + pybao =================
 FROM alpine:3.20 AS build
 
 ARG VERSION
@@ -42,7 +48,7 @@ RUN set -eu; \
     test -x "/out/stockdb/数据更新" || { echo "sync binary missing" >&2; exit 1; }
 
 # ================= 运行时阶段 =================
-FROM python:3.12-alpine
+FROM python:3.14-alpine
 
 # bash：极空间等容器管理 APP 进容器默认执行 /bin/bash，alpine 默认没有会导致
 # "OCI runtime exec failed: /bin/bash not found"。装上后用 APP 终端可正常进入。
@@ -52,9 +58,16 @@ RUN apk add --no-cache tzdata curl bash
 COPY --from=build /out/stockdb/数据更新 /opt/stockdb/数据更新
 # 同步源模板（entrypoint 拷到 /data 供编辑）
 COPY --from=build /out/stockdb/sync_url.txt /opt/stockdb/sync_url.txt
+# pybao 写库（含 stock_sdk.py + 对应架构 stockdb.abi3.so；PYTHONPATH 注入）
+COPY --from=build /out/stockdb/pybao /opt/stockdb/pybao
 
 COPY app.py entrypoint.sh /opt/webui/
 COPY static/ /opt/webui/static/
+
+# uv 运行时：统一 Python 版本管理；容器内 uv 仅作启动器（--no-project 用系统 python）
+RUN pip install --no-cache-dir uv
+
+ENV PYTHONPATH=/opt/stockdb/pybao
 
 WORKDIR /opt/webui
 EXPOSE 8080

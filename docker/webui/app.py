@@ -411,6 +411,257 @@ def _classify_code(code: str) -> str:
     return "other"
 
 
+# ==================== mydb 私有存储写入（pybao 客户端） ====================
+# 上游 stockdb 内置私有存储 ./mydb：HTTP 层只读，写入须用 pybao 客户端
+# （stockdb.abi3.so + stock_sdk.py，随发行包分发，容器内 PYTHONPATH 注入）。
+# 本机开发若未装 pybao，相关接口优雅降级（A 股功能不受影响）。
+
+# 保留表前缀：禁止覆盖上游同步数据，防止与 A 股行情冲突
+_RESERVED_TABLES = ("日k", "分钟k", "复权", "股票代码", "周k", "月k", "板块", "行业", "概念")
+_HK_TABLE = "hk日k"  # 港股日K自定义表（与上游命名空间隔离）
+
+
+def _is_hk_code(code: str) -> bool:
+    """港股代码识别：5 位数字，或带 hk 前缀（如 00700 / hk00700）。"""
+    c = str(code).strip().lower()
+    if c.startswith("hk"):
+        c = c[2:]
+    return c.isdigit() and len(c) == 5
+
+
+def _normalize_hk_code(code: str) -> str:
+    """规范化为 5 位港股代码（00700）。"""
+    c = str(code).strip().lower()
+    if c.startswith("hk"):
+        c = c[2:]
+    return c.zfill(5)
+
+
+def _mydb_import():
+    """惰性导入 pybao 客户端。未安装/加载失败时抛 ImportError（调用方降级）。
+
+    候选路径：容器内 /opt/stockdb/pybao，本地开发 /tmp/pybao_mac 等。
+    """
+    import importlib
+    candidates = ["/opt/stockdb/pybao", "/tmp/pybao_mac"]
+    for p in candidates:
+        try:
+            sys.path.insert(0, p)
+            return importlib.import_module("stockdb")
+        except ImportError:
+            continue
+    raise ImportError("pybao 写库不可用（PYTHONPATH 未注入或平台不兼容）")
+
+
+def _mydb_rd():
+    """获取连接 NAS stockdb 的 pybao 客户端（惰性、缓存）。"""
+    if getattr(_mydb_rd, "_rd", None) is None:
+        mod = _mydb_import()
+        _mydb_rd._rd = mod.init(STOCKDB_HOST, int(STOCKDB_PORT), socket_timeout=5)
+    return _mydb_rd._rd
+
+
+def validate_custom_table(table: str) -> str:
+    """校验自定义表名：禁止覆盖上游保留表，禁止危险字符。返回规范化表名。"""
+    t = str(table or "").strip().strip(":")
+    if not t:
+        raise ValueError("表名不能为空")
+    if not all(ch.isalnum() or ch in "_:-" for ch in t):
+        raise ValueError("表名只能含字母数字与 _:-")
+    for r in _RESERVED_TABLES:
+        if t == r or t.startswith(r + ":"):
+            raise ValueError(f"表名 {t!r} 与上游保留表 {r!r} 冲突，请用自定义命名空间（如 hk日k: / 自定义:）")
+    return t
+
+
+def mydb_write(table: str, items: list[tuple], batch: bool = False) -> dict:
+    """写入 mydb 私有存储。items=[(key, value), ...]。
+
+    注意：pybao 的 rd.set 返回 QueryResult，必须调用 .do() 才真正发送写入
+    （否则只是客户端排队，读不到）。batch 参数保留兼容，统一逐条 .do()。
+    """
+    table = validate_custom_table(table)
+    if not items:
+        raise ValueError("没有可写入的数据")
+    rd = _mydb_rd()
+    result = []
+    for key, value in items:
+        result.append(rd.set(table, key, value).do())
+    # 回读校验（QueryResult 转原生）
+    readback = []
+    for key, _ in items:
+        try:
+            v = rd.get(table, key)
+            if hasattr(v, "keys") and hasattr(v, "all"):
+                v = dict(v)
+            readback.append(v)
+        except Exception:
+            readback.append(None)
+    return {"table": table, "written": len(items), "readback": readback, "result": result}
+
+
+def mydb_read(table: str, key: str = "") -> dict:
+    """读取 mydb 自定义表。key 为空时列出表内全部键值。"""
+    table = validate_custom_table(table)
+    rd = _mydb_rd()
+
+    def _to_py(v):
+        """pybao 返回值可能是 QueryResult，转原生 Python 对象。"""
+        if v is None:
+            return None
+        if hasattr(v, "keys") and hasattr(v, "all"):
+            try:
+                return dict(v)
+            except Exception:
+                pass
+        return v
+
+    if key:
+        val = _to_py(rd.get(table, key))
+        return {"table": table, "key": key, "value": val}
+    keys = rd.keys(table, "*") or []
+    values = {}
+    for k in keys:
+        date_str = str(k).split(":")[-1]
+        try:
+            values[str(k)] = _to_py(rd.get(table, date_str))
+        except Exception:
+            values[str(k)] = None
+    return {"table": table, "keys": keys, "values": values}
+
+
+def mydb_tables() -> list[str]:
+    """列出自定义表名（含保留表前缀过滤）。"""
+    rd = _mydb_rd()
+    keys = rd.keys("*")
+    tables = set()
+    for k in keys:
+        table = str(k).split(":")[0] if ":" in str(k) else str(k)
+        if table and not any(table.startswith(r) for r in _RESERVED_TABLES):
+            tables.add(table)
+    return sorted(tables)
+
+
+# ==================== 港股数据（东财 + 腾讯，写入 hk日k: 表） ====================
+_HK_EM = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+_HK_QT = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+
+
+def _hk_fetch_daily_em(code: str) -> list[dict]:
+    """东财港股日K（含成交额）。返回升序 [{date,open,high,low,close,volume,amount}]。"""
+    import urllib.request, urllib.parse, re
+    secid = "116." + code  # 116 = 港股市场
+    url = (_HK_EM + "?" + urllib.parse.urlencode({
+        "secid": secid, "fields1": "f1,f2,f3,f4,f5,f6",
+        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58",
+        "klt": "101", "fqt": "1", "beg": "0", "end": "20500101"}))
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        data = json.loads(resp.read().decode("utf-8", "replace"))
+    klines = ((data.get("data") or {}).get("klines") or [])
+    rows = []
+    for line in klines:
+        parts = str(line).split(",")
+        if len(parts) < 6:
+            continue
+        date = int(parts[0].replace("-", ""))
+        rows.append({
+            "date": date,
+            "open": float(parts[1]), "close": float(parts[2]),
+            "high": float(parts[3]), "low": float(parts[4]),
+            "volume": float(parts[5]),
+            "amount": float(parts[6]) if len(parts) > 6 else None,
+        })
+    return rows
+
+
+def _hk_fetch_daily_qt(code: str) -> list[dict]:
+    """腾讯港股日K（降级源）。格式 [date, open, close, high, low, volume]。"""
+    import urllib.request, urllib.parse
+    url = (_HK_QT + "?" + urllib.parse.urlencode({
+        "param": f"hk{code},day,,,320,qfq"}))
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0",
+                                               "Referer": "https://gu.qq.com/"})
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        data = json.loads(resp.read().decode("utf-8", "replace"))
+    days = ((data.get("data") or {}).get(f"hk{code}", {}) or {}).get("day") or []
+    rows = []
+    for d in days:
+        if len(d) < 6:
+            continue
+        rows.append({
+            "date": int(d[0].replace("-", "")),
+            "open": float(d[1]), "close": float(d[2]),
+            "high": float(d[3]), "low": float(d[4]),
+            "volume": float(d[5]), "amount": None,
+        })
+    return rows
+
+
+def _hk_fetch_daily(code: str) -> list[dict]:
+    """拉取港股日K（东财优先，腾讯降级）。"""
+    code = _normalize_hk_code(code)
+    try:
+        rows = _hk_fetch_daily_em(code)
+        if rows:
+            return rows
+    except Exception:
+        pass
+    return _hk_fetch_daily_qt(code)
+
+
+def hk_sync(codes: list[str], years: int = 2) -> dict:
+    """港股同步：拉取日K写入 mydb hk日k:{code}:{date}（三层 key，代码隔离）。
+
+    years：保留最近 N 年日K（默认 2，约 520 根），避免全量写爆 mydb。
+    value 内嵌 date（读取用 vals 无需 key 解析）；keys 通配查询有缓存问题，
+    统一用 vals/get 读写（实测可靠）。
+    """
+    years = max(1, min(int(years or 2), 10))
+    cutoff = int((datetime.now().replace(year=datetime.now().year - years)).strftime("%Y%m%d"))
+    results = {}
+    for raw in codes:
+        code = _normalize_hk_code(raw)
+        try:
+            rows = _hk_fetch_daily(code)
+            if not rows:
+                results[code] = {"ok": False, "error": "无数据"}
+                continue
+            items = []
+            for r in rows:
+                val = {k: v for k, v in r.items() if k != "date"}
+                val["date"] = r["date"]  # 内嵌 date，读取无需解析 key
+                if r["date"] >= cutoff:
+                    items.append((str(r["date"]), val))
+            items = items[-520 * years:]  # 兜底截断
+            rd = _mydb_rd()
+            for key, value in items:
+                rd.set(_HK_TABLE, code, key, value).do()  # .do() 真正发送写入
+            results[code] = {"ok": True, "bars": len(items),
+                             "latest": max(r["date"] for r in rows)}
+        except Exception as exc:
+            results[code] = {"ok": False, "error": str(exc)[:200]}
+    return results
+
+
+def hk_klines(code: str) -> list[dict]:
+    """读取 mydb hk日k: 表（升序）。value 内嵌 date，用 vals 全量读取。"""
+    code = _normalize_hk_code(code)
+    rd = _mydb_rd()
+    vals = rd.vals(_HK_TABLE, code, "*") or []
+    rows = []
+    for v in vals:
+        if hasattr(v, "keys") and hasattr(v, "all"):
+            try:
+                v = dict(v)
+            except Exception:
+                v = None
+        if isinstance(v, dict) and v.get("date"):
+            rows.append(v)
+    rows.sort(key=lambda r: int(r["date"]))
+    return rows
+
+
 # ==================== 市场研究：基础因子（纯计算，不复权日K） ====================
 # 因子定义（与 UI 说明一致）：
 #   1. 20 日动量   mom20 = close[-1] / close[-21] - 1          （需 ≥21 根）
@@ -2369,8 +2620,14 @@ border-bottom:1px solid var(--line)}
 .tab-btn{background:transparent;border:0;border-bottom:2px solid transparent;color:var(--muted);
 font-size:15px;padding:8px 0;cursor:pointer;white-space:nowrap;flex:1;text-align:center}
 .tab-btn.active{color:var(--brand);border-bottom-color:var(--brand);font-weight:700}
-.tab-btn.active{color:var(--brand);border-bottom-color:var(--brand);font-weight:700}
 .tab-panel{display:none;padding-top:16px}.tab-panel.active{display:block}
+
+/* 同步页子页签 */
+.sync-tabs{display:flex;gap:8px;border-bottom:1px solid var(--line);padding-bottom:10px;margin-bottom:16px}
+.sync-tab{background:transparent;border:1px solid var(--line);border-radius:8px;color:var(--muted);
+font-size:14px;padding:7px 18px;cursor:pointer}
+.sync-tab.active{background:rgba(56,189,248,.08);border-color:rgba(56,189,248,.4);color:var(--brand);font-weight:700}
+.sync-panel{display:none}.sync-panel.active{display:block}
 
 /* 卡片 */
 .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px;margin:14px 0}
@@ -2568,7 +2825,7 @@ color:var(--text);padding:8px 10px;border-radius:8px;width:220px}
 <div class="topbar"><div class="topbar-inner">
   <nav class="tabs">
     <button class="tab-btn active" data-tab="research" onclick="showTab('research',this)">市场研究</button>
-    <button class="tab-btn" data-tab="study" onclick="showTab('study',this)">研究</button>
+    <button class="tab-btn" data-tab="study" onclick="showTab('study',this)">个股/ETF研究</button>
     <button class="tab-btn" data-tab="sync" onclick="showTab('sync',this)">数据同步</button>
     <button class="tab-btn" data-tab="system" onclick="showTab('system',this)">系统</button>
   </nav>
@@ -2647,7 +2904,7 @@ color:var(--text);padding:8px 10px;border-radius:8px;width:220px}
     <div class="study-main">
       <div class="card">
         <div class="filters" style="margin-bottom:0">
-          <input type="text" id="rsCode" placeholder="6 位代码，如 600633 / 510300" style="width:220px">
+          <input type="text" id="rsCode" placeholder="6 位代码 / 港股 5 位，如 600633、00700" style="width:240px">
           <button class="btn-ghost btn-sm" onclick="loadStock()">加载</button>
           <span class="hint" id="rsMsg"></span>
         </div>
@@ -2687,8 +2944,15 @@ color:var(--text);padding:8px 10px;border-radius:8px;width:220px}
   </div>
 </div>
 
-<!-- 数据同步：主状态区 + 两列辅助 + 历史 + 日志 -->
+<!-- 数据同步：数据源同步 + 私有存储同步（两个子页签） -->
 <div id="tab-sync" class="tab-panel">
+  <div class="sync-tabs">
+    <button class="sync-tab active" data-sync-tab="source" onclick="showSyncTab('source',this)">数据源同步</button>
+    <button class="sync-tab" data-sync-tab="mydb" onclick="showSyncTab('mydb',this)">私有存储同步（手动）</button>
+  </div>
+
+  <!-- 子页签1：数据源同步（A股行情增量同步） -->
+  <div id="sync-source" class="sync-panel active">
   <div class="hero">
     <div class="hero-status"><span id="heroSpin" class="spin" style="display:none"></span><span id="heroStatus">…</span></div>
     <div class="hero-sub" id="heroSub">…</div>
@@ -2752,6 +3016,49 @@ color:var(--text);padding:8px 10px;border-radius:8px;width:220px}
   </div>
   <div class="card"><div class="card-title">同步日志</div>
     <pre id="log">（暂无）</pre>
+  </div>
+  </div>
+
+  <!-- 子页签2：私有存储同步（手动）——港股拉取 + AI 写入接口 -->
+  <div id="sync-mydb" class="sync-panel">
+    <div class="card"><div class="card-title">港股同步 <span class="hint" style="font-weight:normal">（拉取日K写入 hk日k 表 · 手动）</span></div>
+      <div class="hint" style="margin-bottom:8px">输入港股代码（如 00700 腾讯控股）拉取指定时间范围的日K写入私有存储，供个股/ETF研究页查询。手动点击触发。</div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+        <input type="text" id="hkCodes" placeholder="港股代码，逗号分隔，如 00700,00941" style="width:280px">
+        <select id="hkYears">
+          <option value="1">近1年</option>
+          <option value="2" selected>近2年</option>
+          <option value="3">近3年</option>
+          <option value="5">近5年</option>
+          <option value="10">近10年</option>
+        </select>
+        <button class="btn-ghost" onclick="hkSync()">拉取港股</button>
+        <span class="hint" id="hkMsg"></span>
+      </div>
+    </div>
+    <div class="card"><div class="card-title">私有数据写入 <span class="hint" style="font-weight:normal">（AI 接口 · 供扩展）</span></div>
+      <div class="hint" style="margin-bottom:8px">写入自定义表（如 <code>hk日k</code>、<code>自定义指标</code>），表名不可与上游保留表（日k/复权/分钟k 等）冲突。该接口预留扩展为 AI agent 介入的写入通道，支持单条或 JSON 批量。</div>
+      <div style="display:flex;gap:12px;align-items:flex-start;flex-wrap:wrap">
+        <div style="display:flex;flex-direction:column;gap:6px;flex:1;min-width:260px">
+          <input type="text" id="dwTable" placeholder="表名，如 自定义指标" style="width:220px">
+          <textarea id="dwPayload" rows="4" placeholder='单条：{"key":"600633","value":{"score":85}}\n批量：{"items":[["000001",{"score":70}],["000967",{"score":80}]]}' style="width:100%;font-family:monospace;font-size:12px"></textarea>
+          <div style="display:flex;gap:8px;align-items:center">
+            <button class="btn-ghost" onclick="dataWrite()">写入</button>
+            <button class="btn-ghost" onclick="dataTables()">查看表</button>
+            <span class="hint" id="dwMsg"></span>
+          </div>
+        </div>
+        <div id="dwTables" class="hint" style="max-height:140px;overflow:auto;flex:1;min-width:200px"></div>
+      </div>
+    </div>
+    <div class="card"><div class="card-title">说明</div>
+      <div class="hint" style="line-height:1.8">
+        · <b>数据源同步</b>：从镜像源增量同步 A 股行情（日K/分钟K/复权），写入 ./data，自动定时或手动触发。<br>
+        · <b>私有存储同步（手动）</b>：港股日K与自定义数据写入私有存储 ./mydb（与上游 ./data 物理隔离，互不冲突）。<br>
+        · 港股数据源：东财/腾讯公网接口；表名以 <code>hk日k</code> / <code>自定义:</code> 等命名空间隔离，不覆盖上游保留表。<br>
+        · <b>AI 接口</b>：私有数据写入 API（<code>POST /api/data/write</code>）预留为 AI agent 介入的扩展点，后续可对接自动数据接入。
+      </div>
+    </div>
   </div>
 </div>
 
@@ -2849,6 +3156,12 @@ function showTab(name,btn){
     if(kchart)kchart.resize();
   }
   refresh(true); // 切页立即按当前页刷新
+}
+function showSyncTab(name,btn){
+  document.querySelectorAll('.sync-tab').forEach(b=>b.classList.remove('active'));
+  document.querySelectorAll('.sync-panel').forEach(p=>p.classList.remove('active'));
+  (btn||document.querySelector('[data-sync-tab="'+name+'"]')).classList.add('active');
+  $('sync-'+name).classList.add('active');
 }
 
 const PHASE_STAGE={stopping:'停服中',syncing:'同步数据',verifying:'校验数据完整性',restarting:'重启服务'};
@@ -3385,7 +3698,7 @@ function loadStockByCode(code,scope){
 }
 async function loadStock(scope){
   const code=$('rsCode').value.trim();
-  if(!code||!/^\d{6}$/.test(code)){$('rsMsg').textContent='请输入 6 位代码';return}
+  if(!code||!((/^\d{6}$/.test(code))||(/^\d{5}$/.test(code))||(/^hk\d{5}$/i.test(code)))){$('rsMsg').textContent='请输入 6 位 A 股/ETF 代码或 5 位港股代码';return}
   $('rsMsg').textContent='加载中…';
   // 展开详情区（K 线图在 display:none 容器初始化会被压成 100px 宽）
   const det=$('rsDetail');det.style.display='block';
@@ -3503,6 +3816,51 @@ async function restartContainer(){
   try{const r=await j('/api/container/restart',{method:'POST'});$('containerMsg').textContent=r.msg||'已执行';toast(r.msg||'已执行')}
   catch(e){$('containerMsg').textContent='重启失败: '+e}
 }
+// ---- 数据写入（mydb 私有存储，手动触发） ----
+function parsePayload(text){
+  // 支持单条 {key,value} 或批量 {items:[[k,v],...]}
+  const t=(text||'').trim();
+  if(!t)throw new Error('请输入 JSON');
+  const obj=JSON.parse(t);
+  if(obj.items)return {items:obj.items};
+  if(obj.key!==undefined)return {key:String(obj.key),value:obj.value};
+  throw new Error('格式需为 {"key":"...","value":...} 或 {"items":[["k",v],...]}');
+}
+async function dataWrite(){
+  const table=$('dwTable').value.trim();
+  if(!table){$('dwMsg').textContent='请输入表名';return}
+  let payload;
+  try{payload=parsePayload($('dwPayload').value)}catch(e){$('dwMsg').textContent=e.message;return}
+  $('dwMsg').textContent='写入中…';
+  try{
+    const r=await j('/api/data/write',{method:'POST',body:JSON.stringify({table,...payload})});
+    $('dwMsg').textContent=r.msg||('写入 '+r.written+' 条');
+    toast(r.msg||'写入完成');
+    dataTables();
+  }catch(e){$('dwMsg').textContent='写入失败: '+e}
+}
+async function dataTables(){
+  try{
+    const r=await j('/api/data/tables');
+    const ts=r.tables||[];
+    const el=$('dwTables');
+    if(r.error){el.textContent=r.error;return}
+    el.innerHTML=ts.length?('自定义表：<br>'+ts.map(t=>'<div style="margin:2px 0">• '+esc(t)+'</div>').join('')):'（无自定义表）';
+  }catch(e){$('dwTables').textContent='读取失败: '+e}
+}
+async function hkSync(){
+  const codes=$('hkCodes').value.trim();
+  if(!codes){$('hkMsg').textContent='请输入港股代码';return}
+  const list=codes.split(/[,，\s]+/).filter(Boolean);
+  const years=parseInt($('hkYears').value||'2',10);
+  $('hkMsg').textContent='拉取中…';
+  try{
+    const r=await j('/api/hk/sync',{method:'POST',body:JSON.stringify({codes:list,years})});
+    const parts=Object.entries(r).map(([c,v])=>c+' '+(v.ok?('✓ '+v.bars+'根'):('✗ '+v.error))).join('；');
+    $('hkMsg').textContent=parts;
+    toast('港股同步完成');
+  }catch(e){$('hkMsg').textContent='拉取失败: '+e}
+}
 async function toggleContainerLogs(){
   const pre=$('containerLog');
   if(pre.style.display!=='none'){pre.style.display='none';return}
@@ -3570,6 +3928,12 @@ class Handler(BaseHTTPRequestHandler):
                 self._research_factors()
             elif path == "/api/research/stock":
                 self._research_stock()
+            elif path == "/api/data/tables":
+                self._data_tables()
+            elif path == "/api/data/read":
+                self._data_read()
+            elif path == "/api/hk/sync":
+                self._hk_sync()
             else:
                 self._send(404, json.dumps({"error": "not found"}))
         except Exception as exc:
@@ -3597,6 +3961,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._container_restart()
             elif path == "/api/research/rebuild":
                 self._research_rebuild()
+            elif path == "/api/data/write":
+                self._data_write()
+            elif path == "/api/hk/sync":
+                self._hk_sync()
             else:
                 self._send(404, json.dumps({"error": "not found"}))
         except Exception as exc:
@@ -3727,15 +4095,19 @@ class Handler(BaseHTTPRequestHandler):
     def _research_stock(self):
         q = parse_qs(urlparse(self.path).query)
         code = q.get("code", [""])[0].strip()
-        if not code or not (code.isdigit() and len(code) == 6):
-            self._send(400, json.dumps({"error": "缺少或非法 code（需 6 位数字）"}))
-            return
         period = q.get("period", ["day"])[0]
         if period not in ("day", "week", "month"):
             period = "day"
         adj = q.get("adj", ["qfq"])[0]
         if adj not in ("qfq", "hfq", "none"):
             adj = "qfq"
+        # 港股：5 位代码或 hk 前缀 → 读 mydb hk日k: 表，无则实时拉取落盘
+        if _is_hk_code(code):
+            self._research_stock_hk(code, period, adj)
+            return
+        if not code or not (code.isdigit() and len(code) == 6):
+            self._send(400, json.dumps({"error": "缺少或非法 code（需 6 位数字，港股 5 位）"}))
+            return
         # 个股/ETF 研究：直连 stockdb 实时查询（单标的，快），不依赖全市场缓存
         import urllib.request, urllib.parse
         from datetime import datetime as _dt, timedelta as _td
@@ -3793,6 +4165,106 @@ class Handler(BaseHTTPRequestHandler):
             "factors": factors, "percentiles": pcts,
             "klines": krows, "trend": trend,
         }, ensure_ascii=False))
+
+    def _research_stock_hk(self, code: str, period: str = "day", adj: str = "qfq"):
+        """港股个股研究：读 mydb hk日k: 表（无则实时拉取落盘），复用周期聚合。"""
+        hk_code = _normalize_hk_code(code)
+        try:
+            rows = hk_klines(hk_code)
+            if not rows:
+                # 首次：实时拉取并落盘
+                res = hk_sync([hk_code])
+                r = res.get(hk_code) or {}
+                if not r.get("ok"):
+                    self._send(404, json.dumps({"error": f"港股 {hk_code} 拉取失败: {r.get('error')}"},
+                                               ensure_ascii=False))
+                    return
+                rows = hk_klines(hk_code)
+        except Exception as exc:
+            self._send(500, json.dumps({"error": f"港股读取失败: {exc}"}, ensure_ascii=False))
+            return
+        if not rows:
+            self._send(404, json.dumps({"error": f"港股 {hk_code} 暂无数据"}, ensure_ascii=False))
+            return
+        # 港股无复权表，直接用不复权日K聚合（腾讯/东财已含前复权因子）
+        period_rows = _aggregate_kline(rows, period)
+        bars = period_rows[-160:]
+        factors = compute_factors(bars)
+        latest = bars[-1]
+        krows = [{"date": b.get("date"), "open": b.get("open"), "close": b.get("close"),
+                  "high": b.get("high"), "low": b.get("low"), "volume": b.get("volume")}
+                 for b in bars]
+        trend = []
+        for i in range(max(0, len(bars) - 60), len(bars)):
+            seg = bars[:i + 1]
+            trend.append({"date": bars[i].get("date"),
+                          "mom20": _factor_mom20(seg), "vol20": _factor_vol20(seg)})
+        self._send(200, json.dumps({
+            "code": hk_code, "name": "港股 " + hk_code, "date": str(latest.get("date")),
+            "close": latest.get("close"), "pct_chg": latest.get("pct_chg"),
+            "volume": latest.get("volume"), "amount": latest.get("amount"),
+            "period": period, "adj": "qfq", "market": "hk",
+            "factors": factors, "percentiles": {},
+            "klines": krows, "trend": trend,
+        }, ensure_ascii=False))
+
+    def _data_write(self):
+        """mydb 私有存储写入：{table, key, value} 单条 或 {table, items:[[k,v],...]} 批量。"""
+        body = self._read_json()
+        table = body.get("table", "")
+        try:
+            if "items" in body:
+                items = [(str(k), v) for k, v in body["items"]]
+                result = mydb_write(table, items, batch=True)
+            else:
+                key = body.get("key", "")
+                if not key:
+                    self._send(400, json.dumps({"error": "单条写入需提供 key"}))
+                    return
+                result = mydb_write(table, [(str(key), body.get("value"))], batch=False)
+            self._send(200, json.dumps({"msg": f"已写入 {result['written']} 条", **result},
+                                       ensure_ascii=False))
+        except ImportError as exc:
+            self._send(501, json.dumps({"error": f"pybao 写库不可用：{exc}"}, ensure_ascii=False))
+        except ValueError as exc:
+            self._send(400, json.dumps({"error": str(exc)}, ensure_ascii=False))
+        except Exception as exc:
+            self._send(500, json.dumps({"error": f"写入失败: {exc}"}, ensure_ascii=False))
+
+    def _data_tables(self):
+        try:
+            self._send(200, json.dumps({"tables": mydb_tables()}, ensure_ascii=False))
+        except ImportError as exc:
+            self._send(501, json.dumps({"error": f"pybao 写库不可用：{exc}"}, ensure_ascii=False))
+        except Exception as exc:
+            self._send(500, json.dumps({"error": str(exc)}, ensure_ascii=False))
+
+    def _data_read(self):
+        q = parse_qs(urlparse(self.path).query)
+        table = q.get("table", [""])[0]
+        key = q.get("key", [""])[0]
+        try:
+            self._send(200, json.dumps(mydb_read(table, key), ensure_ascii=False))
+        except ImportError as exc:
+            self._send(501, json.dumps({"error": f"pybao 写库不可用：{exc}"}, ensure_ascii=False))
+        except ValueError as exc:
+            self._send(400, json.dumps({"error": str(exc)}, ensure_ascii=False))
+        except Exception as exc:
+            self._send(500, json.dumps({"error": str(exc)}, ensure_ascii=False))
+
+    def _hk_sync(self):
+        """港股同步：POST {codes:["00700",...], years:2} 拉取日K写入 hk日k: 表。"""
+        body = self._read_json()
+        codes = body.get("codes") or []
+        years = body.get("years", 2)
+        if not codes:
+            self._send(400, json.dumps({"error": "缺少 codes（如 ['00700','00941']）"}))
+            return
+        try:
+            result = hk_sync(codes, years=years)
+            self._send(200, json.dumps(result, ensure_ascii=False))
+        except Exception as exc:
+            self._send(500, json.dumps({"error": str(exc)}, ensure_ascii=False))
 
     def _research_rebuild(self):
         if _research_build["state"] == "building":
