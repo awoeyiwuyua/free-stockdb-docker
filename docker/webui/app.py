@@ -54,7 +54,7 @@ _last_verify_result: str | None = None  # 最近一次完整性验证结果（pa
 _scheduler_alive = False             # 定时线程心跳（每次循环更新时间戳）
 _scheduler_heartbeat = 0.0           # 定时线程最近一次心跳时间戳（unix）
 _webui_started = time.time()         # webui 进程启动时间戳
-WEBUI_VERSION = "0.3.2"
+WEBUI_VERSION = "0.3.3"
 
 HISTORY_FILE = DATA_DIR / "sync_history.json"
 SCHEDULE_FILE = DATA_DIR / "sync_schedule.json"
@@ -402,15 +402,20 @@ def data_latest_date() -> str | None:
 
 
 def _classify_code(code: str) -> str:
-    """按代码段归类：etf / stock / other。
+    """按代码段归类：hk / etf / stock / other。
 
+    港股：5 位数字或带 hk 前缀（如 00700 / hk00700）。
     ETF：沪市 51x/52x/56x/58x（510-518 宽基、520-529 新宽基、560-563 行业、588/589 科创），
           深市 159 开头。
     股票：0/3/6 开头（深主板 00x、创业板 300/301、沪主板 60x、科创板 688/689），
           4/8 开头与 92x（北交所 43x/83x/87x/88x/920x）。
     其他：LOF(16x/50x)、REITs(18x)、B股(200/900) 等场内非股票非 ETF 品种。
     """
-    c = str(code)
+    c = str(code).strip().lower()
+    if c.startswith("hk"):
+        c = c[2:]
+    if c.isdigit() and len(c) == 5:
+        return "hk"
     if c[:2] in ("51", "52", "56", "58") or c[:3] == "159":
         return "etf"
     if c[:2] == "92" or c[:3] == "430" or c[0] in ("0", "3", "4", "6", "8"):
@@ -1751,8 +1756,9 @@ def mirror_latest_date() -> str | None:
 
 
 def load_watchlist(scope: str | None = None) -> list[str]:
-    """自选列表。scope=stock|etf 时按代码段过滤（个股/ETF 板块各看各的）；
-    None 返回全量（供迁移/展示）。旧版本未分流数据自动兼容。"""
+    """自选列表。scope=stock|etf 时按代码段过滤（个股/ETF 板块各看各的；
+    港股归入个股板块：stock 返回 A 股 + 港股）。None 返回全量（供迁移/展示）。
+    旧版本未分流数据自动兼容。"""
     if not WATCHLIST_FILE.exists():
         return []
     try:
@@ -1761,7 +1767,7 @@ def load_watchlist(scope: str | None = None) -> list[str]:
     except Exception:
         return []
     if scope == "stock":
-        return [c for c in codes if _classify_code(c) == "stock"]
+        return [c for c in codes if _classify_code(c) in ("stock", "hk")]
     if scope == "etf":
         return [c for c in codes if _classify_code(c) == "etf"]
     return codes
@@ -1769,15 +1775,22 @@ def load_watchlist(scope: str | None = None) -> list[str]:
 
 def save_watchlist(codes: list[str], scope: str | None = None) -> list[str]:
     """保存自选列表。scope=stock|etf 时只替换该部分，保留另一 scope 的条目
-    （个股/ETF 独立板块互不覆盖）。None 视为全量替换（兼容旧调用）。"""
+    （个股/ETF 独立板块互不覆盖；港股归入个股板块）。None 视为全量替换（兼容旧调用）。
+    接受 6 位 A股/ETF 与 5 位港股（hk 前缀统一存为 5 位）。"""
     cleaned = []
     for c in codes:
-        c = str(c).strip()
-        if c and c.isdigit() and len(c) == 6 and c not in cleaned:
+        c = str(c).strip().lower()
+        if c.startswith("hk"):
+            c = c[2:]
+        if c.isdigit() and len(c) in (5, 6) and c not in cleaned:
             cleaned.append(c)
     if scope in ("stock", "etf"):
         current = load_watchlist(None)
-        others = [c for c in current if _classify_code(c) != scope]
+        # 个股板块 = A股 + 港股：整体替换该集合；ETF 板块只替换 ETF。其余分类（另一板块/other）保留
+        if scope == "stock":
+            others = [c for c in current if _classify_code(c) not in ("stock", "hk")]
+        else:
+            others = [c for c in current if _classify_code(c) != "etf"]
         merged = others + cleaned
         # 去重保序
         seen: set[str] = set()
@@ -2579,6 +2592,23 @@ def latest_quotes(codes: list[str]) -> list[dict]:
     quotes = []
     for code in codes:
         try:
+            # 港股：读 mydb hk日k 私有表（未同步/无 pybao 时行情为 null，行仍渲染可点击
+            # → 研究页点击即实时拉取落盘，避免像 A 股一样静默跳过导致「没反应」）
+            if _is_hk_code(code):
+                try:
+                    hk_rows = hk_klines(code)
+                except Exception:
+                    hk_rows = []
+                last = hk_rows[-1] if hk_rows else {}
+                hk_code = _normalize_hk_code(code)
+                quotes.append({
+                    "code": hk_code,
+                    "name": "港股",
+                    "date": last.get("date"),
+                    "close": last.get("close"),
+                    "pct_chg": last.get("pct_chg"),
+                })
+                continue
             rows = []
             for prefix in prefixes:
                 url = f"http://{STOCKDB_HOST}:{STOCKDB_PORT}/?cmd=vals&t={urllib.parse.quote(f'日k:{code}:{prefix}*')}"
@@ -2892,7 +2922,7 @@ color:var(--text);padding:8px 10px;border-radius:8px;width:220px}
         <div class="card-title">自选股</div>
         <div id="wlRow" class="wl-list"><span class="hint">…</span></div>
         <div class="wl-add">
-          <input type="text" id="wlAdd" placeholder="加自选股，如 600633">
+          <input type="text" id="wlAdd" placeholder="加自选股/港股，如 600633、00700">
           <button class="btn-ghost btn-sm" onclick="addWatch('stock')">加入</button>
           <span id="wlMsg" class="hint"></span>
         </div>
@@ -3443,7 +3473,7 @@ async function loadWatchlist(scope){
   const S=scope==='etf'?{
     row:'etfWlRow',add:'etfWlAdd',msg:'etfWlMsg',onOpen:'loadStockByCode',ph:'加自选 ETF，如 510300,159915',scope:'etf'
   }:{
-    row:'wlRow',add:'wlAdd',msg:'wlMsg',onOpen:'loadStockByCode',ph:'加自选股，如 600633,000967',scope:'stock'
+    row:'wlRow',add:'wlAdd',msg:'wlMsg',onOpen:'loadStockByCode',ph:'加自选股/港股，如 600633、00700',scope:'stock'
   };
   try{
     const w=await j('/api/watchlist?scope='+S.scope);

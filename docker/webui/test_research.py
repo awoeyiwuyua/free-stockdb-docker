@@ -637,6 +637,51 @@ class TestWatchlistScope(unittest.TestCase):
         self.assertEqual(mod._classify_code("000001"), "stock")
         self.assertEqual(mod._classify_code("510300"), "etf")
         self.assertEqual(mod._classify_code("159915"), "etf")
+        # 港股：5 位数字（含非 0 开头）与 hk 前缀均归为 hk
+        self.assertEqual(mod._classify_code("00700"), "hk")
+        self.assertEqual(mod._classify_code("hk00700"), "hk")
+        self.assertEqual(mod._classify_code("10700"), "hk")
+        self.assertEqual(mod._classify_code("700"), "other")  # 位数不足
+
+    def test_save_hk_goes_to_stock_scope(self):
+        """港股加自选：存 5 位代码，归入个股板块展示。"""
+        mod.save_watchlist(["00700"], "stock")
+        self.assertEqual(mod.load_watchlist("stock"), ["00700"])
+        self.assertEqual(mod.load_watchlist("etf"), [])
+        self.assertEqual(mod.load_watchlist(None), ["00700"])
+
+    def test_save_hk_prefix_normalized(self):
+        """hk 前缀统一存为 5 位数字。"""
+        mod.save_watchlist(["hk00700", "00700"], "stock")
+        self.assertEqual(mod.load_watchlist("stock"), ["00700"])
+
+    def test_save_hk_rejects_wrong_length(self):
+        """位数不足（3 位）不进入自选。"""
+        mod.save_watchlist(["700"], "stock")
+        self.assertEqual(mod.load_watchlist("stock"), [])
+
+    def test_hk_deletable_from_stock_board(self):
+        """港股可增可删：个股板块整体替换（A股+港股），删除后不再保留。"""
+        mod.save_watchlist(["600633", "00700"], "stock")
+        self.assertEqual(mod.load_watchlist("stock"), ["600633", "00700"])
+        # 删除 00700（前端 delWatch 发来剩余板块代码）
+        mod.save_watchlist(["600633"], "stock")
+        self.assertEqual(mod.load_watchlist("stock"), ["600633"])
+        # 删除 A 股保留港股
+        mod.save_watchlist(["00700"], "stock")
+        self.assertEqual(mod.load_watchlist("stock"), ["00700"])
+
+    def test_hk_preserved_across_scopes(self):
+        """自选股板块（含港股）与 ETF 板块互不影响。"""
+        mod.save_watchlist(["00700", "600633"], "stock")
+        mod.save_watchlist(["510300"], "etf")
+        self.assertEqual(mod.load_watchlist("stock"), ["00700", "600633"])
+        self.assertEqual(mod.load_watchlist("etf"), ["510300"])
+        self.assertEqual(sorted(mod.load_watchlist(None)), ["00700", "510300", "600633"])
+        # 更新 ETF 板块不影响个股板块（含港股）
+        mod.save_watchlist(["510300", "159915"], "etf")
+        self.assertEqual(mod.load_watchlist("stock"), ["00700", "600633"])
+        self.assertEqual(mod.load_watchlist("etf"), ["510300", "159915"])
 
     def test_save_stock_preserves_etf(self):
         mod.save_watchlist(["600633", "000001"], "stock")
