@@ -47,9 +47,14 @@ fi
 STOCKDB_WATCHER=$!
 
 # ---- 5. 前台循环拉起 webui（webui 退出自动重启，容器存活由它保持）----
+# 注意：set -e 下循环体内的 python 失败会直接退出 entrypoint（容器随 webui 一起停），
+# 必须用 if 条件位置豁免——webui 崩溃（含被信号杀死）时循环继续重启，不影响 stockdb。
 echo "[entrypoint] starting webui (8080) ..."
 while :; do
-  python /opt/webui/app.py
-  echo "[entrypoint] webui exited (code $?); restarting in 3s ..." >&2
+  if python /opt/webui/app.py; then
+    echo "[entrypoint] webui exited (code 0); restarting in 3s ..." >&2
+  else
+    echo "[entrypoint] webui exited (code $?); restarting in 3s ..." >&2
+  fi
   sleep 3
 done
