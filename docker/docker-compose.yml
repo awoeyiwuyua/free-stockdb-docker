@@ -43,7 +43,7 @@ services:
       - stockdb-net
     # 未来扩展位（本版不启用，需求浮现后再加）：
     #   - webui：自建前端服务容器，只调 7899 HTTP API（见 README「后续扩展」）
-    #   - ai-mcp：把官方 ai_mcp 容器化（只读 MCP 已由下方 mcp 服务承载）
+    #   - ai-mcp：把官方 ai_mcp 容器化（只读 MCP 已由 webui 的 /mcp 路由承载）
 
   # 一次性同步任务：docker compose --profile sync run --rm stockdb-sync
   # 同步必须停服务（官方 DATA_SOURCE.md 要求），增量同步可反复运行
@@ -79,23 +79,6 @@ services:
       STOCKDB_PORT: "7899"
       STOCKDB_CONTAINER: stockdb
       RESEARCH_DB_PATH: /research/market_research.sqlite3
-    depends_on:
-      - stockdb
-    networks:
-      - stockdb-net
-
-  # stockdb-native MCP：只读 HTTP MCP（POST /mcp），把 stockdb 7899 封装成 5 个 MCP 工具
-  # 供 ZCode / Codex 等 AI 工具通过 {"type":"http","url":"http://<NAS_IP>:8082/mcp"} 接入
-  mcp:
-    image: ghcr.io/awoeyiwuyua/free-stockdb-mcp:latest
-    container_name: stockdb-mcp
-    restart: unless-stopped
-    ports:
-      - "8082:8080"
-    environment:
-      TZ: Asia/Shanghai
-      STOCKDB_HOST: stockdb
-      STOCKDB_PORT: "7899"
     depends_on:
       - stockdb
     networks:

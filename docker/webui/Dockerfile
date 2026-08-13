@@ -81,6 +81,8 @@ COPY --from=build /out/stockdb/pybao /opt/stockdb/pybao
 
 COPY app.py entrypoint.sh /opt/webui/
 COPY static/ /opt/webui/static/
+# 只读 MCP（stockdb-native）模块：app.py 的 /mcp 路由复用其 dispatch（纯标准库）
+COPY mcp/ /opt/webui/mcp/
 
 # uv 运行时：统一 Python 版本管理；容器内 uv 仅作启动器（--no-project 用系统 python）
 RUN pip install --no-cache-dir uv
