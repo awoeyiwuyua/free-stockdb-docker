@@ -80,7 +80,6 @@ COPY --from=build /out/stockdb/sync_url.txt /opt/stockdb/sync_url.txt
 COPY --from=build /out/stockdb/pybao /opt/stockdb/pybao
 
 COPY app.py entrypoint.sh /opt/webui/
-COPY static/ /opt/webui/static/
 # 只读 MCP（stockdb-native）模块：app.py 的 /mcp 路由复用其 dispatch（纯标准库）
 COPY mcp/ /opt/webui/mcp/
 

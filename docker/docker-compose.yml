@@ -10,8 +10,8 @@
 # 数据持久化（升级/重建容器不丢数据）：
 #   ./data  全市场行情库（日K/分钟K/tick），必须持久化
 #   ./mydb  私有数据库（发行包内置目录）
-#   ./research  WebUI 市场复盘 SQLite 研究库
 #   ./log   运行日志（stockdb.log）
+# 注意：webui 0.4.0 起瘦身为运维面板，不再使用 ./research 研究库
 #
 # 端口：宿主机 7899 -> 容器 7899（局域网内通过 http://<NAS_IP>:7899 访问）
 
@@ -71,14 +71,12 @@ services:
       - "8081:8080"
     volumes:
       - ./data:/data
-      - ./research:/research
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
       TZ: Asia/Shanghai
       STOCKDB_HOST: stockdb
       STOCKDB_PORT: "7899"
       STOCKDB_CONTAINER: stockdb
-      RESEARCH_DB_PATH: /research/market_research.sqlite3
     depends_on:
       - stockdb
     networks:
