@@ -9,14 +9,17 @@
 #   - mydb 私有写入：pybao 客户端连 7899 执行 rd.set/mset（自定义表/港股落盘）
 #   - 港股研究：东财/腾讯实时拉取 + 写入 hk日k: 表
 #
-# 架构说明：
-#   - 基础镜像 python:3.14-alpine（musl）：arm64 发布包的 pybao 是 musl 构建
-#     （依赖 libc.so），NAS(arm64) 可直接加载；amd64 发布包 pybao 是 glibc 构建，
-#     在 alpine 下加载失败时 webui 优雅降级（mydb 写入不可用，A 股功能不受影响）。
+# 架构说明（按 TARGETARCH 选基础镜像，保证 pybao 的 stockdb.abi3.so 两架构都能加载）：
+#   - amd64 → python:3.14-slim（Debian/glibc）：匹配 manylinux-x64 发布包的 pybao
+#     （glibc 构建，NEEDED libgcc_s.so.1/libc6 等，musl 下根本无法加载）。
+#   - arm64 → python:3.14-alpine（musl）：匹配 alpine-arm64 发布包的 pybao
+#     （musl 构建，NEEDED libgcc_s.so.1 与无版本号 libc.so，需补 libgcc 包 + libc.so 软链）。
+#   - 同步器「数据更新」为静态链接二进制，与对应 libc 族（glibc/musl）基础镜像一致。
 #   - Python 3.14 GIL：上游 3.14t(free-threaded) 的 abi3t 变体实测 ABI 不匹配
 #     （_PyType_FromSlots 符号缺失），待上游修复后评估升级。
 
 ARG VERSION=0.3.1
+ARG TARGETARCH
 
 # ================= 构建阶段：下载 stockdb 发布包取同步器 + pybao =================
 FROM alpine:3.20 AS build
@@ -47,12 +50,27 @@ RUN set -eu; \
     tar -xf /tmp/pkg.tar -C /out; \
     test -x "/out/stockdb/数据更新" || { echo "sync binary missing" >&2; exit 1; }
 
-# ================= 运行时阶段 =================
-FROM python:3.14-alpine
+# ================= 运行时：amd64 用 Debian(glibc)，匹配 manylinux-x64 的 pybao =================
+FROM python:3.14-slim AS runtime-amd64
 
-# bash：极空间等容器管理 APP 进容器默认执行 /bin/bash，alpine 默认没有会导致
-# "OCI runtime exec failed: /bin/bash not found"。装上后用 APP 终端可正常进入。
-RUN apk add --no-cache tzdata curl bash
+# bash：极空间等容器管理 APP 进容器默认执行 /bin/bash，Debian slim 默认没有需显式装；
+# libgcc-s1：提供 pybao 依赖的 libgcc_s.so.1；ca-certificates 供 curl 走 HTTPS。
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        tzdata curl bash libgcc-s1 ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# ================= 运行时：arm64 保留 alpine(musl)，补 libgcc + libc.so 软链 =================
+FROM python:3.14-alpine AS runtime-arm64
+
+# bash：极空间等容器管理 APP 进容器默认执行 /bin/bash，alpine 默认没有需显式装
+# libgcc：提供 pybao 依赖的 libgcc_s.so.1；libc.so 软链：musl 动态库在
+# /lib/ld-musl-aarch64.so.1（既是 ELF 解释器也充当 libc），补一个无版本号别名
+# 以满足 pybao 里 `NEEDED libc.so` 的查找需求（alpine 默认无 `libc.so` 文件）。
+RUN apk add --no-cache tzdata curl bash libgcc \
+    && ln -s ld-musl-aarch64.so.1 /lib/libc.so
+
+# ================= 最终阶段：按构建目标架构选中对应基础镜像 =================
+FROM runtime-${TARGETARCH}
 
 # 同步器二进制（webui 容器内直接跑同步；/data 卷挂载后即可读写行情库）
 COPY --from=build /out/stockdb/数据更新 /opt/stockdb/数据更新
