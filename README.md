@@ -2,6 +2,32 @@
 
 # free-stockdb
 
+## 📌 本 fork：数据基座 ODS（Docker 单镜像 + NAS 运维面板）
+
+> 本仓库 fork 自 [hello245m/free-stockdb](https://github.com/hello245m/free-stockdb)，做 **Docker 容器化封装**，
+> 定位为**个人本地量化数据基座**——不改上游 C++ 引擎（Sync fork 与上游保持同步），
+> 只负责把引擎稳定跑在 NAS 上、把数据喂给研究侧（命理档案项目 / AI）。
+
+**架构（单镜像，一容器两端口）**：
+- `stockdb` 服务端（7899，行情 HTTP API）+ `数据更新` 同步器 + pybao + webui 运维面板（8080）
+- 进程级控制（pidfile + SIGTERM），**不挂载 docker.sock**；webui 崩溃自动重启不影响数据服务
+- 镜像 `ghcr.io/awoeyiwuyua/free-stockdb:latest`；部署见 [`docker/README.md`](docker/README.md)
+
+**webui 运维面板（`http://<NAS_IP>:8081`）**：
+- 数据同步：网页一键「立即热更新」（reload 零中断）/「停服同步」（故障兜底）+ 定时计划
+- 健康监控：数据最新日期 / stockdb 进程 / 存储 / 同步能力
+- mydb 私有存储：港股日K 拉取（东财/腾讯）、AI 写入接口
+- 查询台：直查任意表；`/mcp` 路由 = AI 取数入口（MCP server 见 `docker/webui/mcp/`）
+
+**边界**：看盘功能已移除（请用富途等专业软件）；因子/回测/情绪研究在**命理档案项目**推进，
+本仓库只提供数据基座。
+
+**版本约定**：镜像 tag = 上游发布包版本（`docker/Dockerfile` 的 `ARG VERSION`，当前 0.3.1）；
+webui 面板版本 = `WEBUI_VERSION`（`docker/webui/app.py`）。compose 建议用 `:latest`。
+
+---
+以下为上游 free-stockdb 引擎说明（fork 沿用，未改动）：
+
 ## 本地量化数据引擎
 
 面向 A 股日K、分钟K与 ETF 分钟、tick级数据的本地量化引擎。free-stockdb 将数据同步、清洗、复权、组织为可直接用于批量查询、批量计算研究的数据底座。
