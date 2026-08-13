@@ -1,6 +1,6 @@
 # free-stockdb-docker
 
-[free-stockdb](https://github.com/hello245m/free-stockdb) 的 Docker 容器化封装，定位为**个人本地量化数据基座**：把上游引擎稳定跑在 NAS 上，供研究侧（命理档案项目 / AI）取数。本仓库不改上游 C++ 源码，Sync fork 与上游保持同步。
+[free-stockdb](https://github.com/hello245m/free-stockdb) 的 Docker 容器化封装，定位为**本地量化数据基座**：把上游引擎稳定跑在 NAS 上，供研究侧与 AI 取数。本仓库不改上游 C++ 源码，Sync fork 与上游保持同步。
 
 ## 架构（单镜像，一容器两端口）
 
@@ -15,10 +15,9 @@
 - mydb 私有存储：港股日K 拉取（东财/腾讯）、AI 写入接口
 - 查询台：直查任意表；`/mcp` 路由 = AI 取数入口
 
-## 边界
+## 版本
 
-- 看盘功能已移除（用富途等专业软件）；因子/回测/情绪研究在命理档案项目推进，本仓库只做数据基座
-- 版本约定：镜像 tag = 上游发布包版本（`docker/Dockerfile` 的 `ARG VERSION`），面板版本 = `WEBUI_VERSION`（`docker/webui/app.py`），compose 用 `:latest`
+- 镜像 tag = 上游发布包版本（`docker/Dockerfile` 的 `ARG VERSION`），面板版本 = `WEBUI_VERSION`（`docker/webui/app.py`），compose 用 `:latest`
 
 ## 文档
 
