@@ -183,6 +183,83 @@ class TestCache(unittest.TestCase):
         self.assertFalse(any("None" in p.name for p in snaps))
 
 
+class TestTtlCaches(unittest.TestCase):
+    """4s 心跳相关的 TTL 缓存：命中缓存不发请求，force=True 强制刷新。"""
+
+    def setUp(self):
+        import urllib.request as ur
+        self._ur = ur
+        self._orig_urlopen = ur.urlopen
+        self._hits = 0
+
+    def tearDown(self):
+        self._ur.urlopen = self._orig_urlopen
+
+    def _fake_urlopen(self, *a, **k):
+        self._hits += 1
+
+        class Resp:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self):
+                # 返回 000001 日K 两行，其中一行为最新日
+                return json.dumps([{"date": 20260812}, {"date": 20260813}]).encode()
+
+        return Resp()
+
+    def _reset(self):
+        mod._latest_date_cache.update(at=0.0, val=None)
+        mod._code_stats_cache.update(at=0.0, val=None)
+        mod._container_state_cache.update(at=0.0, val=None)
+
+    def test_data_latest_date_cached(self):
+        self._reset()
+        self._ur.urlopen = self._fake_urlopen
+        self.assertEqual(mod.data_latest_date(), "20260813")
+        first_hits = self._hits  # 一次调用 = 近 3 月前缀数（95 天跨 4 个月）次 HTTP
+        self.assertEqual(mod.data_latest_date(), "20260813")  # 命中缓存，零新增请求
+        self.assertEqual(self._hits, first_hits)
+
+    def test_data_latest_date_force_bypasses_cache(self):
+        self._reset()
+        self._ur.urlopen = self._fake_urlopen
+        mod.data_latest_date()
+        first_hits = self._hits
+        mod.data_latest_date(force=True)  # 绕过缓存，重新请求
+        self.assertEqual(self._hits, first_hits * 2)
+
+    def test_code_stats_cached(self):
+        self._reset()
+        self._ur.urlopen = self._fake_urlopen
+        mod.code_stats()
+        self.assertEqual(self._hits, 1)  # 全市场代码列表 = 1 次 GET
+        mod.code_stats()
+        self.assertEqual(self._hits, 1)  # 命中缓存，零新增请求
+
+    def test_container_state_cached_and_force(self):
+        self._reset()
+        calls = []
+        orig = mod.docker_request
+        mod.docker_request = lambda *a, **k: (calls.append(a),
+                                              {"State": {"Status": "running"}, "Config": {"Image": "x"}})[1]
+        try:
+            mod.container_state()
+            mod.container_state()          # 命中缓存，不再发 docker 请求
+            self.assertEqual(len(calls), 1)
+            mod.container_state(force=True)  # force 绕过缓存
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(mod.container_state()["status"], "running")
+            self.assertEqual(len(calls), 2)  # 回落到缓存
+        finally:
+            mod.docker_request = orig
+
+
 class TestReentry(unittest.TestCase):
     def test_lock_prevents_double_start(self):
         # 模拟构建进行中：锁被持有 → 再次启动返回 False

@@ -54,7 +54,7 @@ _last_verify_result: str | None = None  # 最近一次完整性验证结果（pa
 _scheduler_alive = False             # 定时线程心跳（每次循环更新时间戳）
 _scheduler_heartbeat = 0.0           # 定时线程最近一次心跳时间戳（unix）
 _webui_started = time.time()         # webui 进程启动时间戳
-WEBUI_VERSION = "0.3.3"
+WEBUI_VERSION = "0.3.4"
 
 HISTORY_FILE = DATA_DIR / "sync_history.json"
 SCHEDULE_FILE = DATA_DIR / "sync_schedule.json"
@@ -375,13 +375,19 @@ def _sync_effective(before_date, after_date, counts) -> bool:
     return bool(before_date) and bool(after_date) and after_date > before_date
 
 
-def data_latest_date() -> str | None:
+def data_latest_date(force: bool = False) -> str | None:
     """全市场行情最新交易日（8位）：取平安银行 000001 日K 最大日期。
 
     000001 每交易日都有行情，是可靠的"数据同步到哪天"探针；数据源本身
     不含指数表，这里不代表上证指数点位（概览页大盘指数另行处理）。
     近 3 月前缀通配，跨年安全。
+
+    4s 心跳轮询会频繁调用：8 秒 TTL 缓存，避免每 4s 打 3 次 stockdb HTTP。
+    同步验证/重启检测等需要实时的路径传 force=True 绕过缓存。
     """
+    now = time.time()
+    if not force and _latest_date_cache["val"] is not None and now - _latest_date_cache["at"] < 8:
+        return _latest_date_cache["val"]
     import urllib.request, urllib.parse
     from datetime import datetime as dt, timedelta
     today = dt.now()
@@ -398,7 +404,9 @@ def data_latest_date() -> str | None:
                     dates.append(str(row["date"]))
         except Exception:
             continue
-    return max(dates) if dates else None
+    result = max(dates) if dates else None
+    _latest_date_cache.update(at=now, val=result)
+    return result
 
 
 def _classify_code(code: str) -> str:
@@ -1674,7 +1682,11 @@ def code_stats() -> dict:
     """全市场标的数量，股票 / ETF 分开统计（其余归 other），并返回查询延迟 ms。
 
     延迟 = 拉取全市场代码列表耗时，供系统页「行情服务」健康卡显示。
+    全市场代码列表 GET 较贵且 4s 心跳反复调用：15 秒缓存（仅缓存成功结果）。
     """
+    now = time.time()
+    if _code_stats_cache["val"] is not None and now - _code_stats_cache["at"] < 15:
+        return _code_stats_cache["val"]
     import urllib.request, urllib.parse
     t0 = time.time()
     try:
@@ -1691,12 +1703,16 @@ def code_stats() -> dict:
         for c in set(codes):
             stats[_classify_code(c)] += 1
         stats["latency_ms"] = latency_ms
+        _code_stats_cache.update(at=now, val=stats)
         return stats
     except Exception:
         return {"stock": None, "etf": None, "other": None, "latency_ms": None}
 
 
 _coverage_cache: dict = {"at": 0.0, "data": None}  # 15 分钟缓存，避免 4s 轮询重复全历史扫描
+_latest_date_cache: dict = {"at": 0.0, "val": None}  # 8 秒缓存：/api/status 4s 心跳不重复打 stockdb
+_code_stats_cache: dict = {"at": 0.0, "val": None}   # 15 秒缓存：全市场代码列表 GET 较贵
+_container_state_cache: dict = {"at": 0.0, "val": None}  # 5 秒缓存：docker socket 查询
 
 
 def data_coverage() -> dict | None:
@@ -1729,6 +1745,7 @@ def data_coverage() -> dict | None:
 
 
 _mirror_cache: dict = {"at": 0.0, "val": None}  # 镜像日期抓取缓存（10 分钟），避免 4s 轮询重复访问外网
+_mirror_refresh_lock = threading.Lock()  # 防重入：镜像刷新后台线程同一时间只跑一个
 
 
 def mirror_latest_date() -> str | None:
@@ -1737,22 +1754,34 @@ def mirror_latest_date() -> str | None:
     镜像源是 LevelDB 文件镜像（HTTP + manifest），无行情 API，但它首页明文标注
     「数据更新至:YYYY-MM-DD」。抓该日期可判断「本地落后是同步未跑 vs 镜像未发布」。
     可配置 MIRROR_PAGE_URL 覆盖（内网映射/镜像源变更时）。
+
+    镜像抓取是公网请求且可能很慢（最多 12s）：/api/status 4s 心跳里不能同步等它。
+    缓存过期时在后台线程刷新，本请求立即返回旧值（无则 None），下次轮询即有新值。
     """
     if _mirror_cache["val"] is not None and time.time() - _mirror_cache["at"] < 600:
         return _mirror_cache["val"]
-    import urllib.request, re
-    url = os.environ.get("MIRROR_PAGE_URL", "https://a.123128.xyz/")
-    result = None
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=12) as resp:
-            html = resp.read().decode("utf-8", "replace")
-        m = re.search(r"数据更新至:(\d{4}-\d{2}-\d{2})", html)
-        result = m.group(1) if m else None
-    except Exception:
-        result = None
-    _mirror_cache.update(at=time.time(), val=result)
-    return result
+
+    def _refresh():
+        try:
+            import urllib.request, re
+            url = os.environ.get("MIRROR_PAGE_URL", "https://a.123128.xyz/")
+            result = None
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                with urllib.request.urlopen(req, timeout=12) as resp:
+                    html = resp.read().decode("utf-8", "replace")
+                m = re.search(r"数据更新至:(\d{4}-\d{2}-\d{2})", html)
+                result = m.group(1) if m else None
+            except Exception:
+                result = None
+            _mirror_cache.update(at=time.time(), val=result)
+        finally:
+            _mirror_refresh_lock.release()
+
+    if _mirror_refresh_lock.acquire(blocking=False):
+        threading.Thread(target=_refresh, daemon=True).start()
+    # 过期瞬间：立即返回旧值（无则 None），避免阻塞心跳
+    return _mirror_cache["val"]
 
 
 def load_watchlist(scope: str | None = None) -> list[str]:
@@ -1897,28 +1926,41 @@ def docker_request(method: str, path: str, timeout: int = 10) -> dict:
         conn.close()
 
 
-def container_state() -> dict:
+def container_state(force: bool = False) -> dict:
     """返回 stockdb 容器状态详情。
 
     {ok, status, note}：ok=False 表示 docker socket 不可用（热更新无法停/启容器）。
     image/started 供系统页展示；查询失败时保持 None。
+    docker socket 查询在 4s 心跳中频繁触发：5 秒缓存；同步流程里停/启容器后的
+    状态校验传 force=True 绕过缓存（否则可能读到停服前的"running"漏掉补启）。
     """
+    now = time.time()
+    if not force and _container_state_cache["val"] is not None and now - _container_state_cache["at"] < 5:
+        return _container_state_cache["val"]
     try:
         info = docker_request("GET", f"/containers/{STOCKDB_CONTAINER}/json")
     except FileNotFoundError:
-        return {"ok": False, "status": "unknown", "note": "docker socket 未挂载（/var/run/docker.sock 不可达），无法停/启容器",
-                "image": None, "started": None}
+        result = {"ok": False, "status": "unknown", "note": "docker socket 未挂载（/var/run/docker.sock 不可达），无法停/启容器",
+                  "image": None, "started": None}
+        _container_state_cache.update(at=now, val=result)
+        return result
     except PermissionError:
-        return {"ok": False, "status": "unknown", "note": "docker socket 权限不足，无法操控容器",
-                "image": None, "started": None}
+        result = {"ok": False, "status": "unknown", "note": "docker socket 权限不足，无法操控容器",
+                  "image": None, "started": None}
+        _container_state_cache.update(at=now, val=result)
+        return result
     except Exception as exc:
-        return {"ok": False, "status": "unknown", "note": f"docker 查询失败: {exc}",
-                "image": None, "started": None}
+        result = {"ok": False, "status": "unknown", "note": f"docker 查询失败: {exc}",
+                  "image": None, "started": None}
+        _container_state_cache.update(at=now, val=result)
+        return result
     st = info.get("State", {}).get("Status", "unknown")
     cfg = info.get("Config", {}) or {}
     started = (info.get("State", {}) or {}).get("StartedAt") or None
-    return {"ok": True, "status": st, "note": "",
-            "image": cfg.get("Image") or None, "started": started}
+    result = {"ok": True, "status": st, "note": "",
+              "image": cfg.get("Image") or None, "started": started}
+    _container_state_cache.update(at=now, val=result)
+    return result
 
 
 def container_start() -> None:
@@ -2093,10 +2135,10 @@ def run_sync(hot: bool = True, trigger: str = "manual", retry: bool = False) -> 
     try:
         log(f"=== 同步开始 {now()}（{'热更新' if hot else '严格模式(停服)'}｜{'定时' if trigger.startswith('scheduled') else '手动'}{'·重试' if retry else ''}）===")
 
-        # 0. 同步前抓全市场最新交易日（作为同步后验证基准）
+        # 0. 同步前抓全市场最新交易日（作为同步后验证基准；绕过 TTL 缓存）
         before_date = None
         try:
-            before_date = data_latest_date()
+            before_date = data_latest_date(force=True)
             if before_date:
                 log(f"→ 同步前数据最新交易日：{before_date}")
         except Exception:
@@ -2107,14 +2149,14 @@ def run_sync(hot: bool = True, trigger: str = "manual", retry: bool = False) -> 
             _sync_state["phase"] = "stopping"
             log("→ 停止 stockdb 容器 ...")
             try:
-                if container_state().get("status") == "running":
+                if container_state(force=True).get("status") == "running":
                     container_stop()
                 else:
                     log("  （stockdb 已处于停止状态）")
             except Exception as exc:
                 log(f"  ⚠️ 停止失败，继续同步（风险：数据卷并发写）：{exc}")
         else:
-            st = container_state()
+            st = container_state(force=True)
             if st["status"] == "running":
                 log("→ 热更新：stockdb 保持运行，直接增量同步 ...")
             elif st["status"] in ("exited", "not-found"):
@@ -2190,8 +2232,8 @@ def run_sync(hot: bool = True, trigger: str = "manual", retry: bool = False) -> 
             else:
                 _last_verify_result = "skipped"
                 log("  ⚠️ 同步退出码非 0，跳过完整性验证")
-                # 同步失败时确保服务仍在（可能中途被手动停过）
-                if container_state().get("status") != "running":
+                # 同步失败时确保服务仍在（可能中途被手动停过）；force 绕过缓存
+                if container_state(force=True).get("status") != "running":
                     try:
                         container_start()
                         log("  → 已尝试重新启动 stockdb")
@@ -2207,7 +2249,7 @@ def run_sync(hot: bool = True, trigger: str = "manual", retry: bool = False) -> 
                 log("  ✅ stockdb 已启动")
             except Exception as exc:
                 log(f"  ❌ 启动失败：{exc}")
-        elif container_state().get("status") in ("exited", "not-found"):
+        elif container_state(force=True).get("status") in ("exited", "not-found"):
             _sync_state["phase"] = "restarting"
             log("→ 热更新收尾：stockdb 未在运行，尝试启动 ...")
             try:
@@ -2226,7 +2268,7 @@ def run_sync(hot: bool = True, trigger: str = "manual", retry: bool = False) -> 
         # 记录同步历史（时间/触发来源/模式/结果/耗时/下载删除数/数据最新日期/失败原因）
         try:
             counts = parse_sync_counts(_last_sync_stdout)
-            after_date = data_latest_date()
+            after_date = data_latest_date(force=True)
             effective = _sync_effective(before_date, after_date, counts)
             warn = None
             if _sync_state.get("exit_code") == 0 and not effective:
@@ -3212,16 +3254,13 @@ async function refresh(force){
   if(_refreshing){if(force)_refreshQueued=true;return}
   _refreshing=true;
   try{
-    const s=await j('/api/status');
     const active=document.querySelector('.tab-panel.active')?.id||'tab-research';
-    const h=(active==='tab-sync'||active==='tab-system')?await j('/api/health'):null;
-    if(h)_healthCache=h;
-    if(active==='tab-research'){
-      loadResearchOnce();   // 首次进入/页面初始加载时加载市场研究（_rsLoaded 防重复）
-    }else if(active==='tab-study'){
-      loadResearchOnce();   // 研究页：自选列表与查询共用研究数据源
-    }else if(active==='tab-sync'){
-      renderHero(s,h||{});
+    if(active==='tab-sync'){
+      // 同步页：进度/日志需精确 → 每帧全量 status+health（后端 TTL 缓存后开销大降）
+      const s=await j('/api/status');
+      const h=await j('/api/health');
+      if(h)_healthCache=h;
+      renderHero(s,h);
       renderSchView(s.schedule||{});
       renderDataOverview(s);
       const sched=s.schedule||{};
@@ -3230,8 +3269,16 @@ async function refresh(force){
       const lg=await j('/api/log?n=80');
       $('log').textContent=lg.log;   // 日志常展开（HTML 无 display:none，无需折叠逻辑）
     }else if(active==='tab-system'){
+      // 系统页：健康卡需实时 → 每帧全量 status+health（后端缓存后已可接受）
+      const s=await j('/api/status');
+      const h=await j('/api/health');
+      if(h)_healthCache=h;
       renderSystem(s);
       loadHistory();
+    }else{
+      // 研究/个股研究页（含默认初始页）：无需 4s 重请求——研究数据首次进入时
+      // loadResearchOnce 加载一次，另有 8s 构建状态轮询自维持；这里只保底触发
+      loadResearchOnce();
     }
   }catch(e){
     $('log').textContent='状态刷新失败: '+e;$('log').style.display='block';
