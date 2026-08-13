@@ -7,6 +7,16 @@ NAS 拉取时自动匹配自身 CPU 架构。
 - 上游：https://github.com/hello245m/free-stockdb （MIT，fork 于 `awoeyiwuyua/free-stockdb-docker`）
 - 本仓库定位：**只做 docker 化封装，不改上游 C++ 源码**，Sync fork 与上游零冲突
 
+## 版本约定（重要）
+
+- **镜像 tag = 上游 stockdb 发布包版本号**（当前 `0.3.1`）：workflow 手动触发时不填
+  version 输入，就从 `docker/Dockerfile` 的 `ARG VERSION` 打 tag，如
+  `ghcr.io/awoeyiwuyua/free-stockdb:0.3.1` 与 `:latest`。
+- **webui 面板内部版本 = `WEBUI_VERSION`**（当前 0.5.0，见 `docker/webui/app.py`），
+  仅用于面板显示，**不是镜像 tag**。二者是两个维度，不要混用。
+- 迭代节奏：上游发新版 → 升 `ARG VERSION`（镜像 tag 跟着变）；webui 面板改动 →
+  升 `WEBUI_VERSION`（面板显示）。compose 建议用 `:latest`，无需每次改配置。
+
 ## 目录说明
 
 | 文件 | 作用 |
@@ -32,12 +42,12 @@ NAS 拉取时自动匹配自身 CPU 架构。
 **A. GitHub Actions（推荐，需一次性配置）**
 1. 生成 GitHub PAT（权限勾选 `write:packages`）→ 本 fork 仓库 `Settings → Secrets and variables → Actions` → 新增 Secret，名字 `GH_PAT`，粘贴 token
 2. 仓库 `Actions` 页 → 左侧 `Build & Push stockdb image` → `Run workflow`（手动触发）
-3. 等构建完成（约 5–10 分钟），镜像出现在 `ghcr.io/awoeyiwuyua/free-stockdb:0.5.0`
+3. 等构建完成（约 5–10 分钟），镜像出现在 `ghcr.io/awoeyiwuyua/free-stockdb:0.3.1`
 
 **B. 本机/极空间构建（备选）**
 ```bash
 # Mac（已装 Docker Desktop）或极空间 Docker 内，在 docker/ 目录：
-docker build -t ghcr.io/awoeyiwuyua/free-stockdb:0.5.0 .
+docker build -t ghcr.io/awoeyiwuyua/free-stockdb:0.3.1 .
 # 极空间导入镜像：docker save ... | 极空间导入 tar
 ```
 
@@ -50,7 +60,7 @@ docker build -t ghcr.io/awoeyiwuyua/free-stockdb:0.5.0 .
    ```bash
    # 首次：先同步再启动（服务未起，天然满足「同步须停服务」）
    docker run --rm -v "$PWD/data:/data" -v "$PWD/mydb:/mydb" \
-     ghcr.io/awoeyiwuyua/free-stockdb:0.5.0 /bin/sh -c \
+     ghcr.io/awoeyiwuyua/free-stockdb:0.3.1 /bin/sh -c \
      "cd /data && /opt/stockdb/数据更新"
    ```
    （或直接跳过：启动后用网页一键热更新同步）
@@ -152,7 +162,7 @@ webui 容器已内嵌 `/mcp` 路由（无需单独 mcp 容器），走 8081：
 # 停 stockdb 进程 → 增量同步（断点续传，可反复运行直到无新文件）→ 重启进程
 docker compose stop stockdb
 docker run --rm -v "$PWD/data:/data" -v "$PWD/mydb:/mydb" \
-  ghcr.io/awoeyiwuyua/free-stockdb:0.5.0 /bin/sh -c "cd /data && /opt/stockdb/数据更新"
+  ghcr.io/awoeyiwuyua/free-stockdb:0.3.1 /bin/sh -c "cd /data && /opt/stockdb/数据更新"
 docker compose start stockdb
 ```
 > 同步源在 `/data/sync_url.txt`（一行一个镜像根目录；`always` 后缀 = 每次都强制校验该源）。
