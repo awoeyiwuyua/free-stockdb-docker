@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
-"""free-stockdb webui — 行情查询 + 同步管理（纯 Python 标准库，零第三方依赖）
+"""free-stockdb webui — 同步管理 + 运维面板（纯 Python 标准库，零第三方依赖）
 
 功能：
+  - 同步管理：网页一键完成「停 stockdb 进程 → 运行数据更新（增量同步）→ 重启」
   - 行情查询：代理 stockdb 7899 HTTP API（日K/分钟K/复权/股票代码）
-  - 同步管理：挂载 docker socket + /data 卷，网页一键完成
-    「停 stockdb 容器 → 容器内运行数据更新（增量同步）→ 重启 stockdb」
+  - 私有存储：mydb 写入（pybao 客户端）+ 港股日K 拉取（东财/腾讯）
   - 日志查看：同步过程实时写入 /data/sync.log，页面轮询展示
 
+0.5.0 单镜像架构：stockdb 与 webui 同容器，进程级控制（pidfile + SIGTERM），
+不再依赖 docker socket 挂载。
+
 安全边界：
-  - docker 操控仅限固定的 stockdb 容器（stop/start/inspect 白名单），
-    不开放任意命令；写操作（同步/定时/自选）面向内网信任环境，无令牌鉴权。
+  - 进程操控仅限固定的 stockdb 服务（pidfile 停止/启动），不开放任意命令；
+    写操作（同步/定时）面向内网信任环境，无令牌鉴权。
   - 只读查询不鉴权；局域网部署即可，如需公网暴露请自行加反向代理鉴权。
   - 同步串行化（互斥锁），防止并发点击
 """
@@ -19,7 +22,7 @@ from __future__ import annotations
 import http.client
 import json
 import os
-import socket
+import signal
 import subprocess
 import sys
 import threading
@@ -38,11 +41,16 @@ except Exception:  # noqa: BLE001 - MCP 模块缺失时优雅降级
 
 STOCKDB_HOST = os.environ.get("STOCKDB_HOST", "127.0.0.1")
 STOCKDB_PORT = int(os.environ.get("STOCKDB_PORT", "7899"))
-STOCKDB_CONTAINER = os.environ.get("STOCKDB_CONTAINER", "stockdb")
-DOCKER_SOCKET = os.environ.get("DOCKER_SOCKET", "/var/run/docker.sock")
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 SYNC_LOG = DATA_DIR / "sync.log"
 LISTEN_PORT = int(os.environ.get("WEBUI_PORT", "8080"))
+
+# 0.5.0 单镜像：stockdb 与 webui 同容器，进程级控制（不再依赖 docker socket）。
+# entrypoint 后台监督 stockdb 进程存活（读 pidfile，暂停标记存在时不拉起）；
+# webui 通过 pidfile + SIGTERM 停、删除暂停标记让监督器拉起。
+STOCKDB_PIDFILE = Path(os.environ.get("STOCKDB_PIDFILE", "/data/stockdb.pid"))
+STOCKDB_PAUSE = Path(os.environ.get("STOCKDB_PAUSE_FLAG", "/data/.stockdb-paused"))
+STOCKDB_LOG_FILE = Path(os.environ.get("STOCKDB_LOG_FILE", "/data/log.txt"))
 
 # 同步线程状态
 _sync_lock = threading.Lock()
@@ -53,7 +61,7 @@ _last_verify_result: str | None = None  # 最近一次完整性验证结果（pa
 _scheduler_alive = False             # 定时线程心跳（每次循环更新时间戳）
 _scheduler_heartbeat = 0.0           # 定时线程最近一次心跳时间戳（unix）
 _webui_started = time.time()         # webui 进程启动时间戳
-WEBUI_VERSION = "0.4.0"
+WEBUI_VERSION = "0.5.0"
 
 HISTORY_FILE = DATA_DIR / "sync_history.json"
 SCHEDULE_FILE = DATA_DIR / "sync_schedule.json"
@@ -714,7 +722,7 @@ def code_stats() -> dict:
 _coverage_cache: dict = {"at": 0.0, "data": None}  # 15 分钟缓存，避免 4s 轮询重复全历史扫描
 _latest_date_cache: dict = {"at": 0.0, "val": None}  # 8 秒缓存：/api/status 4s 心跳不重复打 stockdb
 _code_stats_cache: dict = {"at": 0.0, "val": None}   # 15 秒缓存：全市场代码列表 GET 较贵
-_container_state_cache: dict = {"at": 0.0, "val": None}  # 5 秒缓存：docker socket 查询
+_container_state_cache: dict = {"at": 0.0, "val": None}  # 5 秒缓存：stockdb 进程探测
 
 
 def data_coverage() -> dict | None:
@@ -838,97 +846,99 @@ def health_status() -> dict:
                 "status": "unknown", "note": f"健康度计算失败: {exc}"}
 
 
-# ==================== 大盘指数快照 ====================
-class DockerUnixSocket(http.client.HTTPConnection):
-    def __init__(self, path: str = "/var/run/docker.sock"):
-        super().__init__("localhost")
-        self._path = path
-
-    def connect(self):
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.connect(self._path)
-        self.sock = sock
+# ==================== stockdb 进程级控制（0.5.0 单镜像，不再依赖 docker socket） ====================
+# entrypoint 后台监督 stockdb 进程存活（读 pidfile，/data/.stockdb-paused 存在时不拉起）；
+# webui 通过 pidfile + SIGTERM 停进程、删除暂停标记让监督器重新拉起。
+# 本地开发模式（无 pidfile/进程）优雅降级为 unknown。
 
 
-def docker_request(method: str, path: str, timeout: int = 10) -> dict:
-    """调用 Docker Engine API，返回 JSON。失败抛异常（由调用方处理）。"""
-    conn = DockerUnixSocket(DOCKER_SOCKET)
+def _stockdb_pid() -> int | None:
     try:
-        # HTTPConnection.request() 不接受 timeout 关键字参数；
-        # 超时在 socket 上设置（Unix socket connect/read 均生效）
-        if conn.sock is not None:
-            conn.sock.settimeout(timeout)
-        conn.request(method, path)
-        resp = conn.getresponse()
-        body = resp.read().decode("utf-8", "replace")
-        if resp.status >= 400:
-            raise RuntimeError(f"docker {method} {path}: HTTP {resp.status} {resp.reason} {body[:200]}")
-        return json.loads(body) if body else {}
-    finally:
-        conn.close()
+        text = STOCKDB_PIDFILE.read_text(encoding="utf-8", errors="replace").strip()
+        return int(text) if text.isdigit() else None
+    except Exception:
+        return None
+
+
+def stockdb_proc_alive() -> bool:
+    """pidfile 中的进程是否存活（pid 存在且可 SIG 0 探测）。"""
+    pid = _stockdb_pid()
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)  # 探测存在性，不发信号
+        return True
+    except OSError:
+        return False
+
+
+def _send_term(pid: int, timeout: float = 30.0) -> None:
+    """SIGTERM 并等待退出；超时升级 SIGKILL。"""
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        return  # 已退出
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not stockdb_proc_alive():
+            return
+        time.sleep(0.3)
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except OSError:
+        pass
 
 
 def container_state(force: bool = False) -> dict:
-    """返回 stockdb 容器状态详情。
+    """返回 stockdb 运行状态详情（进程级）。
 
-    {ok, status, note}：ok=False 表示 docker socket 不可用（热更新无法停/启容器）。
-    image/started 供系统页展示；查询失败时保持 None。
-    docker socket 查询在 4s 心跳中频繁触发：5 秒缓存；同步流程里停/启容器后的
-    状态校验传 force=True 绕过缓存（否则可能读到停服前的"running"漏掉补启）。
+    {ok, status, note}：ok=False 表示本机无法控制 stockdb（本地开发/无 pidfile）。
+    started 为进程启动时间（epoch 秒，供运行时长展示）；查询失败时保持 None。
+    进程探测在 4s 心跳中频繁触发：5 秒缓存；同步流程里停/启后的状态校验传
+    force=True 绕过缓存（否则可能读到停服前的 running 漏掉补启）。
     """
     now = time.time()
     if not force and _container_state_cache["val"] is not None and now - _container_state_cache["at"] < 5:
         return _container_state_cache["val"]
-    try:
-        info = docker_request("GET", f"/containers/{STOCKDB_CONTAINER}/json")
-    except FileNotFoundError:
-        result = {"ok": False, "status": "unknown", "note": "docker socket 未挂载（/var/run/docker.sock 不可达），无法停/启容器",
-                  "image": None, "started": None}
-        _container_state_cache.update(at=now, val=result)
-        return result
-    except PermissionError:
-        result = {"ok": False, "status": "unknown", "note": "docker socket 权限不足，无法操控容器",
-                  "image": None, "started": None}
-        _container_state_cache.update(at=now, val=result)
-        return result
-    except Exception as exc:
-        result = {"ok": False, "status": "unknown", "note": f"docker 查询失败: {exc}",
-                  "image": None, "started": None}
-        _container_state_cache.update(at=now, val=result)
-        return result
-    st = info.get("State", {}).get("Status", "unknown")
-    cfg = info.get("Config", {}) or {}
-    started = (info.get("State", {}) or {}).get("StartedAt") or None
-    result = {"ok": True, "status": st, "note": "",
-              "image": cfg.get("Image") or None, "started": started}
+    alive = stockdb_proc_alive()
+    started = None
+    if alive:
+        try:
+            started = int(Path(f"/proc/{_stockdb_pid()}/stat").stat().st_ctime)
+        except Exception:
+            started = None
+    result = {"ok": alive, "status": "running" if alive else "stopped",
+              "note": "" if alive else "stockdb 进程未运行",
+              "started": started}
     _container_state_cache.update(at=now, val=result)
     return result
 
 
 def container_start() -> None:
-    docker_request("POST", f"/containers/{STOCKDB_CONTAINER}/start")
+    """删除暂停标记，由 entrypoint 监督器拉起 stockdb（进程不存在时立即拉起）。"""
+    STOCKDB_PAUSE.unlink(missing_ok=True)
 
 
 def container_stop() -> None:
-    try:
-        docker_request("POST", f"/containers/{STOCKDB_CONTAINER}/stop")
-    except RuntimeError as exc:
-        # 容器已停止时 stop 返回 304，属正常
-        if "304" not in str(exc):
-            raise
+    """写暂停标记（监督器不再拉起）+ SIGTERM 停进程（同 PID 双保险）。"""
+    STOCKDB_PAUSE.touch(exist_ok=True)
+    pid = _stockdb_pid()
+    if pid:
+        _send_term(pid)
 
 
 def container_restart() -> None:
-    """重启容器（热更新失败止损/加载新快照用）。"""
-    docker_request("POST", f"/containers/{STOCKDB_CONTAINER}/restart")
+    """重启 stockdb 进程（热更新失败止损/加载新快照用）。"""
+    container_stop()
+    time.sleep(1)
+    container_start()
 
 
 def wait_stockdb_ready(timeout: float = 60.0) -> bool:
     """轮询等待 stockdb HTTP 服务就绪（重启后验证/查询前调用）。
 
-    容器 restart 返回不代表服务已可查询，直接连可能连接拒绝导致误判；
-    轮询 7899 的 /?cmd=get&t=股票代码 直到响应（含健康检查端口映射未生效前的
-    短暂窗口）。超时返回 False。
+    进程 restart 返回不代表服务已可查询，直接连可能连接拒绝导致误判；
+    轮询 7899 的 /?cmd=get&t=股票代码 直到响应。超时返回 False。
     """
     import urllib.request, urllib.parse
     deadline = time.time() + timeout
@@ -948,9 +958,8 @@ def reload_stockdb() -> list[str]:
     """向运行中的 stockdb 发送 reload 命令，热重载 dataN 快照（零中断）。
 
     上游同步器设计为同步后向本地 127.0.0.1:7899 发 GET /?cmd=reload&t=<remote>
-    让运行中的服务重载 LevelDB（同步日志 "reload 1 skipped: local program is
-    unavailable" 即因容器内 127.0.0.1 指向自身而非 stockdb）。webui 容器内代发
-    到 STOCKDB_HOST 即可。返回成功重载的 remote 列表（如 ["0","1"]）。
+    让运行中的服务重载 LevelDB。单镜像下 STOCKDB_HOST=127.0.0.1 即自身。
+    返回成功重载的 remote 列表（如 ["0","1"]）。
     """
     import urllib.request, urllib.parse
     ok: list[str] = []
@@ -967,35 +976,14 @@ def reload_stockdb() -> list[str]:
 
 
 def container_logs(tail: int = 150) -> str:
-    """读取 stockdb 容器日志尾部。
-
-    Docker Engine logs API 默认返回多路复用帧（8 字节头 + payload），需解帧；
-    JSON 日志则返回纯文本行。返回去帧后的日志文本。
-    """
-    raw = docker_request("GET", f"/containers/{STOCKDB_CONTAINER}/logs?stdout=1&stderr=1&tail={tail}")
-    if not isinstance(raw, str):
-        raise RuntimeError("docker logs 返回非文本")
-    if isinstance(raw, str) and not raw:
+    """读取 stockdb 日志尾部（conf 的 logger.output=/data/log.txt）。"""
+    if not STOCKDB_LOG_FILE.exists():
         return ""
-    data = raw.encode("utf-8", "replace")
-    out = bytearray()
-    i = 0
-    n = len(data)
     try:
-        while i + 8 <= n:
-            if data[i] > 2:  # 非帧头（0/1/2），按纯文本处理
-                out.extend(data[i:])
-                break
-            size = int.from_bytes(data[i + 4:i + 8], "big")
-            i += 8
-            out.extend(data[i:i + size])
-            i += size
-        if i < n and data[i] <= 2 and i + 8 > n:  # 尾部残帧
-            out.extend(data[i:])
-    except Exception:
-        pass
-    text = bytes(out).decode("utf-8", "replace")
-    return "\n".join(line for line in text.splitlines() if line.strip())
+        lines = STOCKDB_LOG_FILE.read_text(encoding="utf-8", errors="replace").splitlines()
+        return "\n".join(lines[-tail:])
+    except Exception as exc:
+        raise RuntimeError(f"读取 stockdb 日志失败: {exc}") from exc
 
 
 # ==================== 同步任务（后台线程） ====================
@@ -1089,7 +1077,7 @@ def run_sync(hot: bool = True, trigger: str = "manual", retry: bool = False) -> 
         # 1.（严格模式）停 stockdb；热更新模式不停
         if not hot:
             _sync_state["phase"] = "stopping"
-            log("→ 停止 stockdb 容器 ...")
+            log("→ 停止 stockdb 进程 ...")
             try:
                 if container_state(force=True).get("status") == "running":
                     container_stop()
@@ -1185,7 +1173,7 @@ def run_sync(hot: bool = True, trigger: str = "manual", retry: bool = False) -> 
         # 4.（严格模式）重启服务；热更新若中途发现服务没跑也补启
         if not hot:
             _sync_state["phase"] = "restarting"
-            log("→ 启动 stockdb 容器 ...")
+            log("→ 启动 stockdb 进程 ...")
             try:
                 container_start()
                 log("  ✅ stockdb 已启动")
@@ -1695,13 +1683,13 @@ color:var(--text);padding:8px 10px;border-radius:8px;width:220px}
     <div id="sysOK" style="display:flex;align-items:center;gap:8px;font-weight:700;font-size:16px;margin-bottom:4px">…</div>
     <div class="hc-cards">
       <div class="hc"><div class="lbl">行情服务</div><div class="st"><i id="hcSvcDot"></i><span id="hcSvc">…</span></div><div class="sub" id="hcSvcSub">…</div></div>
-      <div class="hc"><div class="lbl">Docker</div><div class="st"><i id="hcDkrDot"></i><span id="hcDkr">…</span></div><div class="sub" id="hcDkrSub">…</div></div>
+      <div class="hc"><div class="lbl">stockdb</div><div class="st"><i id="hcDkrDot"></i><span id="hcDkr">…</span></div><div class="sub" id="hcDkrSub">…</div></div>
       <div class="hc"><div class="lbl">自动任务</div><div class="st"><i id="hcSchedDot"></i><span id="hcSched">…</span></div><div class="sub" id="hcSchedSub">…</div></div>
       <div class="hc"><div class="lbl">同步能力</div><div class="st"><i id="hcCapDot"></i><span id="hcCap">…</span></div><div class="sub" id="hcCapSub">…</div></div>
     </div>
     <div id="dkrWarn" class="warn-card" style="display:none">
-      <div class="t">Docker 管理不可用</div>
-      <div class="d">未检测到 /var/run/docker.sock。行情查询仍可使用，但无法重启容器或执行停服同步。</div>
+      <div class="t">stockdb 进程不可控</div>
+      <div class="d">未检测到 stockdb 进程（pidfile 不存在）。行情查询仍可使用，但无法重启 stockdb 或执行停服同步。</div>
     </div>
   </div>
   <div class="card"><div class="card-title">存储空间</div>
@@ -1711,9 +1699,9 @@ color:var(--text);padding:8px 10px;border-radius:8px;width:220px}
   </div>
   <div class="card"><div class="card-title">运行信息</div>
     <div class="info-grid">
-      <div class="it"><span class="lk">镜像</span><span id="cImage">—</span></div>
-      <div class="it"><span class="lk">容器状态</span><span id="cState">—</span></div>
-      <div class="it"><span class="lk">运行时长</span><span id="cUptime">—</span></div>
+      <div class="it"><span class="lk">数据卷</span><span id="cImage">—</span></div>
+      <div class="it"><span class="lk">stockdb 进程</span><span id="cState">—</span></div>
+      <div class="it"><span class="lk">进程时长</span><span id="cUptime">—</span></div>
       <div class="it"><span class="lk">同步节点</span><span id="cSource">—</span></div>
       <div class="it"><span class="lk">WebUI 版本</span><span id="cVer">—</span></div>
       <div class="it"><span class="lk">WebUI 启动</span><span id="cStart">—</span></div>
@@ -1725,7 +1713,7 @@ color:var(--text);padding:8px 10px;border-radius:8px;width:220px}
   </div>
   <div class="card"><div class="card-title">运维工具</div>
     <div class="actions">
-      <button class="btn-ghost" id="btnLogs" disabled onclick="toggleContainerLogs()">查看容器日志</button>
+      <button class="btn-ghost" id="btnLogs" disabled onclick="toggleContainerLogs()">查看 stockdb 日志</button>
       <button class="btn-danger" id="btnRestart" disabled onclick="restartContainer()">重启 stockdb</button>
       <span class="hint" id="containerMsg"></span>
     </div>
@@ -1991,10 +1979,10 @@ function renderSystem(s){
   $('hcSvcDot').style.background=svcOK?'var(--ok)':'var(--err)';
   $('hcSvc').textContent=svcOK?'正常':'不可用';
   $('hcSvcSub').textContent='响应 '+(lat!=null?lat+' ms':'—')+' · 数据至 '+(s.data_latest?String(s.data_latest).slice(4,6)+'-'+String(s.data_latest).slice(6,8):'—');
-  // Docker
+  // stockdb 进程（单镜像同容器，进程级控制）
   $('hcDkrDot').style.background=cs.ok?'var(--ok)':'var(--err)';
-  $('hcDkr').textContent=cs.ok?'已连接':'不可用';
-  $('hcDkrSub').textContent=cs.ok?('容器 '+cs.status):'未检测到 docker.sock';
+  $('hcDkr').textContent=cs.ok?'运行中':'已停止';
+  $('hcDkrSub').textContent=cs.ok?('进程 '+cs.status):'stockdb 进程未运行';
   // 自动任务：运行状态 + 待重试提示
   const sch=s.schedule||{};
   $('hcSchedDot').style.background=s.scheduler_alive?'var(--ok)':'var(--err)';
@@ -2011,7 +1999,7 @@ function renderSystem(s){
   // 总状态
   const issues=(svcOK?0:1)+(cap.ok?0:1)+(s.scheduler_alive?0:1)+(cs.ok?0:1);
   $('sysOK').innerHTML='<span class="dot '+(issues===0?'ok':'warn')+'"></span> '+(issues===0?'系统运行正常':'存在待处理项');
-  // Docker 警告卡 + 运维按钮禁用
+  // stockdb 不可控警告卡 + 运维按钮禁用
   $('dkrWarn').style.display=cs.ok?'none':'block';
   $('btnLogs').disabled=!cs.ok;
   $('btnRestart').disabled=!cs.ok;
@@ -2022,7 +2010,7 @@ function renderSystem(s){
     const bar=$('diskBar');bar.style.width=pct+'%';bar.className=pct>80?'high':'';
   }
   // 运行信息
-  $('cImage').textContent=cs.image||'—';
+  $('cImage').textContent=s.data_dir||'—';
   $('cState').textContent=cs.status||'—';
   $('cUptime').textContent=cs.started?fmtUptime(cs.started):'—';
   $('cSource').textContent=s.source||'—';
@@ -2065,7 +2053,7 @@ function fmtUptime(iso){
   }catch(e){return iso}
 }
 async function restartContainer(){
-  if(!confirm('确定重启 stockdb 容器？重启期间行情服务会短暂中断。')){$('containerMsg').textContent='已取消';return}
+  if(!confirm('确定重启 stockdb 进程？重启期间行情服务会短暂中断。')){$('containerMsg').textContent='已取消';return}
   try{const r=await j('/api/container/restart',{method:'POST'});$('containerMsg').textContent=r.msg||'已执行';toast(r.msg||'已执行')}
   catch(e){$('containerMsg').textContent='重启失败: '+e}
 }
@@ -2120,7 +2108,7 @@ async function toggleContainerLogs(){
   pre.style.display='block';pre.textContent='（加载中…）';
   try{
     const r=await j('/api/container/logs?tail=150');
-    pre.textContent=r.log||'（容器无日志输出）';
+    pre.textContent=r.log||'（stockdb 日志为空）';
     if(r.error)pre.textContent+='\n\n'+r.error;
     $('containerMsg').textContent='';
   }catch(e){pre.textContent='读取失败: '+e}
@@ -2393,34 +2381,29 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, json.dumps({"msg": f"已启动{mode}同步（手动），日志将实时刷新"}))
 
     def _container_logs(self):
-        """stockdb 容器日志尾部（系统页查看用）。无 docker 时降级提示。"""
+        """stockdb 日志尾部（系统页查看用，读 /data/log.txt）。"""
         tail = int(parse_qs(urlparse(self.path).query).get("tail", ["150"])[0])
         try:
             text = container_logs(tail)
             self._send(200, json.dumps({"log": text}, ensure_ascii=False))
-        except FileNotFoundError:
-            self._send(200, json.dumps({"log": "", "error": "docker socket 未挂载，无法读取容器日志" }, ensure_ascii=False))
         except Exception as exc:
             self._send(200, json.dumps({"log": "", "error": f"读取失败: {exc}"}, ensure_ascii=False))
 
     def _container_restart(self):
-        """重启 stockdb 容器（系统页按钮，前端已二次确认）。"""
+        """重启 stockdb 进程（系统页按钮，前端已二次确认）。"""
         if _sync_state["running"]:
-            self._send(200, json.dumps({"msg": "同步进行中，请勿重启容器"}))
+            self._send(200, json.dumps({"msg": "同步进行中，请勿重启 stockdb"}))
             return
         try:
             container_restart()
-            self._send(200, json.dumps({"msg": "已发送重启命令，容器状态将自动刷新"}))
-        except FileNotFoundError:
-            self._send(200, json.dumps({"msg": "docker socket 未挂载，无法重启容器（本地开发模式不可用）"}))
+            self._send(200, json.dumps({"msg": "已发送重启，进程状态将自动刷新"}))
         except Exception as exc:
             self._send(200, json.dumps({"msg": f"重启失败: {exc}"}))
 
 
 def main():
     print(f"webui listening on 0.0.0.0:{LISTEN_PORT}", file=sys.stderr)
-    print(f"stockdb: {STOCKDB_HOST}:{STOCKDB_PORT} | container: {STOCKDB_CONTAINER} | data: {DATA_DIR}",
-          file=sys.stderr)
+    print(f"stockdb: {STOCKDB_HOST}:{STOCKDB_PORT}（同容器进程）| data: {DATA_DIR}", file=sys.stderr)
     threading.Thread(target=scheduler_loop, daemon=True).start()
     ThreadingHTTPServer(("0.0.0.0", LISTEN_PORT), Handler).serve_forever()
 
