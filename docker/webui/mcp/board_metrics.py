@@ -1,7 +1,7 @@
 """打板开盘溢价计算的最小纯标准库子集。
 
-vendor 自命理档案 mingli_app/quant/emotion/metrics.py，仅保留 MCP 所需最小集，
-保持算法原样未改（打板溢价口径、涨停价取整、20cm 判定、过滤规则一行不改）。
+vendor 自个人量化研究项目的情绪指标模块（quant/emotion/metrics.py，仅保留
+MCP 所需最小集），保持算法原样未改（打板溢价口径、涨停价取整、20cm 判定、过滤规则一行不改）。
 
 保留符号：
 - DailyBar dataclass

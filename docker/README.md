@@ -114,7 +114,7 @@ WEBUI_PORT=18080 ./docker/webui/dev.sh           # 换本地端口
 
 > **0.5.0 单镜像架构**：stockdb（7899）与 webui（8080）同容器，进程级控制（pidfile + SIGTERM），
 > 不再挂载 docker.sock。webui 崩溃自动重启，不影响 stockdb 数据服务。
-> 0.4.0 起 webui 已瘦身为**运维面板**（数据基座管理），不再含行情/自选/K线等看盘功能——看盘请用富途等专业软件，因子/回测研究在命理档案项目推进。
+> 0.4.0 起 webui 已瘦身为**运维面板**（数据基座管理），行情/自选/K线等展示功能已移除。
 
 > 同步主流程为**热更新**（同步器检测到新数据文件后自动重启 stockdb 加载新快照，
 > 重启窗口约 1-2 秒）；**停服同步**为故障兜底（「更多操作 → 停服同步」）。
@@ -191,7 +191,7 @@ docker compose pull && docker compose up -d
 ## 后续扩展（本版不启用，需求浮现后再加）
 
 - **AI MCP 容器化**：官方 `调用方式/ai_mcp/stockdb_full_mcp.py`（需容器带 Python + pybao C 扩展），或继续用本仓库 `docker/webui/mcp/stockdb_mcp_server.py`（HTTP 只读，已随 webui 容器的 `/mcp` 路由承载，NAS 部署后走 `http://<NAS_IP>:8081/mcp`）
-- **webui 增强**：0.4.0 起 webui 为运维面板（同步/健康/查询/私有存储），不再维护看盘功能；数据接入统一走 stockdb HTTP（7899）与 `/mcp` 路由。
+- **webui 增强**：0.4.0 起 webui 为运维面板（同步/健康/查询/私有存储），行情展示功能已移除；数据接入统一走 stockdb HTTP（7899）与 `/mcp` 路由。
 - **定时同步**：极空间计划任务，或 webui 内加定时（后续版本）
 
 ## 风险与备忘
