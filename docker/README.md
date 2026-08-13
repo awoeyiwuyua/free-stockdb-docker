@@ -108,13 +108,24 @@ WEBUI_PORT=18080 ./docker/webui/dev.sh           # 换本地端口
 > A股休市表（`app.py` 的 `XSHG_HOLIDAYS`）取自 [exchange_calendars](https://github.com/gerrymanoim/exchange_calendars) XSHG 日历，数据截至 2026 年；官方次年放假安排公布后，用 `docker/webui/scripts/extract_xshg_holidays.py` 重新提取更新（webui 运行时零依赖，判定不依赖外部服务）。
 
 ### 4. 本地 ZCode 接入
-本机 `scripts/stockdb_mcp_server.py`（只读 MCP，连 `STOCKDB_HOST:7899`）：
+只读 MCP server 已迁入本仓库 `mcp/stockdb_mcp_server.py`（纯标准库，连 `STOCKDB_HOST:7899`），
+支持 stdio 与 HTTP 两种传输。
+
+**A. stdio（本机 ZCode）**
 ```bash
 # 连通性自检（替换为你的 NAS 地址）：
-STOCKDB_HOST=<NAS_IP> uv run python scripts/stockdb_mcp_server.py --self-check
-# 通过后，把 ~/.zcode/cli/config.json 的 stockdb-native 加 env：
+STOCKDB_HOST=<NAS_IP> uv run python mcp/stockdb_mcp_server.py --self-check
+# 通过后，在 ZCode Settings → MCP 加 stockdb-native，command 指向本文件：
 #   "env": {"STOCKDB_HOST": "<NAS_IP>"}
 ```
+
+**B. HTTP（NAS 容器部署，推荐）**
+compose 里的 `mcp` 服务已在 NAS 上跑 HTTP（容器内 8080 → 宿主 8082），
+ZCode / Codex 直接填 `type: http` 即可，无需本地 Python：
+```json
+{"type":"http","url":"http://<NAS_IP>:8082/mcp"}
+```
+健康检查：`curl http://<NAS_IP>:8082/` 应返回 `stockdb-mcp ok`。
 
 ---
 
@@ -205,7 +216,7 @@ sqlite3 ./research/market_research.sqlite3 \
 
 ## 后续扩展（本版不启用，需求浮现后再加）
 
-- **AI MCP 容器化**：官方 `调用方式/ai_mcp/stockdb_full_mcp.py`（需容器带 Python + pybao C 扩展），或继续用本仓库 `scripts/stockdb_mcp_server.py`（HTTP 只读，NAS 部署后改 `STOCKDB_HOST` 即可，无需容器化）
+- **AI MCP 容器化**：官方 `调用方式/ai_mcp/stockdb_full_mcp.py`（需容器带 Python + pybao C 扩展），或继续用本仓库 `mcp/stockdb_mcp_server.py`（HTTP 只读，已随 compose 的 `mcp` 服务容器化，NAS 部署后走 `http://<NAS_IP>:8082/mcp`）
 - **webui 增强**：当前 webui 保持纯标准库后端，已包含市场复盘、因子排行、K 线与多周期视图；后续新增研究模块继续复用本地 ECharts 与 StockDB HTTP API。
 - **定时同步**：极空间计划任务，或 webui 内加定时（后续版本）
 
