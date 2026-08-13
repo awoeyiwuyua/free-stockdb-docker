@@ -11,12 +11,11 @@ NAS 拉取时自动匹配自身 CPU 架构。
 
 | 文件 | 作用 |
 |------|------|
-| `Dockerfile` | 多阶段：下载官方发布包 + SHA256 校验 + 静态二进制打包进 alpine |
-| `docker-compose.yml` | `stockdb` 服务（常驻）+ `stockdb-sync`（一次性增量同步，sync profile）+ `webui/`（自建运维面板，同步管理+健康监控+私有存储+AI 查询） |
-| `stockdb.conf` | 容器内配置模板：`server.ip: 0.0.0.0`（默认 127.0.0.1，容器内必须改才能映射）；pidfile/log 绝对路径落 `/data` 卷；首次启动拷到 `/data/stockdb.conf` 供编辑 |
-| `entrypoint.sh` | 容器入口：切到 `/data` 可写卷 → 拷贝 conf/sync_url 模板 → 以绝对路径 conf 启动 `stockdb`（发行版要求 `stockdb /path/to/conf`） |
-| `sync.sh` | 同步封装：切到 `/data` → 读 `/data/sync_url.txt` 数据源 → 运行 `数据更新` 增量同步 |
-| `.github/workflows/build-image.yml` | GitHub Actions：手动触发，buildx 构建 amd64+arm64 推 ghcr.io |
+| `Dockerfile` | 多阶段（0.5.0 起**单镜像**）：下载官方发布包（服务端+同步器+pybao）+ SHA256 校验 + webui 运维面板，一容器含 stockdb(7899)+webui(8080) |
+| `docker-compose.yml` | 单 service `stockdb`（端口 7899 + 8081，挂载 `./data` `./mydb`），不再挂载 docker.sock |
+| `stockdb.conf` | 容器内配置模板：`server.ip: 0.0.0.0`；pidfile `/data/stockdb.pid`、log `/data/log.txt`；首次启动拷到 `/data/stockdb.conf` 供编辑 |
+| `webui/entrypoint.sh` | 容器入口（0.5.0）：数据卷准备 → 可选首次同步（`STOCKDB_SYNC_FIRST=1`）→ 后台监督 stockdb 进程存活 → 前台循环拉起 webui（崩溃自动重启） |
+| `.github/workflows/build-image.yml` | GitHub Actions：手动触发，buildx 构建 amd64+arm64 单镜像推 ghcr.io |
 
 ---
 
@@ -33,26 +32,28 @@ NAS 拉取时自动匹配自身 CPU 架构。
 **A. GitHub Actions（推荐，需一次性配置）**
 1. 生成 GitHub PAT（权限勾选 `write:packages`）→ 本 fork 仓库 `Settings → Secrets and variables → Actions` → 新增 Secret，名字 `GH_PAT`，粘贴 token
 2. 仓库 `Actions` 页 → 左侧 `Build & Push stockdb image` → `Run workflow`（手动触发）
-3. 等构建完成（约 5–10 分钟），镜像出现在 `ghcr.io/awoeyiwuyua/free-stockdb:0.3.1`
+3. 等构建完成（约 5–10 分钟），镜像出现在 `ghcr.io/awoeyiwuyua/free-stockdb:0.5.0`
 
 **B. 本机/极空间构建（备选）**
 ```bash
 # Mac（已装 Docker Desktop）或极空间 Docker 内，在 docker/ 目录：
-docker build -t ghcr.io/awoeyiwuyua/free-stockdb:0.3.1 .
+docker build -t ghcr.io/awoeyiwuyua/free-stockdb:0.5.0 .
 # 极空间导入镜像：docker save ... | 极空间导入 tar
 ```
 
 ### 3. 极空间部署
 1. 极空间 Docker → 项目 → 新建 → 上传/粘贴 `docker-compose.yml`，项目目录建议 `/vol1/docker/stockdb/`
-2. compose 会在项目目录下自动创建 `data/`、`mydb/`、`research/`、`log/` 子目录（数据持久化）
+2. compose 会在项目目录下自动创建 `data/`、`mydb/` 子目录（数据持久化）
 3. **首次同步数据**（断点续传，一次可能数 GB，需较长时间，可反复运行）——二选一：
 
    **A. 有主机终端**（SSH / Docker 项目终端，同步须停服务）：
    ```bash
-   docker compose stop stockdb
-   docker compose --profile sync run --rm stockdb-sync
-   docker compose start stockdb
+   # 首次：先同步再启动（服务未起，天然满足「同步须停服务」）
+   docker run --rm -v "$PWD/data:/data" -v "$PWD/mydb:/mydb" \
+     ghcr.io/awoeyiwuyua/free-stockdb:0.5.0 /bin/sh -c \
+     "cd /data && /opt/stockdb/数据更新"
    ```
+   （或直接跳过：启动后用网页一键热更新同步）
 
    **B. 无主机终端（只有图形界面）——容器 sync-first 模式（推荐给极空间）**：
    - 极空间 Docker → 项目 → stockdb 容器 → **编辑环境变量**，加 `STOCKDB_SYNC_FIRST=1`
@@ -63,7 +64,7 @@ docker build -t ghcr.io/awoeyiwuyua/free-stockdb:0.3.1 .
    - 同步完成后可删除该变量（或保留：每次重启都自动增量同步，数据保持最新，
      只是启动多花几分钟）
 
-4. 启动服务（方式 A 已含；方式 B 重启容器即完成同步+启动）：
+4. 启动服务：
    ```bash
    docker compose up -d stockdb
    ```
@@ -74,8 +75,8 @@ docker build -t ghcr.io/awoeyiwuyua/free-stockdb:0.3.1 .
    curl "http://<NAS_IP>:7899/?cmd=get&t=日k:600633:20260810" # 应返回日K
    docker compose ps                                        # stockdb 状态应为 running(healthy)
    ```
-   webui 运维面板（同步管理 + 健康监控 + AI 查询）：浏览器打开 `http://<NAS_IP>:18080`
-   （若 18080 被占用，改 `docker-compose.yml` 里 `18080:8080` 的宿主端口即可，
+   webui 运维面板（同步管理 + 健康监控 + AI 查询）：浏览器打开 `http://<NAS_IP>:8081`
+   （若 8081 被占用，改 `docker-compose.yml` 里 `8081:8080` 的宿主端口即可，
    容器内 8080 不变）。
 
 ### 3.5 本地迭代 webui（Mac 等有 python3 的机器）
@@ -90,18 +91,20 @@ WEBUI_PORT=18080 ./docker/webui/dev.sh           # 换本地端口
 ```
 
 - 本地数据（同步历史/日志）落在 `docker/webui/.dev-data/`（已 gitignore），不碰 NAS 数据卷
-- docker 操控与同步依赖容器内 `/opt/stockdb/数据更新`，本地不挂载 docker socket，对应接口自动降级为"不可用"提示——这些改动需推到 NAS 重建 webui 镜像后验证
-- 改完 `app.py` 后 `docker compose up -d --build webui` 可重新构建（也可用 GH Actions / `docker build` 流程，见上文）
+- 同步依赖容器内 `/opt/stockdb/数据更新`；本地无该二进制时同步接口自动降级为"不可用"提示——这些改动需推到 NAS 重建镜像后验证
+- 改完 `app.py` 后重新构建单镜像（GH Actions / `docker build` 流程，见上文），极空间上 `docker compose up -d stockdb` 拉新镜像重启
 
 **webui 功能速览**（轻量 NAS 运维控制台风格，深色 + 状态优先 + 响应式）：
 
 | 页签 | 能力 |
 |------|------|
 | 数据同步 | 主状态区（数据是否最新 + 立即热更新 + 更多操作→停服同步备用）、同步进度（阶段/耗时/进度条）、自动同步设置卡（多时间点、仅交易日、失败自动重试）、数据概况（股票/ETF 数量、覆盖范围）、最近同步（桌面表格 + 手机卡片、失败原因展开）、日志（运行中/失败自动展开） |
-| 系统 | 健康检查面板（行情服务延迟 / Docker 连接 / 自动任务三卡）、存储空间条、运行信息（镜像/状态/时长/节点）、运维工具（容器日志、重启 stockdb，描边警告样式）、Docker 不可用警告卡、开发工具（原始查询代理，直查 stockdb 任意表） |
+| 系统 | 健康检查面板（行情服务延迟 / stockdb 进程 / 自动任务三卡）、存储空间条、运行信息（数据卷/进程状态/进程时长/节点）、运维工具（stockdb 日志、重启 stockdb，描边警告样式）、stockdb 不可控警告卡、开发工具（原始查询代理，直查 stockdb 任意表） |
 | 私有存储（同步页子页签） | 港股日K 手动拉取（东财/腾讯，写入 `hk日k` 表）、AI 写入接口（自定义表，表名与上游保留表隔离） |
 
-> 0.4.0 起 webui 瘦身为**运维面板**（数据基座管理），不再含行情/自选/K线等看盘功能——看盘请用富途等专业软件，因子/回测研究在命理档案项目推进。
+> **0.5.0 单镜像架构**：stockdb（7899）与 webui（8080）同容器，进程级控制（pidfile + SIGTERM），
+> 不再挂载 docker.sock。webui 崩溃自动重启，不影响 stockdb 数据服务。
+> 0.4.0 起 webui 已瘦身为**运维面板**（数据基座管理），不再含行情/自选/K线等看盘功能——看盘请用富途等专业软件，因子/回测研究在命理档案项目推进。
 
 > 同步主流程为**热更新**（同步器检测到新数据文件后自动重启 stockdb 加载新快照，
 > 重启窗口约 1-2 秒）；**停服同步**为故障兜底（「更多操作 → 停服同步」）。
@@ -134,20 +137,24 @@ webui 容器已内嵌 `/mcp` 路由（无需单独 mcp 容器），走 8081：
 
 ---
 
-## 二、日常数据更新（增量同步，须停服务）
+## 二、日常数据更新（增量同步）
 
-官方要求**同步期间停止服务**（`docs/DATA_SOURCE.md`：同步应先停服务、完成后重启）。两步：
+官方要求**同步期间停止服务**（`docs/DATA_SOURCE.md`）。0.5.0 起三种方式任选：
 
+**方式 1（推荐，网页一键热更新）**：浏览器打开 `http://<NAS_IP>:8081` → 点「立即热更新」。
+同步期间 stockdb 保持运行（reload 热重载零中断），同步失败自动重启进程兜底。
+
+**方式 2（停服同步，故障兜底）**：网页「更多操作 → 停服同步」，webui 会停 stockdb 进程 →
+运行同步器 → 重启进程，全程网页操作无需终端。
+
+**方式 3（命令行/计划任务，极空间计划任务可定时）**：
 ```bash
-# 1. 停服务
+# 停 stockdb 进程 → 增量同步（断点续传，可反复运行直到无新文件）→ 重启进程
 docker compose stop stockdb
-# 2. 增量同步（可反复运行直到无新文件；断点续传，数据只追增量）
-docker compose --profile sync run --rm stockdb-sync
-# 3. 重启
+docker run --rm -v "$PWD/data:/data" -v "$PWD/mydb:/mydb" \
+  ghcr.io/awoeyiwuyua/free-stockdb:0.5.0 /bin/sh -c "cd /data && /opt/stockdb/数据更新"
 docker compose start stockdb
 ```
-
-> 极空间可在「计划任务」里把上述三步做成定时脚本（如每日收盘后），实现自动更新。
 > 同步源在 `/data/sync_url.txt`（一行一个镜像根目录；`always` 后缀 = 每次都强制校验该源）。
 
 ---

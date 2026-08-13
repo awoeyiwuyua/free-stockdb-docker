@@ -91,19 +91,18 @@ class TestTtlCaches(unittest.TestCase):
     def test_container_state_cached_and_force(self):
         self._reset()
         calls = []
-        orig = mod.docker_request
-        mod.docker_request = lambda *a, **k: (calls.append(a),
-                                              {"State": {"Status": "running"}, "Config": {"Image": "x"}})[1]
+        orig = mod.stockdb_proc_alive
+        mod.stockdb_proc_alive = lambda: (calls.append(1) or True)  # 模拟进程存活
         try:
             mod.container_state()
-            mod.container_state()          # 命中缓存，不再发 docker 请求
+            mod.container_state()          # 命中缓存，不再探测进程
             self.assertEqual(len(calls), 1)
             mod.container_state(force=True)  # force 绕过缓存
             self.assertEqual(len(calls), 2)
             self.assertEqual(mod.container_state()["status"], "running")
             self.assertEqual(len(calls), 2)  # 回落到缓存
         finally:
-            mod.docker_request = orig
+            mod.stockdb_proc_alive = orig
 
 
 class TestSyncEffective(unittest.TestCase):

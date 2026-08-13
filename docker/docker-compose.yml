@@ -1,84 +1,43 @@
-# free-stockdb 极空间 Q4 Docker 部署
+# free-stockdb 极空间 Q4 Docker 部署（0.5.0 单镜像，一个容器）
 #
 # 用法：
 #   首次部署见 docker/README.md。核心命令：
-#     1. 首次同步数据：  docker compose --profile sync run --rm stockdb-sync
+#     1. 首次同步数据：  容器启动前设 STOCKDB_SYNC_FIRST=1（见下），或
+#                        启动后浏览器 http://<NAS_IP>:8081 点「立即热更新」
 #     2. 启动服务：      docker compose up -d stockdb
 #     3. 查看日志：      docker compose logs -f stockdb
-#     4. 日常增量更新：  停 stockdb -> 重复步骤1 -> 启动 stockdb（见 README）
+#     4. 日常增量更新：  浏览器打开 http://<NAS_IP>:8081 点「立即热更新」
+#                        （网页一键同步，无需 SSH/终端）
 #
 # 数据持久化（升级/重建容器不丢数据）：
-#   ./data  全市场行情库（日K/分钟K/tick），必须持久化
+#   ./data  全市场行情库（日K/分钟K/tick）+ stockdb.conf + 同步日志，必须持久化
 #   ./mydb  私有数据库（发行包内置目录）
-#   ./log   运行日志（stockdb.log）
-# 注意：webui 0.4.0 起瘦身为运维面板，不再使用 ./research 研究库
 #
-# 端口：宿主机 7899 -> 容器 7899（局域网内通过 http://<NAS_IP>:7899 访问）
+# 端口：
+#   7899  stockdb HTTP 行情 API（局域网 http://<NAS_IP>:7899）
+#   8081  webui 运维面板（同步管理 / 健康监控 / 私有存储 / AI 查询 /mcp 路由）
 
 services:
   stockdb:
-    image: ghcr.io/awoeyiwuyua/free-stockdb:latest
+    image: ghcr.io/awoeyiwuyua/free-stockdb:0.5.0
     container_name: stockdb
     restart: unless-stopped
     ports:
       - "7899:7899"
+      - "8081:8080"
     volumes:
       - ./data:/data
       - ./mydb:/mydb
-      - ./log:/opt/stockdb/log
     environment:
       TZ: Asia/Shanghai
-      # 极空间无终端场景：把下面这行取消注释并设为 1，容器启动时会先增量同步
-      # 再启动服务（首次部署/日常更新数据 = 界面改这里 + 重启容器）：
+      # 极空间无终端首次部署：取消注释并设为 1，容器启动时先增量同步再启动服务
       # STOCKDB_SYNC_FIRST: "1"
-    # 可选：自定义同步源或额外参数
-    #  - STOCKDB_SYNC_CONFIG=/data/sync_url.txt
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- 'http://127.0.0.1:7899/?cmd=get&t=股票代码' >/dev/null 2>&1 || exit 1"]
       interval: 60s
       timeout: 10s
       retries: 5
       start_period: 15s
-    networks:
-      - stockdb-net
-    # 未来扩展位（本版不启用，需求浮现后再加）：
-    #   - webui：自建前端服务容器，只调 7899 HTTP API（见 README「后续扩展」）
-    #   - ai-mcp：把官方 ai_mcp 容器化（只读 MCP 已由 webui 的 /mcp 路由承载）
-
-  # 一次性同步任务：docker compose --profile sync run --rm stockdb-sync
-  # 同步必须停服务（官方 DATA_SOURCE.md 要求），增量同步可反复运行
-  stockdb-sync:
-    image: ghcr.io/awoeyiwuyua/free-stockdb:latest
-    container_name: stockdb-sync
-    profiles: ["sync"]
-    volumes:
-      - ./data:/data
-      - ./mydb:/mydb
-    environment:
-      TZ: Asia/Shanghai
-    command: ["/opt/stockdb/sync.sh"]
-    restart: "no"
-    networks:
-      - stockdb-net
-
-  # webui 管理台：行情查询 + 一键同步（挂载 docker socket 以操控 stockdb 容器）
-  # 极空间无终端时，日常更新数据 = 浏览器打开 http://<NAS_IP>:8081 点「开始同步」
-  webui:
-    image: ghcr.io/awoeyiwuyua/free-stockdb-webui:latest
-    container_name: stockdb-webui
-    restart: unless-stopped
-    ports:
-      - "8081:8080"
-    volumes:
-      - ./data:/data
-      - /var/run/docker.sock:/var/run/docker.sock
-    environment:
-      TZ: Asia/Shanghai
-      STOCKDB_HOST: stockdb
-      STOCKDB_PORT: "7899"
-      STOCKDB_CONTAINER: stockdb
-    depends_on:
-      - stockdb
     networks:
       - stockdb-net
 
