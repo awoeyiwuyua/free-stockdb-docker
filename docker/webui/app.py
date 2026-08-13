@@ -29,6 +29,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs, unquote
 
+# 只读 MCP（stockdb-native）dispatch：HTTP POST /mcp 复用（纯标准库，随 webui 同目录 mcp/ 分发）。
+# 缺失/加载失败时 webui 其余功能不受影响，/mcp 路由返回 500。
+try:
+    from mcp.stockdb_mcp_server import dispatch as mcp_dispatch
+except Exception:  # noqa: BLE001 - MCP 模块缺失时优雅降级
+    mcp_dispatch = None
+
 STOCKDB_HOST = os.environ.get("STOCKDB_HOST", "127.0.0.1")
 STOCKDB_PORT = int(os.environ.get("STOCKDB_PORT", "7899"))
 STOCKDB_CONTAINER = os.environ.get("STOCKDB_CONTAINER", "stockdb")
@@ -47,7 +54,7 @@ _last_verify_result: str | None = None  # 最近一次完整性验证结果（pa
 _scheduler_alive = False             # 定时线程心跳（每次循环更新时间戳）
 _scheduler_heartbeat = 0.0           # 定时线程最近一次心跳时间戳（unix）
 _webui_started = time.time()         # webui 进程启动时间戳
-WEBUI_VERSION = "0.3.1"
+WEBUI_VERSION = "0.3.2"
 
 HISTORY_FILE = DATA_DIR / "sync_history.json"
 SCHEDULE_FILE = DATA_DIR / "sync_schedule.json"
@@ -3965,6 +3972,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._data_write()
             elif path == "/api/hk/sync":
                 self._hk_sync()
+            elif path == "/mcp":
+                self._mcp()
             else:
                 self._send(404, json.dumps({"error": "not found"}))
         except Exception as exc:
@@ -3978,6 +3987,48 @@ class Handler(BaseHTTPRequestHandler):
             return json.loads(self.rfile.read(length).decode("utf-8") or "{}")
         except json.JSONDecodeError:
             return {}
+
+    def _mcp(self):
+        """只读 MCP JSON-RPC 端点：复用 stockdb_mcp_server.dispatch（与 stdio 同协议）。
+
+        单请求单响应：请求 dict → JSON-RPC 响应体；通知（无 id）返回 202 空体。
+        """
+        if mcp_dispatch is None:
+            self._send(500, json.dumps({"error": "MCP 模块不可用"}))
+            return
+        length = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(length) if length > 0 else b""
+        if not raw.strip():
+            self._send(200, json.dumps({
+                "jsonrpc": "2.0", "id": None,
+                "error": {"code": -32700, "message": "Parse error: 空请求体"},
+            }))
+            return
+        try:
+            msg = json.loads(raw.decode("utf-8"))
+            if not isinstance(msg, dict):
+                raise ValueError("请求体必须是 JSON 对象")
+        except Exception as exc:  # noqa: BLE001 - 解析失败返回 JSON-RPC parse error
+            self._send(200, json.dumps({
+                "jsonrpc": "2.0", "id": None,
+                "error": {"code": -32700, "message": f"Parse error: {exc}"},
+            }))
+            return
+        try:
+            response = mcp_dispatch(msg)
+        except Exception as exc:  # noqa: BLE001 - 分发异常转为 JSON-RPC internal error
+            self._send(200, json.dumps({
+                "jsonrpc": "2.0", "id": msg.get("id"),
+                "error": {"code": -32603, "message": f"Internal error: {exc}"},
+            }))
+            return
+        if response is None:
+            # 通知：无 JSON-RPC 响应，202 空体
+            self.send_response(202)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        self._send(200, json.dumps(response, ensure_ascii=False))
 
     def _status(self):
         state = container_state()

@@ -108,24 +108,28 @@ WEBUI_PORT=18080 ./docker/webui/dev.sh           # 换本地端口
 > A股休市表（`app.py` 的 `XSHG_HOLIDAYS`）取自 [exchange_calendars](https://github.com/gerrymanoim/exchange_calendars) XSHG 日历，数据截至 2026 年；官方次年放假安排公布后，用 `docker/webui/scripts/extract_xshg_holidays.py` 重新提取更新（webui 运行时零依赖，判定不依赖外部服务）。
 
 ### 4. 本地 ZCode 接入
-只读 MCP server 已迁入本仓库 `mcp/stockdb_mcp_server.py`（纯标准库，连 `STOCKDB_HOST:7899`），
-支持 stdio 与 HTTP 两种传输。
+只读 MCP server 已迁入本仓库 `docker/webui/mcp/stockdb_mcp_server.py`（纯标准库，连 `STOCKDB_HOST:7899`），
+随 webui 镜像一起分发，由 webui 的 `POST /mcp` 路由承载（与 stdio 共用同一份 dispatch）。
 
 **A. stdio（本机 ZCode）**
 ```bash
 # 连通性自检（替换为你的 NAS 地址）：
-STOCKDB_HOST=<NAS_IP> uv run python mcp/stockdb_mcp_server.py --self-check
+STOCKDB_HOST=<NAS_IP> uv run python docker/webui/mcp/stockdb_mcp_server.py --self-check
 # 通过后，在 ZCode Settings → MCP 加 stockdb-native，command 指向本文件：
 #   "env": {"STOCKDB_HOST": "<NAS_IP>"}
 ```
 
 **B. HTTP（NAS 容器部署，推荐）**
-compose 里的 `mcp` 服务已在 NAS 上跑 HTTP（容器内 8080 → 宿主 8082），
-ZCode / Codex 直接填 `type: http` 即可，无需本地 Python：
+webui 容器已内嵌 `/mcp` 路由（无需单独 mcp 容器），走 8081：
 ```json
-{"type":"http","url":"http://<NAS_IP>:8082/mcp"}
+{"type":"http","url":"http://<NAS_IP>:8081/mcp"}
 ```
-健康检查：`curl http://<NAS_IP>:8082/` 应返回 `stockdb-mcp ok`。
+健康检查：`curl http://<NAS_IP>:8081/api/health`。
+
+> **安全注意**：`/mcp` 与 webui 的只读查询接口一致，均无鉴权（面向内网信任环境）。
+> 由于 webui 同时暴露同步/重启 stockdb 容器等写操作接口，若通过 `type:http` 把 webui
+> 暴露给公网 agent，务必修整：改走 Tailscale（`100.66.1.1`）等内网地址、或在前加反向
+> 代理鉴权，否则等于把可操控容器的高权限接口裸奔在公网。
 
 ---
 
@@ -216,7 +220,7 @@ sqlite3 ./research/market_research.sqlite3 \
 
 ## 后续扩展（本版不启用，需求浮现后再加）
 
-- **AI MCP 容器化**：官方 `调用方式/ai_mcp/stockdb_full_mcp.py`（需容器带 Python + pybao C 扩展），或继续用本仓库 `mcp/stockdb_mcp_server.py`（HTTP 只读，已随 compose 的 `mcp` 服务容器化，NAS 部署后走 `http://<NAS_IP>:8082/mcp`）
+- **AI MCP 容器化**：官方 `调用方式/ai_mcp/stockdb_full_mcp.py`（需容器带 Python + pybao C 扩展），或继续用本仓库 `docker/webui/mcp/stockdb_mcp_server.py`（HTTP 只读，已随 webui 容器的 `/mcp` 路由承载，NAS 部署后走 `http://<NAS_IP>:8081/mcp`）
 - **webui 增强**：当前 webui 保持纯标准库后端，已包含市场复盘、因子排行、K 线与多周期视图；后续新增研究模块继续复用本地 ECharts 与 StockDB HTTP API。
 - **定时同步**：极空间计划任务，或 webui 内加定时（后续版本）
 
