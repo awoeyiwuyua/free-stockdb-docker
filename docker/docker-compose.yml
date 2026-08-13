@@ -33,7 +33,9 @@ services:
       # 极空间无终端首次部署：取消注释并设为 1，容器启动时先增量同步再启动服务
       # STOCKDB_SYNC_FIRST: "1"
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- 'http://127.0.0.1:7899/?cmd=get&t=股票代码' >/dev/null 2>&1 || exit 1"]
+      # 0.5.0 amd64 运行时是 Debian slim，无 wget → 用镜像内置 curl；
+      # 中文表名必须 URL 编码（%E8%82%A1...=股票代码），与 webui 内部 quote 一致
+      test: ["CMD-SHELL", "curl -fsS 'http://127.0.0.1:7899/?cmd=get&t=%E8%82%A1%E7%A5%A8%E4%BB%A3%E7%A0%81' >/dev/null 2>&1 || exit 1"]
       interval: 60s
       timeout: 10s
       retries: 5
