@@ -183,6 +183,83 @@ class TestCache(unittest.TestCase):
         self.assertFalse(any("None" in p.name for p in snaps))
 
 
+class TestTtlCaches(unittest.TestCase):
+    """4s 心跳相关的 TTL 缓存：命中缓存不发请求，force=True 强制刷新。"""
+
+    def setUp(self):
+        import urllib.request as ur
+        self._ur = ur
+        self._orig_urlopen = ur.urlopen
+        self._hits = 0
+
+    def tearDown(self):
+        self._ur.urlopen = self._orig_urlopen
+
+    def _fake_urlopen(self, *a, **k):
+        self._hits += 1
+
+        class Resp:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self):
+                # 返回 000001 日K 两行，其中一行为最新日
+                return json.dumps([{"date": 20260812}, {"date": 20260813}]).encode()
+
+        return Resp()
+
+    def _reset(self):
+        mod._latest_date_cache.update(at=0.0, val=None)
+        mod._code_stats_cache.update(at=0.0, val=None)
+        mod._container_state_cache.update(at=0.0, val=None)
+
+    def test_data_latest_date_cached(self):
+        self._reset()
+        self._ur.urlopen = self._fake_urlopen
+        self.assertEqual(mod.data_latest_date(), "20260813")
+        first_hits = self._hits  # 一次调用 = 近 3 月前缀数（95 天跨 4 个月）次 HTTP
+        self.assertEqual(mod.data_latest_date(), "20260813")  # 命中缓存，零新增请求
+        self.assertEqual(self._hits, first_hits)
+
+    def test_data_latest_date_force_bypasses_cache(self):
+        self._reset()
+        self._ur.urlopen = self._fake_urlopen
+        mod.data_latest_date()
+        first_hits = self._hits
+        mod.data_latest_date(force=True)  # 绕过缓存，重新请求
+        self.assertEqual(self._hits, first_hits * 2)
+
+    def test_code_stats_cached(self):
+        self._reset()
+        self._ur.urlopen = self._fake_urlopen
+        mod.code_stats()
+        self.assertEqual(self._hits, 1)  # 全市场代码列表 = 1 次 GET
+        mod.code_stats()
+        self.assertEqual(self._hits, 1)  # 命中缓存，零新增请求
+
+    def test_container_state_cached_and_force(self):
+        self._reset()
+        calls = []
+        orig = mod.docker_request
+        mod.docker_request = lambda *a, **k: (calls.append(a),
+                                              {"State": {"Status": "running"}, "Config": {"Image": "x"}})[1]
+        try:
+            mod.container_state()
+            mod.container_state()          # 命中缓存，不再发 docker 请求
+            self.assertEqual(len(calls), 1)
+            mod.container_state(force=True)  # force 绕过缓存
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(mod.container_state()["status"], "running")
+            self.assertEqual(len(calls), 2)  # 回落到缓存
+        finally:
+            mod.docker_request = orig
+
+
 class TestReentry(unittest.TestCase):
     def test_lock_prevents_double_start(self):
         # 模拟构建进行中：锁被持有 → 再次启动返回 False
@@ -637,6 +714,51 @@ class TestWatchlistScope(unittest.TestCase):
         self.assertEqual(mod._classify_code("000001"), "stock")
         self.assertEqual(mod._classify_code("510300"), "etf")
         self.assertEqual(mod._classify_code("159915"), "etf")
+        # 港股：5 位数字（含非 0 开头）与 hk 前缀均归为 hk
+        self.assertEqual(mod._classify_code("00700"), "hk")
+        self.assertEqual(mod._classify_code("hk00700"), "hk")
+        self.assertEqual(mod._classify_code("10700"), "hk")
+        self.assertEqual(mod._classify_code("700"), "other")  # 位数不足
+
+    def test_save_hk_goes_to_stock_scope(self):
+        """港股加自选：存 5 位代码，归入个股板块展示。"""
+        mod.save_watchlist(["00700"], "stock")
+        self.assertEqual(mod.load_watchlist("stock"), ["00700"])
+        self.assertEqual(mod.load_watchlist("etf"), [])
+        self.assertEqual(mod.load_watchlist(None), ["00700"])
+
+    def test_save_hk_prefix_normalized(self):
+        """hk 前缀统一存为 5 位数字。"""
+        mod.save_watchlist(["hk00700", "00700"], "stock")
+        self.assertEqual(mod.load_watchlist("stock"), ["00700"])
+
+    def test_save_hk_rejects_wrong_length(self):
+        """位数不足（3 位）不进入自选。"""
+        mod.save_watchlist(["700"], "stock")
+        self.assertEqual(mod.load_watchlist("stock"), [])
+
+    def test_hk_deletable_from_stock_board(self):
+        """港股可增可删：个股板块整体替换（A股+港股），删除后不再保留。"""
+        mod.save_watchlist(["600633", "00700"], "stock")
+        self.assertEqual(mod.load_watchlist("stock"), ["600633", "00700"])
+        # 删除 00700（前端 delWatch 发来剩余板块代码）
+        mod.save_watchlist(["600633"], "stock")
+        self.assertEqual(mod.load_watchlist("stock"), ["600633"])
+        # 删除 A 股保留港股
+        mod.save_watchlist(["00700"], "stock")
+        self.assertEqual(mod.load_watchlist("stock"), ["00700"])
+
+    def test_hk_preserved_across_scopes(self):
+        """自选股板块（含港股）与 ETF 板块互不影响。"""
+        mod.save_watchlist(["00700", "600633"], "stock")
+        mod.save_watchlist(["510300"], "etf")
+        self.assertEqual(mod.load_watchlist("stock"), ["00700", "600633"])
+        self.assertEqual(mod.load_watchlist("etf"), ["510300"])
+        self.assertEqual(sorted(mod.load_watchlist(None)), ["00700", "510300", "600633"])
+        # 更新 ETF 板块不影响个股板块（含港股）
+        mod.save_watchlist(["510300", "159915"], "etf")
+        self.assertEqual(mod.load_watchlist("stock"), ["00700", "600633"])
+        self.assertEqual(mod.load_watchlist("etf"), ["510300", "159915"])
 
     def test_save_stock_preserves_etf(self):
         mod.save_watchlist(["600633", "000001"], "stock")
