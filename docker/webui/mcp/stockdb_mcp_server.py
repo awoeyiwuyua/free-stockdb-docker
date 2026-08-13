@@ -26,12 +26,18 @@ Usage:
     STOCKDB_TIMEOUT  HTTP 查询超时（秒），默认 15
 
 暴露的工具（只读）:
-    get_kline           日K/分钟K 行情，支持区间与字段投影
+    get_kline           K线（日K/分钟K，支持 1m/1w/1M 周期、fq 复权、批量 codes、limit）
     get_stock_list      全市场 A 股代码列表
     get_adjust_factors  复权因子
     get_market_snapshot 指定交易日多只股票的单日行情快照
     get_board_open_effect_history
                         全市场“昨日非一字板涨停、今日开盘溢价”时序
+    get_indicators      技术指标计算（pybao，39 项指标，含 zhishu 指数）
+    get_board_members   板块 ↔ 股票 双向查询（pybao）
+
+pybao 为可选外部依赖（容器 /opt/stockdb/pybao，本机 /tmp/pybao_mac 或 PYBAO_DIR）：
+get_indicators / get_board_members，以及 get_kline 的复权/1m/1w/1M/批量能力依赖它；
+缺失时相关能力返回明确降级错误，其余工具不受影响。
 """
 
 from __future__ import annotations
@@ -61,6 +67,11 @@ from board_metrics import (  # noqa: E402  - 需先插入 sys.path 再导入同�
     compute_board_open_effect_details,
 )
 
+try:  # noqa: E402  - pybao_tools 为同目录模块（_MCP_DIR 已插入 sys.path）
+    import pybao_tools
+except ImportError:  # 防御：模块缺失时 get_indicators/get_board_members 返回明确错误而非崩溃
+    pybao_tools = None  # type: ignore[assignment]
+
 PROTOCOL_VERSION = "2025-06-18"
 SERVER_NAME = "stockdb-native"
 SERVER_VERSION = "0.1.0"
@@ -69,6 +80,11 @@ DEFAULT_HOST = "100.66.1.1"
 DEFAULT_PORT = 7899
 DEFAULT_HTTP_HOST = "0.0.0.0"
 DEFAULT_HTTP_PORT = 8080
+
+# K线周期枚举（8 项）；1m/1w/1M 与复权(fq)/批量(codes) 走 pybao SDK 路径，其余走 HTTP
+KLINE_FREQUENCIES = ("1m", "5m", "15m", "30m", "60m", "1d", "1w", "1M")
+_SDK_KLINE_FREQUENCIES = frozenset({"1m", "1w", "1M"})
+_KLINE_CODES_MAX = 50  # 批量 codes 上限
 
 # 重型工具串行化锁：query_board_open_effect_history 内部会嵌套调用
 # query_fullmarket_daily_snapshot（两者都会开线程池拉全市场），用 RLock 避免同线程二次获取死锁。
@@ -171,6 +187,153 @@ def query_minute_kline(code: str, datetime_ts: str) -> object:
     table = f"分钟k:{code}:{datetime_ts}"
     data = _http_get("get", table)
     return _normalize_rows(data)
+
+
+def _as_limit(value: object) -> int:
+    """limit 参数：缺省/0 = 不截断；非法输入抛中文 ValueError。"""
+    if value in (None, ""):
+        return 0
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        raise ValueError("get_kline: limit 必须是整数") from None
+    return max(0, number)
+
+
+def _pybao_sdk_client() -> object | None:
+    """pybao SDK client（可为 None）。pybao_tools 缺失时同样返回 None。"""
+    if pybao_tools is None:
+        return None
+    return pybao_tools.get_sdk_client()
+
+
+def _query_kline_via_sdk(
+    *,
+    code: str,
+    codes: list[str],
+    frequency: str,
+    fq: str,
+    limit: int,
+    fields: str | None,
+    start: str,
+    end: str,
+) -> dict:
+    """pybao SDK 路径：复权(fq)/1m/1w/1M 周期/批量 codes。client 不可用抛中文 ValueError。
+
+    对接 stock_sdk 真实接口 StockDBClient.get_data(code|codes, start, end,
+    frequency, fields=None, fq, limit=None)：单码返回行列表，批量返回
+    {code: rows}；复权/周月K 聚合由 SDK 内存完成；8 位日期在分钟频率下
+    由 SDK 自动补全为 14 位时间戳区间。返回 {"source", "code", "codes",
+    "frequency", "data", "total", "truncated"}；limit>0 时每码保留最新 limit 行。
+    """
+    client = _pybao_sdk_client()
+    if client is None:
+        raise ValueError(
+            "pybao 不可用：复权/1m/1w/1M/批量 K 线查询需要 pybao SDK"
+            "（容器 /opt/stockdb/pybao 或 PYBAO_DIR）"
+        )
+    target_codes = codes or ([code] if code else [])
+    sdk_fq = None if fq in ("", "none") else fq
+    try:
+        raw = client.get_data(
+            target_codes[0] if len(target_codes) == 1 else target_codes,
+            start=start or None,
+            end=end or None,
+            frequency=frequency,
+            fields=None,
+            fq=sdk_fq,
+            limit=None,
+        )
+    except Exception as exc:  # noqa: BLE001 - 查询失败转为中文 ValueError
+        raise ValueError(f"get_kline: pybao 查询失败: {type(exc).__name__}: {exc}") from exc
+
+    # 归一化：批量 → {code: rows}，单码 → 行列表
+    if isinstance(raw, dict):
+        per_code = {item: _normalize_rows(rows) for item, rows in raw.items()}
+    else:
+        per_code = {target_codes[0]: _normalize_rows(raw)}
+    # fields 投影（SDK 的 fields 参数返回二维值列表，这里统一客户端投影为 dict 行）
+    if fields:
+        keys = [k.strip() for k in fields.split(",")]
+        per_code = {
+            item: [{k: row.get(k) for k in keys} for row in rows]
+            for item, rows in per_code.items()
+        }
+    total_by_code = {item: len(rows) for item, rows in per_code.items()}
+    truncated = limit > 0 and any(n > limit for n in total_by_code.values())
+    if limit > 0:
+        per_code = {
+            item: rows[-limit:] if len(rows) > limit else rows
+            for item, rows in per_code.items()
+        }
+    return {
+        "source": "pybao",
+        "code": code or target_codes[0],
+        "codes": codes,
+        "frequency": frequency,
+        "data": per_code[target_codes[0]] if len(target_codes) == 1 else per_code,
+        "total": (
+            total_by_code[target_codes[0]]
+            if len(target_codes) == 1
+            else total_by_code
+        ),
+        "truncated": truncated,
+    }
+
+
+def query_kline(args: dict) -> dict:
+    """K线查询（HTTP 降级路径 + pybao SDK 增强路径）。
+
+    - HTTP 路径：1d/5m/15m/30m/60m，走 free-stockdb HTTP API（无需 pybao）
+    - pybao SDK 路径：fq 复权、1m/1w/1M 周期、批量 codes（需 pybao，不可用时报明确降级错误）
+    参数非法时抛 ValueError（中文文案），由 _call_tool 转 isError。
+    返回 {"source", "code", "frequency", "data", "total", "truncated"}。
+    """
+    frequency = str(args.get("frequency", "1d") or "1d")
+    fq = str(args.get("fq", "none") or "none").lower()
+    limit = _as_limit(args.get("limit"))
+    fields = str(args.get("fields", "") or "") or None
+    code = str(args.get("code", "") or "")
+    raw_codes = args.get("codes")
+    if raw_codes is not None and not isinstance(raw_codes, list):
+        raise ValueError("get_kline: codes 必须为数组")
+    codes = [str(item).strip() for item in (raw_codes or []) if str(item).strip()]
+    if not code and not codes:
+        raise ValueError("get_kline: code 与 codes 至少提供一个")
+    if codes and len(codes) > _KLINE_CODES_MAX:
+        raise ValueError(f"get_kline: codes 最多 {_KLINE_CODES_MAX} 个")
+    if frequency not in KLINE_FREQUENCIES:
+        raise ValueError(f"get_kline: 不支持的周期: {frequency}")
+    if fq not in ("", "none", "qfq", "hfq"):
+        raise ValueError(f"get_kline: 不支持的复权方式: {fq}")
+
+    start = str(args.get("start", "") or "")
+    end = str(args.get("end", "") or "")
+    needs_sdk = fq not in ("", "none") or frequency in _SDK_KLINE_FREQUENCIES or bool(codes)
+    if needs_sdk:
+        return _query_kline_via_sdk(
+            code=code, codes=codes, frequency=frequency, fq=fq,
+            limit=limit, fields=fields, start=start, end=end,
+        )
+
+    if frequency == "1d":
+        data = query_daily_kline(code, start, end, fields)
+    else:  # 5m/15m/30m/60m 分钟K
+        data = query_minute_kline(code, start)
+    if isinstance(data, dict) and "error" in data:
+        raise ValueError(f"get_kline: {data['error']}")
+    rows = [row for row in _normalize_rows(data) if isinstance(row, dict)]
+    total = len(rows)
+    truncated = limit > 0 and total > limit
+    kept = rows[-limit:] if truncated else rows  # 保留最新 limit 行
+    return {
+        "source": "http",
+        "code": code,
+        "frequency": frequency,
+        "data": kept,
+        "total": total,
+        "truncated": truncated,
+    }
 
 
 def query_stock_list() -> object:
@@ -450,19 +613,37 @@ TOOLS: list[dict] = [
     {
         "name": "get_kline",
         "description": (
-            "获取A股股票K线数据。frequency 支持 '1d'(日K)、'5m'/'15m'/'30m'/'60m'(分钟K，"
-            "分钟K 需传 14 位 datetime 时间戳)。日K 传 8 位日期 start（可加 end 构成开区间 "
-            "start..end，按自然月拆分查询）。fields 为逗号分隔投影字段，如 date,open,close,volume。"
+            "获取A股K线。frequency: 1d日K、5m/15m/30m/60m分钟K(HTTP)、"
+            "1m/1w/1M(需pybao)。日K传8位start(可加end构成区间)；分钟K传8位日期或14位时间戳。"
+            "fq复权(qfq/hfq)、批量codes需pybao(容器镜像自动携带)，不可用时返回明确降级错误。"
+            "fields为逗号分隔投影字段。limit>0时只保留最新limit行并标记truncated。"
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "code": {"type": "string", "description": "6 位股票代码，如 600633"},
+                "code": {"type": "string", "description": "6 位股票代码，如 600633（与 codes 二选一）"},
+                "codes": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "批量股票代码列表，最多 50 个（与 code 二选一；需 pybao SDK）",
+                },
                 "frequency": {
                     "type": "string",
-                    "enum": ["1d", "5m", "15m", "30m", "60m"],
-                    "description": "K 线周期；1d=日K，其余为分钟K",
+                    "enum": ["1m", "5m", "15m", "30m", "60m", "1d", "1w", "1M"],
+                    "description": "K 线周期；1d=日K，5m/15m/30m/60m=分钟K，1m/1w/1M 需 pybao SDK",
                     "default": "1d",
+                },
+                "fq": {
+                    "type": "string",
+                    "enum": ["none", "qfq", "hfq"],
+                    "description": "复权方式；none=不复权(默认)，qfq=前复权，hfq=后复权（需 pybao SDK）",
+                    "default": "none",
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "最多返回行数；0=不截断（默认）",
+                    "default": 0,
                 },
                 "start": {
                     "type": "string",
@@ -471,7 +652,7 @@ TOOLS: list[dict] = [
                 "end": {"type": "string", "description": "日K 结束日期(可选，与 start 构成开区间 start<end)"},
                 "fields": {"type": "string", "description": "投影字段，逗号分隔（可选）"},
             },
-            "required": ["code"],
+            "required": [],
         },
     },
     {
@@ -549,24 +730,140 @@ TOOLS: list[dict] = [
             "required": ["start", "end"],
         },
     },
+    {
+        "name": "get_indicators",
+        "description": (
+            "批量计算A股技术指标（39项，含自建指数zhishu）。支持多股票×多指标×多参数一次计算、"
+            "金叉/死叉信号(cross)、前/后复权(fq)。依赖pybao指标库（容器镜像自动携带，缺省报错并给指引）。"
+            "常用默认参数：macd=12,26,9；kdj=9,3,3；rsi=24；boll=20,2。"
+            "基础指标(ma/ema/sma/wma/dma/std/sum/hhv/llv/ref)可用fields指定计算字段。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "indicators": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "指标名列表，1-8个，如 ['macd','kdj']。支持：ma,ema,sma,wma,dma,std,sum,hhv,llv,ref,macd,kdj,rsi,wr,bias,boll,psy,cci,atr,bbi,dmi,taq,ktn,trix,vr,cr,emv,dpo,brar,dfma,mtm,mass,roc,expma,obv,mfi,asi,xsii,zhishu",
+                },
+                "codes": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "6位股票代码列表，1-50个，如 ['600633','000001']",
+                },
+                "params": {
+                    "type": "array",
+                    "items": {"type": ["string", "integer", "null"]},
+                    "description": "与indicators逐项对齐的参数，如 ['5,10,20', null]；单指标可直接传标量",
+                },
+                "frequency": {
+                    "type": "string",
+                    "enum": ["1d", "1m", "5m", "15m", "30m", "60m", "1w", "1M"],
+                    "description": "指标计算周期",
+                    "default": "1d",
+                },
+                "start": {
+                    "type": "string",
+                    "description": "8位起始日期(如20260601)。缺省=最近60个自然日",
+                },
+                "end": {
+                    "type": "string",
+                    "description": "8位结束日期；\"N\"=最新。缺省=N",
+                },
+                "cross": {
+                    "type": ["boolean", "string"],
+                    "description": "false=原始值；true=仅金叉死叉信号；\"with_value\"=信号+原始值",
+                    "default": False,
+                },
+                "fq": {
+                    "type": "string",
+                    "enum": ["qfq", "hfq", "none"],
+                    "description": "复权方式，默认qfq",
+                    "default": "qfq",
+                },
+                "fields": {
+                    "type": "string",
+                    "description": "仅基础指标组：计算字段(open/high/low/close/volume/amount)，逗号分隔",
+                },
+                "method": {
+                    "type": "integer",
+                    "enum": [1, 2, 3, 4, 5],
+                    "description": "zhishu专用加权方法：1平权/2流通市值/3成交额/4成交量/5总市值",
+                    "default": 1,
+                },
+                "base": {
+                    "type": "number",
+                    "description": "zhishu指数基点",
+                    "default": 1000,
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "每只股票最多返回行数（硬上限1000），保留最新行；截断返回truncated标记",
+                    "default": 500,
+                },
+                "compact": {
+                    "type": "boolean",
+                    "description": "True=列式(dates+指标数组，省token)，False=行列表",
+                    "default": True,
+                },
+            },
+            "required": ["indicators", "codes"],
+        },
+    },
+    {
+        "name": "get_board_members",
+        "description": (
+            "板块↔股票双向映射（概念/申万一级/申万二级/申万三级）。传6位股票代码→查所属板块；"
+            "传板块名称(支持模糊)或板块代码(如801760.SL)→查成分股。依赖pybao（容器镜像自动携带，"
+            "缺省报错并给指引）。include_symbols=True时返回合并去重的成分股列表（上限500，超出截断）。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "6位股票代码 / 板块代码 / 板块名称（模糊匹配）"},
+                "category": {
+                    "type": ["string", "integer"],
+                    "enum": ["概念", "申万一级", "申万二级", "申万三级", 0, 1, 2, 3],
+                    "description": "板块分类；整数0-3亦可用；不传=全部",
+                },
+                "fields": {
+                    "type": "string",
+                    "description": "投影字段，逗号分隔；symbols成分股需include_symbols=true",
+                    "default": "code,name,type,group,category",
+                },
+                "include_symbols": {
+                    "type": "boolean",
+                    "description": "是否返回成分股代码列表（上限500，超出截断）",
+                    "default": False,
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "成分股最多返回条数（硬上限500）",
+                    "default": 500,
+                },
+            },
+            "required": ["query"],
+        },
+    },
 ]
+
+
+def _pybao_tool_missing_error(tool_name: str) -> dict:
+    """pybao_tools 模块整体缺失时的明确降级错误。"""
+    return {"content": [{"type": "text", "text": json.dumps(
+        {"error": f"{tool_name}: pybao 工具模块不可用"}, ensure_ascii=False)}], "isError": True}
 
 
 def _call_tool(name: str, args: dict) -> dict:
     """Dispatch a tools/call request to a handler. Returns MCP result dict."""
     if name == "get_kline":
-        code = str(args.get("code", ""))
-        frequency = str(args.get("frequency", "1d"))
-        start = str(args.get("start", "") or "")
-        end = str(args.get("end", "") or "")
-        fields = str(args.get("fields", "") or "") or None
-        if frequency == "1d":
-            result = query_daily_kline(code, start, end, fields)
-        elif frequency in ("5m", "15m", "30m", "60m"):
-            result = query_minute_kline(code, start)
-        else:
+        try:
+            result = query_kline(args)
+        except ValueError as exc:
             return {"content": [{"type": "text", "text": json.dumps(
-                {"error": f"不支持的周期: {frequency}"}, ensure_ascii=False)}], "isError": True}
+                {"error": str(exc)}, ensure_ascii=False)}], "isError": True}
     elif name == "get_stock_list":
         result = query_stock_list()
     elif name == "get_adjust_factors":
@@ -590,6 +887,22 @@ def _call_tool(name: str, args: dict) -> dict:
             workers=int(args.get("workers", 16) or 16),
             include_distribution=bool(args.get("include_distribution", False)),
         )
+    elif name == "get_indicators":
+        if pybao_tools is None:
+            return _pybao_tool_missing_error("get_indicators")
+        outcome = pybao_tools.compute_indicators(args)
+        if not outcome.get("ok"):
+            return {"content": [{"type": "text", "text": json.dumps(
+                {"error": outcome.get("error", "未知错误")}, ensure_ascii=False)}], "isError": True}
+        result = outcome.get("result")
+    elif name == "get_board_members":
+        if pybao_tools is None:
+            return _pybao_tool_missing_error("get_board_members")
+        outcome = pybao_tools.query_boards(args)
+        if not outcome.get("ok"):
+            return {"content": [{"type": "text", "text": json.dumps(
+                {"error": outcome.get("error", "未知错误")}, ensure_ascii=False)}], "isError": True}
+        result = outcome.get("result")
     else:
         return {"content": [{"type": "text", "text": json.dumps(
             {"error": f"未知工具: {name}"}, ensure_ascii=False)}], "isError": True}

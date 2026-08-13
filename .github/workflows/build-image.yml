@@ -99,18 +99,36 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GH_PAT }}
 
-      # 拉取刚推的单镜像，两种架构各自在容器内 import stockdb（pybao abi3.so），
-      # 验证对应架构的 manylinux-x64(glibc)/alpine-arm64(musl) 二进制确实可加载。
+      # 拉取刚推的单镜像，两种架构各自在容器内 import pybao 三模块
+      # （stockdb/zhibiao/zb_core 的 abi3.so），验证对应架构的
+      # manylinux-x64(glibc)/alpine-arm64(musl) 二进制确实可加载。
+      # zhibiao/zb_core 为 get_indicators/get_board_members 的运行时依赖。
       - name: Verify pybao import (linux/amd64)
         run: |
           docker run --rm --entrypoint python \
             --platform linux/amd64 \
             ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:latest \
-            -c "import stockdb; print('amd64 ok')"
+            -c "import stockdb, zb_core, zhibiao; print('amd64 pybao ok')"
 
       - name: Verify pybao import (linux/arm64)
         run: |
           docker run --rm --entrypoint python \
             --platform linux/arm64 \
             ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:latest \
-            -c "import stockdb; print('arm64 ok')"
+            -c "import stockdb, zb_core, zhibiao; print('arm64 pybao ok')"
+
+  test-mcp:
+    name: MCP 单测（离线，无 pybao 依赖）
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+
+      - name: Run MCP unit tests
+        working-directory: docker/webui
+        run: python -m unittest mcp.test_stockdb_mcp_server -v

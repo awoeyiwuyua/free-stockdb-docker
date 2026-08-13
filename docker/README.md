@@ -12,7 +12,7 @@ NAS 拉取时自动匹配自身 CPU 架构。
 - **镜像 tag = 上游 stockdb 发布包版本号**（当前 `0.3.1`）：workflow 手动触发时不填
   version 输入，就从 `docker/Dockerfile` 的 `ARG VERSION` 打 tag，如
   `ghcr.io/awoeyiwuyua/free-stockdb:0.3.1` 与 `:latest`。
-- **webui 面板内部版本 = `WEBUI_VERSION`**（当前 0.5.0，见 `docker/webui/app.py`），
+- **webui 面板内部版本 = `WEBUI_VERSION`**（当前 0.5.1，见 `docker/webui/app.py`），
   仅用于面板显示，**不是镜像 tag**。二者是两个维度，不要混用。
 - 迭代节奏：上游发新版 → 升 `ARG VERSION`（镜像 tag 跟着变）；webui 面板改动 →
   升 `WEBUI_VERSION`（面板显示）。compose 建议用 `:latest`，无需每次改配置。
@@ -124,6 +124,23 @@ WEBUI_PORT=18080 ./docker/webui/dev.sh           # 换本地端口
 ### 4. 本地 ZCode 接入
 只读 MCP server 已迁入本仓库 `docker/webui/mcp/stockdb_mcp_server.py`（纯标准库，连 `STOCKDB_HOST:7899`），
 随 webui 镜像一起分发，由 webui 的 `POST /mcp` 路由承载（与 stdio 共用同一份 dispatch）。
+
+现共 **7 个只读工具**：
+
+| 工具 | 能力 |
+|------|------|
+| `get_kline` | A 股 K 线（日K/分钟K，支持 1m/1w/1M 周期、fq 复权、批量 codes、字段投影、limit） |
+| `get_stock_list` | 全市场 A 股代码列表 |
+| `get_adjust_factors` | 复权因子 |
+| `get_market_snapshot` | 指定交易日多只股票的单日行情快照 |
+| `get_board_open_effect_history` | 板块开盘效应历史（涨停股次日开盘溢价统计） |
+| `get_indicators` | 技术指标计算（39 项，含 zhishu 指数） |
+| `get_board_members` | 板块 ↔ 股票 双向查询 |
+
+> **pybao 依赖**：`get_indicators` / `get_board_members`，以及 `get_kline` 的复权（fq）、
+> 1m/1w/1M 周期、批量 codes 能力，均依赖容器内 pybao（镜像自带 `/opt/stockdb/pybao`，无需额外配置）。
+> 本机 dev 开发（dev.sh）需把 macOS 版 pybao 放到 `/tmp/pybao_mac` 或设置 `PYBAO_DIR` 环境变量，
+> 否则这三类能力返回**明确降级错误**（其余工具不受影响）。
 
 **A. stdio（本机 ZCode）**
 ```bash
