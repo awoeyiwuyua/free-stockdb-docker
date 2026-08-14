@@ -66,10 +66,11 @@ _ENDPOINT_TRADE = "/api/claw/mockTrading/trade"       # 下单
 _ENDPOINT_CANCEL = "/api/claw/mockTrading/cancel"     # 撤单
 _ENDPOINT_QUERY = "/api/claw/query"                   # 行情/盘口查询
 
-_RATE_LIMIT_CODE = 113  # MX 频率限制响应码
+_RATE_LIMIT_CODE = 113  # MX 频率限制响应码（响应体 code，int）
+_BUSINESS_KEY_INVALID = 114  # API 密钥不存在或已失效（响应体 code，int）
 
-# 默认 base url（pyc 恢复的任务D原文：base https://mkapi2.dfcfs.com/finskill）
-_DEFAULT_BASE = "https://mkapi2.dfcfs.com/finskill"
+# 默认 base url（真实接口实测：必须完整 finskillshub；截断会打到错误路径被网关 403）
+_DEFAULT_BASE = "https://mkapi2.dfcfs.com/finskillshub"
 _DEFAULT_TIMEOUT = 10.0  # 单请求超时秒数
 
 
@@ -268,11 +269,21 @@ class MXClient:
                 "MX 模拟账户未绑定",
                 hint="绑定模拟账户",
             )
-        # 业务失败：code != 0 且非上述已知码 → 8 码原样/兜底映射
+        # 业务失败：code 非成功值（0/200/"0"/"200"）→ 8 码映射/兜底
         code = body.get("code")
-        if code not in (None, 0, 200):
-            err_code = code if isinstance(code, str) and code in ERROR_CODES \
-                else ERROR_INTERNAL_ERROR
+        try:
+            code_int = int(code)
+        except (TypeError, ValueError):
+            code_int = None
+        code_str = str(code) if code is not None else None
+        if code_str not in (None, "0", "200"):
+            if code_int == _BUSINESS_KEY_INVALID:
+                raise MXError(
+                    ERROR_DEPENDENCY_UNAVAILABLE,
+                    "MX API 密钥不存在或已失效（code=114）",
+                    hint="前往妙想 Skills 页面重新获取/激活 apikey",
+                )
+            err_code = code_str if code_str in ERROR_CODES else ERROR_INTERNAL_ERROR
             raise MXError(
                 err_code,
                 f"MX 接口业务失败（code={code}）: {self._msg_from_body(body) or '无详细信息'}",
@@ -300,8 +311,13 @@ class MXClient:
         return None
 
     def _is_rate_limited(self, body) -> bool:
-        """响应体 code 是否为 MX 频率限制码（113）。"""
-        return isinstance(body, dict) and body.get("code") == _RATE_LIMIT_CODE
+        """响应体 code 是否为 MX 频率限制码（113，int/str 兼容）。"""
+        if not isinstance(body, dict):
+            return False
+        try:
+            return int(body.get("code")) == _RATE_LIMIT_CODE
+        except (TypeError, ValueError):
+            return str(body.get("code")) == str(_RATE_LIMIT_CODE)
 
     def _looks_unbound(self, body) -> bool:
         """响应体消息是否提示"模拟账户未绑定"（结合 HTTP 404 判定）。"""

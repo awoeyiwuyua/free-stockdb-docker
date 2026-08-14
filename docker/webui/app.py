@@ -1476,7 +1476,9 @@ _paper_scheduler_heartbeat = 0.0
 _paper_pause_flag = DATA_DIR / "paper_pause.flag"   # 暂停标记：文件存在即暂停
 
 # 资金摘要提取键（连通自检 balance_summary；防御式匹配，未知形态回退数值字段子集）
-_BALANCE_SUMMARY_KEYS = ("cash", "available_cash", "frozen", "total_money",
+_BALANCE_SUMMARY_KEYS = ("totalAssets", "availBalance", "balanceActual",
+                         "initMoney", "accName", "accID", "nav",
+                         "cash", "available_cash", "frozen", "total_money",
                          "available", "total", "balance", "资金", "可用",
                          "冻结", "总资产", "持仓市值", "market_value")
 
