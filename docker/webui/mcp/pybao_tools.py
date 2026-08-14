@@ -15,8 +15,8 @@ stockdb_mcp_server 的 get_indicators / get_board_members / get_kline(增强路�
 
 compute_indicators / query_boards / query_mydb / screen_stocks 统一返回
 {"ok": True, "result": {...}} 或 {"ok": False, "error": "中文错误"}。
-失败返回带 "code"（PARAM_INVALID=参数校验失败 / PYBAO_UNAVAILABLE=pybao 缺失 /
-INTERNAL=计算/查询/加工异常），PYBAO_UNAVAILABLE 附加 "hint" 定位说明。
+失败返回带 "code"（INVALID_ARGUMENT=参数校验失败 / DEPENDENCY_UNAVAILABLE=pybao 缺失 /
+INTERNAL_ERROR=计算/查询/加工异常），DEPENDENCY_UNAVAILABLE 附加 "hint" 定位说明。
 
 进度通知：set_progress_hook / clear_progress_hook / notify_progress 提供线程级
 进度回调（供 server/app 的 SSE 流式进度推送复用），无回调时静默不产生开销。
@@ -89,7 +89,7 @@ BOARD_FIELDS = ("code", "name", "source", "type", "group", "category", "symbols"
 FIELD_ALIASES = {"symbol": "symbols", "symbls": "symbols", "codelist": "symbols"}
 
 # pybao 缺失时的错误文案与定位 hint（error 保留 "pybao 不可用：" 开头文案，
-# hint 为独立字段供客户端按 code=PYBAO_UNAVAILABLE 分支展示）
+# hint 为独立字段供客户端按 code=DEPENDENCY_UNAVAILABLE 分支展示）
 PYBAO_UNAVAILABLE = (
     "pybao 不可用：容器镜像内自动携带（/opt/stockdb/pybao）；本机开发请把 "
     "macOS 版 pybao 放到 /tmp/pybao_mac 或设置 PYBAO_DIR 环境变量。"
@@ -100,9 +100,28 @@ PYBAO_UNAVAILABLE_HINT = (
 )
 
 
-# === 统一错误码 ===
-# 契约：所有 {"ok": False, ...} 返回携带 "code" ∈ {PARAM_INVALID, PYBAO_UNAVAILABLE,
-# INTERNAL}；PYBAO_UNAVAILABLE 附加 "hint"。server 层 isError content 透传 code/hint。
+# === 统一错误码（8 码体系，本批全局） ===
+# 契约：所有 {"ok": False, ...} 返回携带 "code" ∈ 下方 8 码常量（值必须与
+# stockdb_mcp_server 侧同名常量完全一致）；DEPENDENCY_UNAVAILABLE 附加 "hint"。
+# server 层 isError content 透传 code/hint。
+# 各码语义：
+#   INVALID_ARGUMENT        参数非法（替换原 PARAM_INVALID；未知工具也用本码）
+#   NO_DATA                 合法查询但无数据（替换原 DATA_NOT_FOUND）
+#   NOT_PUBLISHED           该时点数据尚未入库/尚未发布
+#   INVALID_SYMBOL          代码不在股票池
+#   DEPENDENCY_UNAVAILABLE  pybao 缺失（替换原 PYBAO_UNAVAILABLE）
+#   PARTIAL_RESULT          预留：仅作数据面 is_partial 标志的语义说明，
+#                           不作为 isError code 返回
+#   RATE_LIMITED            预留常量，当前无配额实现，不返回
+#   INTERNAL_ERROR          内部异常（替换原 INTERNAL）
+INVALID_ARGUMENT = "INVALID_ARGUMENT"
+NO_DATA = "NO_DATA"
+NOT_PUBLISHED = "NOT_PUBLISHED"
+INVALID_SYMBOL = "INVALID_SYMBOL"
+DEPENDENCY_UNAVAILABLE = "DEPENDENCY_UNAVAILABLE"
+PARTIAL_RESULT = "PARTIAL_RESULT"
+RATE_LIMITED = "RATE_LIMITED"
+INTERNAL_ERROR = "INTERNAL_ERROR"
 
 
 def _error(code: str, message: str, *, hint: str | None = None) -> dict:
@@ -114,18 +133,20 @@ def _error(code: str, message: str, *, hint: str | None = None) -> dict:
 
 
 def _param_error(message: str) -> dict:
-    """参数校验失败（PARAM_INVALID）。"""
-    return _error("PARAM_INVALID", message)
+    """参数校验失败（INVALID_ARGUMENT）。"""
+    return _error(INVALID_ARGUMENT, message)
 
 
 def _pybao_unavailable_error() -> dict:
-    """pybao 缺失降级（PYBAO_UNAVAILABLE + 定位 hint）。"""
-    return _error("PYBAO_UNAVAILABLE", PYBAO_UNAVAILABLE, hint=PYBAO_UNAVAILABLE_HINT)
+    """pybao 缺失降级（DEPENDENCY_UNAVAILABLE + 定位 hint）。"""
+    return _error(
+        DEPENDENCY_UNAVAILABLE, PYBAO_UNAVAILABLE, hint=PYBAO_UNAVAILABLE_HINT
+    )
 
 
 def _internal_error(message: str) -> dict:
-    """计算/查询/加工异常（INTERNAL）。"""
-    return _error("INTERNAL", message)
+    """计算/查询/加工异常（INTERNAL_ERROR）。"""
+    return _error(INTERNAL_ERROR, message)
 
 
 # === pybao 定位与加载 ===
@@ -345,7 +366,7 @@ def compute_indicators(args: dict) -> dict:
 
     返回 {"ok": True, "result": {"source", "frequency", "indicators", "params",
     "compact", "truncated", "truncated_rows", "data"}} 或 {"ok": False, "error": "中文",
-    "code": "PARAM_INVALID"/"PYBAO_UNAVAILABLE"/"INTERNAL"(+hint)}。
+    "code": "INVALID_ARGUMENT"/"DEPENDENCY_UNAVAILABLE"/"INTERNAL_ERROR"(+hint)}。
     data 形态：单码 → rows / 列式 dict；批量 → {code: rows / 列式 dict}；zhishu → 单序列。
     """
     # === 参数校验（先于 pybao 加载，离线即可报错） ===
@@ -561,9 +582,11 @@ def query_boards(args: dict) -> dict:
         limit           结果条目上限（默认 500，硬上限 500）
 
     返回 {"ok": True, "result": {"source", "category", "query", "boards",
-    "total", "truncated", "symbols"?}} 或 {"ok": False, "error": "中文", "code": ...}。
-    boards 为板块元数据列表（不含 symbols）；include_symbols=True 时额外返回
-    去重合并后的 symbols（成分股，超上限截断并标记 truncated）。
+    "board_count", "symbol_count", "truncated", "symbols"?}} 或 {"ok": False,
+    "error": "中文", "code": ...}。
+    boards 为板块元数据列表（不含 symbols）；board_count = 命中板块数（= len(boards)）；
+    symbol_count = 各板块成分股去重合并后的总数（原 total 语义）；
+    include_symbols=True 时额外返回去重合并后的 symbols（成分股，超上限截断并标记 truncated）。
     """
     # === 参数校验（先于 pybao 加载） ===
     query = str(args.get("query") or "").strip()
@@ -642,7 +665,7 @@ def query_boards(args: dict) -> dict:
         "query": query,
         "boards": meta,
         "board_count": len(meta),
-        "total": total_symbols,
+        "symbol_count": total_symbols,
         "truncated": truncated,
     }
     if include_symbols:
