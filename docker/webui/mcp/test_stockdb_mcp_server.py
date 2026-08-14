@@ -1,4 +1,6 @@
+import io
 import json
+import time
 import unittest
 from unittest import mock
 
@@ -235,13 +237,15 @@ class StockdbMcpServerTests(unittest.TestCase):
         self.assertEqual(response["jsonrpc"], "2.0")
         self.assertEqual(response["id"], 1)
         tool_names = {tool["name"] for tool in response["result"]["tools"]}
-        self.assertEqual(len(tool_names), 9)
+        self.assertEqual(len(tool_names), 11)
         self.assertIn("get_stock_list", tool_names)
         self.assertIn("get_board_open_effect_history", tool_names)
         self.assertIn("get_indicators", tool_names)
         self.assertIn("get_board_members", tool_names)
         self.assertIn("screen_stocks", tool_names)
         self.assertIn("get_mydb_data", tool_names)
+        self.assertIn("get_trading_days", tool_names)
+        self.assertIn("get_data_status", tool_names)
 
     @mock.patch.object(server, "query_stock_list")
     def test_http_dispatch_tools_call(self, query_stock_list):
@@ -1136,6 +1140,417 @@ class StockdbMcpServerTests(unittest.TestCase):
         self.assertTrue(result["isError"])
         payload = json.loads(result["content"][0]["text"])
         self.assertEqual(payload["error"], "X")
+
+
+# === Phase 2.5：统一错误码 / 交易日历 / get_trading_days / get_data_status / TTL ===
+
+    def test_error_code_pybao_unavailable_with_hint(self):
+        with mock.patch.object(pybao_tools, "get_pybao", return_value=None):
+            outcome = pybao_tools.compute_indicators(
+                {"indicators": ["macd"], "codes": ["600633"]},
+            )
+
+        self.assertFalse(outcome["ok"])
+        self.assertEqual(outcome["code"], "PYBAO_UNAVAILABLE")
+        self.assertIn("/tmp/pybao_mac", outcome["hint"])
+
+    def test_error_code_unknown_indicator_param_invalid(self):
+        outcome = pybao_tools.compute_indicators(
+            {"indicators": ["not_an_indicator"], "codes": ["600633"]},
+        )
+
+        self.assertFalse(outcome["ok"])
+        self.assertEqual(outcome["code"], "PARAM_INVALID")
+
+    def test_error_code_unknown_tool(self):
+        response = server.dispatch({
+            "jsonrpc": "2.0", "id": 130, "method": "tools/call",
+            "params": {"name": "definitely_not_a_tool", "arguments": {}},
+        })
+
+        result = response["result"]
+        self.assertTrue(result["isError"])
+        payload = json.loads(result["content"][0]["text"])
+        self.assertEqual(payload["code"], "UNKNOWN_TOOL")
+
+    # === calendar_xshg（2026 休市表） ===
+
+    def test_calendar_is_trading_day(self):
+        self.assertFalse(server.calendar_xshg.is_trading_day("20260101"))  # 元旦休市
+        self.assertFalse(server.calendar_xshg.is_trading_day("20260815"))  # 周六
+        self.assertTrue(server.calendar_xshg.is_trading_day("20260813"))   # 周四交易日
+
+    def test_calendar_trading_days_between(self):
+        self.assertEqual(
+            server.calendar_xshg.trading_days_between("20260810", "20260814"),
+            ["20260810", "20260811", "20260812", "20260813", "20260814"],
+        )
+
+    def test_calendar_nearest_trading_day(self):
+        self.assertEqual(
+            server.calendar_xshg.nearest_trading_day("20260815"), "20260814",
+        )
+
+    # === get_trading_days dispatch ===
+
+    def test_http_dispatch_get_trading_days_range(self):
+        response = server.dispatch({
+            "jsonrpc": "2.0", "id": 140, "method": "tools/call",
+            "params": {
+                "name": "get_trading_days",
+                "arguments": {"start": "20260810", "end": "20260814"},
+            },
+        })
+
+        self.assertIsNone(response["result"].get("isError"))
+        payload = json.loads(response["result"]["content"][0]["text"])
+        self.assertEqual(
+            payload["trading_days"],
+            ["20260810", "20260811", "20260812", "20260813", "20260814"],
+        )
+        self.assertEqual(payload["count"], 5)
+        self.assertFalse(payload["truncated"])
+        self.assertEqual(payload["calendar_through"], "2026-12-31")
+
+    def test_http_dispatch_get_trading_days_limit_truncates(self):
+        response = server.dispatch({
+            "jsonrpc": "2.0", "id": 141, "method": "tools/call",
+            "params": {
+                "name": "get_trading_days",
+                "arguments": {"start": "20260810", "end": "20260814", "limit": 2},
+            },
+        })
+
+        payload = json.loads(response["result"]["content"][0]["text"])
+        self.assertTrue(payload["truncated"])
+        self.assertEqual(payload["trading_days"], ["20260810", "20260811"])
+        self.assertEqual(payload["count"], 2)
+
+    def test_http_dispatch_get_trading_days_invalid_start(self):
+        response = server.dispatch({
+            "jsonrpc": "2.0", "id": 142, "method": "tools/call",
+            "params": {
+                "name": "get_trading_days",
+                "arguments": {"start": "2026-08-10"},
+            },
+        })
+
+        result = response["result"]
+        self.assertTrue(result["isError"])
+        payload = json.loads(result["content"][0]["text"])
+        self.assertEqual(payload["code"], "PARAM_INVALID")
+
+    # === get_data_status（pair 形态 / pybao 标志 / TTL 去重） ===
+
+    def test_get_data_status_pair_form_and_pybao_flag(self):
+        with mock.patch.object(server, "_TTL", server._TTLCache()):
+            with mock.patch.object(server, "_http_get") as http_get:
+                http_get.return_value = [["日k:000001:20260813", {"date": 20260813}]]
+                with mock.patch.object(pybao_tools, "get_pybao", return_value=None):
+                    response = server.dispatch({
+                        "jsonrpc": "2.0", "id": 150, "method": "tools/call",
+                        "params": {"name": "get_data_status", "arguments": {}},
+                    })
+
+        self.assertIsNone(response["result"].get("isError"))
+        payload = json.loads(response["result"]["content"][0]["text"])
+        self.assertEqual(payload["latest_trade_date"], "20260813")
+        self.assertFalse(payload["pybao_available"])
+        self.assertEqual(payload["tool_count"], 11)
+
+    def test_get_data_status_ttl_dedup_single_http_round(self):
+        with mock.patch.object(server, "_TTL", server._TTLCache()):
+            with mock.patch.object(server, "_http_get") as http_get:
+                http_get.return_value = [["日k:000001:20260813", {"date": 20260813}]]
+                with mock.patch.object(pybao_tools, "get_pybao", return_value=None):
+                    first = server.get_data_status()
+                    second = server.get_data_status()
+
+        self.assertEqual(first["latest_trade_date"], "20260813")
+        self.assertEqual(second["latest_trade_date"], "20260813")
+        # 探针覆盖 3 个 YYYYMM 前缀，但 TTL 缓存使第二次调用不再发起任何 HTTP
+        self.assertEqual(http_get.call_count, 3)
+
+    def test_get_data_status_without_ttl_reprobes(self):
+        cache = server._TTLCache()
+        with mock.patch.object(server, "_TTL", cache):
+            with mock.patch.object(cache, "set"):
+                with mock.patch.object(server, "_http_get") as http_get:
+                    http_get.return_value = [["日k:000001:20260813", {"date": 20260813}]]
+                    server.get_data_status()
+                    server.get_data_status()
+
+        # 缓存写入失效 → 每次调用都重新探针（3 前缀 × 2 次）
+        self.assertEqual(http_get.call_count, 6)
+
+    # === _TTLCache 类 ===
+
+    def test_ttl_cache_hit_and_expiry(self):
+        cache = server._TTLCache(ttl=0.01)
+        self.assertIsNone(cache.get("k"))
+        cache.set("k", "v")
+        self.assertEqual(cache.get("k"), "v")  # 命中
+        time.sleep(0.02)
+        self.assertIsNone(cache.get("k"))  # 过期后惰性删除
+
+    # === get_market_snapshot date 缺省 = 最新交易日 ===
+
+    @mock.patch.object(server, "_http_get")
+    @mock.patch.object(server, "_latest_trade_date")
+    def test_http_dispatch_get_market_snapshot_default_date(self, latest, http_get):
+        latest.return_value = "20260813"
+        http_get.return_value = [{"date": 20260813, "close": 12.5, "code": "600633"}]
+
+        response = server.dispatch({
+            "jsonrpc": "2.0", "id": 160, "method": "tools/call",
+            "params": {
+                "name": "get_market_snapshot",
+                "arguments": {"codes": ["600633"]},
+            },
+        })
+
+        self.assertIsNone(response["result"].get("isError"))
+        payload = json.loads(response["result"]["content"][0]["text"])
+        self.assertEqual(payload["results"][0]["date"], 20260813)
+        tables = [call.args[1] for call in http_get.call_args_list]
+        self.assertIn("日k:600633:20260813", tables)
+        self.assertEqual(latest.call_count, 1)
+
+    # === get_kline 空结果 + 非交易日 hint ===
+
+    @mock.patch.object(server, "_http_get")
+    def test_http_dispatch_get_kline_non_trading_day_hint(self, http_get):
+        http_get.return_value = []
+        with mock.patch.object(
+            server.calendar_xshg, "is_trading_day", return_value=False
+        ):
+            with mock.patch.object(
+                server.calendar_xshg, "nearest_trading_day", return_value="20260814"
+            ):
+                response = server.dispatch({
+                    "jsonrpc": "2.0", "id": 170, "method": "tools/call",
+                    "params": {
+                        "name": "get_kline",
+                        "arguments": {
+                            "code": "600633", "frequency": "1d", "start": "20260815",
+                        },
+                    },
+                })
+
+        payload = json.loads(response["result"]["content"][0]["text"])
+        self.assertEqual(payload["data"], [])
+        self.assertIn("非交易日", payload["hint"])
+        self.assertIn("20260814", payload["hint"])
+
+    # === query_mydb 游标续取 / lookup key 复合键 ===
+
+    @mock.patch.object(pybao_tools, "get_mydb_rd")
+    def test_query_mydb_cursor_pagination(self, get_mydb_rd):
+        fake_rd = mock.Mock()
+        fake_rd.keys.return_value = [
+            "hk日k:00700:20250425",
+            "hk日k:00700:20250426",
+            "hk日k:00700:20250427",
+        ]
+        fake_rd.get.return_value = {"close": 12.5}
+        get_mydb_rd.return_value = fake_rd
+
+        page1 = pybao_tools.query_mydb({"table": "hk日k", "limit": 2})
+        self.assertTrue(page1["ok"])
+        r1 = page1["result"]
+        self.assertEqual(
+            r1["keys"], ["hk日k:00700:20250425", "hk日k:00700:20250426"],
+        )
+        self.assertEqual(r1["total"], 3)
+        self.assertTrue(r1["truncated"])
+        self.assertEqual(r1["next_key"], "hk日k:00700:20250426")
+
+        page2 = pybao_tools.query_mydb({
+            "table": "hk日k", "limit": 2, "cursor": r1["next_key"],
+        })
+        r2 = page2["result"]
+        self.assertEqual(r2["keys"], ["hk日k:00700:20250427"])
+        self.assertFalse(r2["truncated"])
+        self.assertIsNone(r2["next_key"])  # 未截断 → next_key None
+        # 游标语义：第二页所有键严格大于 cursor
+        self.assertTrue(all(str(k) > r1["next_key"] for k in r2["keys"]))
+
+    @mock.patch.object(pybao_tools, "get_mydb_rd")
+    def test_query_mydb_lookup_key_keeps_composite(self, get_mydb_rd):
+        fake_rd = mock.Mock()
+        fake_rd.keys.return_value = ["hk日k:00700:20250425"]
+        fake_rd.get.return_value = {"close": 12.5}
+        get_mydb_rd.return_value = fake_rd
+
+        outcome = pybao_tools.query_mydb({"table": "hk日k"})
+
+        self.assertTrue(outcome["ok"])
+        # lookup key 取首个冒号后的全部（00700:20250425），而非最后一段（20250425）
+        lookup_keys = [call.args[1] for call in fake_rd.get.call_args_list]
+        self.assertEqual(lookup_keys, ["00700:20250425"])
+        self.assertEqual(
+            outcome["result"]["values"]["hk日k:00700:20250425"], {"close": 12.5},
+        )
+
+    # === screen_stocks 多条件交集 ===
+
+    @mock.patch.object(pybao_tools, "get_sdk_client")
+    @mock.patch.object(pybao_tools, "get_pybao")
+    def test_screen_stocks_multi_condition_intersection(self, get_pybao, get_sdk_client):
+        fake = mock.Mock()
+
+        def fake_jisuan(name, codes, **kwargs):
+            if name == "macd":
+                return {
+                    "600001": [{"date": 20260105, "cross": 1}],
+                    "600002": [{"date": 20260105, "cross": 0}],
+                    "600003": [{"date": 20260105, "cross": 0}],
+                }
+            return {
+                "600001": [{"date": 20260105, "cross": 1}],
+                "600002": [{"date": 20260105, "cross": 1}],
+                "600003": [{"date": 20260105, "cross": 0}],
+            }
+
+        fake.jisuan.side_effect = fake_jisuan
+        get_pybao.return_value = fake
+        fake_client = mock.Mock()
+        fake_client.get_data.return_value = [
+            {"date": 20260105, "float_mv": 5e8, "is_st": False,
+             "name": "测试", "close": 10.2, "pct_chg": 3.5},
+        ]
+        get_sdk_client.return_value = fake_client
+
+        outcome = pybao_tools.screen_stocks(
+            {
+                "indicator_cross": [
+                    {"name": "macd", "golden": True, "within_days": 5},
+                    {"name": "kdj", "golden": True, "within_days": 5},
+                ],
+                "date": "20260105",
+            },
+            ["600001", "600002", "600003"],
+        )
+
+        self.assertTrue(outcome["ok"])
+        result = outcome["result"]
+        # 交集：600001 命中两条件；600002 只命中 kdj；600003 都不命中
+        self.assertEqual(result["matched_count"], 1)
+        cand = result["candidates"][0]
+        self.assertEqual(cand["code"], "600001")
+        self.assertIsNone(cand["signal"])  # 多条件 → signal None
+        self.assertEqual(
+            cand["crosses"],
+            {"macd": {"date": 20260105, "signal": 1},
+             "kdj": {"date": 20260105, "signal": 1}},
+        )
+        self.assertEqual(cand["cross_date"], 20260105)  # 各条件日期最大值
+        self.assertEqual(cand["pct_chg"], 3.5)
+        self.assertIsInstance(result["elapsed_ms"], int)
+        # 每条件独立 jisuan（两次，各自交叉）
+        self.assertEqual(fake.jisuan.call_count, 2)
+        self.assertEqual(fake.jisuan.call_args_list[0].args[0], "macd")
+        self.assertEqual(fake.jisuan.call_args_list[1].args[0], "kdj")
+
+    def test_screen_stocks_duplicate_indicator_rejected(self):
+        outcome = pybao_tools.screen_stocks(
+            {"indicator_cross": [{"name": "macd"}, {"name": "macd"}]},
+            ["600001"],
+        )
+
+        self.assertFalse(outcome["ok"])
+        self.assertIn("重复", outcome["error"])
+
+    @mock.patch.object(pybao_tools, "get_sdk_client")
+    @mock.patch.object(pybao_tools, "get_pybao")
+    def test_screen_stocks_single_object_backward_compat(self, get_pybao, get_sdk_client):
+        fake = mock.Mock()
+        fake.jisuan.return_value = {
+            "600001": [{"date": 20260105, "cross": 1}],
+            "600002": [{"date": 20260105, "cross": 0}],
+        }
+        get_pybao.return_value = fake
+        fake_client = mock.Mock()
+        fake_client.get_data.return_value = [
+            {"date": 20260105, "float_mv": 5e8, "is_st": False,
+             "name": "测试", "close": 10.2},
+        ]
+        get_sdk_client.return_value = fake_client
+
+        # 单对象（非数组）保持向后兼容
+        outcome = pybao_tools.screen_stocks(
+            {"indicator_cross": {"name": "macd", "golden": True, "within_days": 5},
+             "date": "20260105"},
+            ["600001", "600002"],
+        )
+
+        self.assertTrue(outcome["ok"])
+        result = outcome["result"]
+        self.assertEqual([c["code"] for c in result["candidates"]], ["600001"])
+        self.assertEqual(result["candidates"][0]["signal"], 1)  # 单条件 → 信号值
+
+    # === prompts 能力 ===
+
+    def test_http_dispatch_prompts_list(self):
+        response = server.dispatch({
+            "jsonrpc": "2.0", "id": 180, "method": "prompts/list",
+        })
+
+        names = {prompt["name"] for prompt in response["result"]["prompts"]}
+        self.assertEqual(names, {"screen-workflow", "limit-up-review"})
+
+    def test_http_dispatch_prompts_get_and_unknown(self):
+        response = server.dispatch({
+            "jsonrpc": "2.0", "id": 181, "method": "prompts/get",
+            "params": {"name": "screen-workflow"},
+        })
+
+        messages = response["result"]["messages"]
+        self.assertTrue(messages)
+        self.assertEqual(messages[0]["role"], "user")
+        self.assertEqual(messages[0]["content"]["type"], "text")
+        self.assertTrue(messages[0]["content"]["text"].strip())
+
+        unknown = server.dispatch({
+            "jsonrpc": "2.0", "id": 182, "method": "prompts/get",
+            "params": {"name": "no-such-prompt"},
+        })
+        self.assertEqual(unknown["error"]["code"], -32602)
+
+    # === tools/call stderr 日志（mcp_tool_call 一行 JSON） ===
+
+    @mock.patch.object(server, "query_stock_list")
+    def test_tools_call_logs_mcp_tool_call_line(self, query_stock_list):
+        query_stock_list.return_value = {"total": 0, "codes": []}
+
+        with mock.patch("sys.stderr", new_callable=io.StringIO) as fake_stderr:
+            server.dispatch({
+                "jsonrpc": "2.0", "id": 190, "method": "tools/call",
+                "params": {"name": "get_stock_list", "arguments": {}},
+            })
+            captured = fake_stderr.getvalue()
+
+        self.assertIn("mcp_tool_call", captured)
+        self.assertIn("get_stock_list", captured)
+
+    # === 进度钩子（线程级 set/clear/notify） ===
+
+    def test_progress_hook_lifecycle(self):
+        calls: list[tuple[str, str | None]] = []
+        pybao_tools.set_progress_hook(
+            lambda stage, detail: calls.append((stage, detail))
+        )
+        try:
+            pybao_tools.notify_progress("a", "b")
+            self.assertEqual(calls, [("a", "b")])
+            pybao_tools.clear_progress_hook()
+            pybao_tools.notify_progress("c", "d")
+            self.assertEqual(calls, [("a", "b")])  # clear 后不再触发
+        finally:
+            pybao_tools.clear_progress_hook()
+        # 未设 hook 时 notify 不抛异常
+        pybao_tools.notify_progress("e")
+        self.assertEqual(calls, [("a", "b")])
 
 
 if __name__ == "__main__":

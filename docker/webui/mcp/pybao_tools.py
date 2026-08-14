@@ -10,11 +10,16 @@ stockdb_mcp_server 的 get_indicators / get_board_members / get_kline(增强路�
 - compute_indicators(args)  技术指标计算（参数校验 + 批量计算 + 结果加工）
 - query_boards(args)        板块成员查询（双向：板块→成分股 / 股票→所属板块）
 - get_mydb_rd()     返回连接当前端点的原始 rd 客户端（mydb 私有库读写用），不可用返回 None
-- query_mydb(args)  mydb 私有库只读（表名校验 + 键值/全表读取，镜像 app.mydb_read 语义）
+- query_mydb(args)  mydb 私有库只读（表名校验 + 键值/全表读取，支持游标续取）
 - screen_stocks(args, universe)  条件选股核心计算（指标交叉/流通市值/ST 过滤）
 
 compute_indicators / query_boards / query_mydb / screen_stocks 统一返回
 {"ok": True, "result": {...}} 或 {"ok": False, "error": "中文错误"}。
+失败返回带 "code"（PARAM_INVALID=参数校验失败 / PYBAO_UNAVAILABLE=pybao 缺失 /
+INTERNAL=计算/查询/加工异常），PYBAO_UNAVAILABLE 附加 "hint" 定位说明。
+
+进度通知：set_progress_hook / clear_progress_hook / notify_progress 提供线程级
+进度回调（供 server/app 的 SSE 流式进度推送复用），无回调时静默不产生开销。
 
 依赖：纯 Python 标准库；pybao 为可选外部依赖，缺失时上述能力返回明确降级错误，
 不影响 stockdb_mcp_server 其余 HTTP 工具。
@@ -32,6 +37,7 @@ from __future__ import annotations
 import os
 import sys
 import threading
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -82,10 +88,44 @@ DEFAULT_BOARD_FIELDS = "code,name,type,group,category"
 BOARD_FIELDS = ("code", "name", "source", "type", "group", "category", "symbols")
 FIELD_ALIASES = {"symbol": "symbols", "symbls": "symbols", "codelist": "symbols"}
 
+# pybao 缺失时的错误文案与定位 hint（error 保留 "pybao 不可用：" 开头文案，
+# hint 为独立字段供客户端按 code=PYBAO_UNAVAILABLE 分支展示）
 PYBAO_UNAVAILABLE = (
     "pybao 不可用：容器镜像内自动携带（/opt/stockdb/pybao）；本机开发请把 "
     "macOS 版 pybao 放到 /tmp/pybao_mac 或设置 PYBAO_DIR 环境变量。"
 )
+PYBAO_UNAVAILABLE_HINT = (
+    "容器镜像自动携带（/opt/stockdb/pybao）；本机开发请把 macOS 版 pybao 放 "
+    "/tmp/pybao_mac 或设 PYBAO_DIR"
+)
+
+
+# === 统一错误码 ===
+# 契约：所有 {"ok": False, ...} 返回携带 "code" ∈ {PARAM_INVALID, PYBAO_UNAVAILABLE,
+# INTERNAL}；PYBAO_UNAVAILABLE 附加 "hint"。server 层 isError content 透传 code/hint。
+
+
+def _error(code: str, message: str, *, hint: str | None = None) -> dict:
+    """构造统一错误返回 {"ok": False, "error", "code"(, "hint")}。"""
+    out: dict = {"ok": False, "error": message, "code": code}
+    if hint:
+        out["hint"] = hint
+    return out
+
+
+def _param_error(message: str) -> dict:
+    """参数校验失败（PARAM_INVALID）。"""
+    return _error("PARAM_INVALID", message)
+
+
+def _pybao_unavailable_error() -> dict:
+    """pybao 缺失降级（PYBAO_UNAVAILABLE + 定位 hint）。"""
+    return _error("PYBAO_UNAVAILABLE", PYBAO_UNAVAILABLE, hint=PYBAO_UNAVAILABLE_HINT)
+
+
+def _internal_error(message: str) -> dict:
+    """计算/查询/加工异常（INTERNAL）。"""
+    return _error("INTERNAL", message)
 
 
 # === pybao 定位与加载 ===
@@ -252,6 +292,35 @@ def _normalize_boards(boards: object) -> list[dict]:
     return []
 
 
+# === 进度通知（线程级，供 server/app 流式进度推送复用） ===
+
+_progress_local = threading.local()
+
+
+def set_progress_hook(fn) -> None:
+    """设置当前线程的进度回调；fn(stage: str, detail: str | None)。
+
+    供 server/app 在长任务（如全市场 screen_stocks）期间以 SSE 推送进度事件。
+    """
+    _progress_local.hook = fn
+
+
+def clear_progress_hook() -> None:
+    """清除当前线程的进度回调（恢复为无回调静默）。"""
+    _progress_local.hook = None
+
+
+def notify_progress(stage: str, detail: str | None = None) -> None:
+    """当前线程存在进度回调时调用 fn(stage, detail)；无回调或回调异常均静默。"""
+    hook = getattr(_progress_local, "hook", None)
+    if hook is None:
+        return
+    try:
+        hook(stage, detail)
+    except Exception:  # noqa: BLE001 - 进度回调异常不影响业务
+        pass
+
+
 # === 业务接口 ===
 
 
@@ -275,62 +344,69 @@ def compute_indicators(args: dict) -> dict:
         compact     True=列式（dates+字段数组），False=行列表（默认 True）
 
     返回 {"ok": True, "result": {"source", "frequency", "indicators", "params",
-    "compact", "truncated", "truncated_rows", "data"}} 或 {"ok": False, "error": "中文"}。
+    "compact", "truncated", "truncated_rows", "data"}} 或 {"ok": False, "error": "中文",
+    "code": "PARAM_INVALID"/"PYBAO_UNAVAILABLE"/"INTERNAL"(+hint)}。
     data 形态：单码 → rows / 列式 dict；批量 → {code: rows / 列式 dict}；zhishu → 单序列。
     """
     # === 参数校验（先于 pybao 加载，离线即可报错） ===
     indicators = args.get("indicators")
     if not isinstance(indicators, list) or not indicators:
-        return {"ok": False, "error": "indicators 必须为非空数组"}
+        return _param_error("indicators 必须为非空数组")
     if len(indicators) > _INDICATOR_MAX:
-        return {"ok": False, "error": f"indicators 最多 {_INDICATOR_MAX} 个，当前 {len(indicators)} 个"}
+        return _param_error(
+            f"indicators 最多 {_INDICATOR_MAX} 个，当前 {len(indicators)} 个",
+        )
     ind_list: list[str] = []
     for name in indicators:
         name = str(name).strip().lower()
         if name not in SUPPORTED_INDICATORS:
-            return {"ok": False, "error": f"未知指标: {name}"}
+            return _param_error(f"未知指标: {name}")
         if name not in ind_list:
             ind_list.append(name)
     if "zhishu" in ind_list and len(ind_list) > 1:
-        return {"ok": False, "error": "zhishu 指数只能单独计算（不可与其它指标混用）"}
+        return _param_error("zhishu 指数只能单独计算（不可与其它指标混用）")
 
     raw_codes = args.get("codes")
     if isinstance(raw_codes, str):
         raw_codes = [raw_codes]
     if not isinstance(raw_codes, list) or not raw_codes:
-        return {"ok": False, "error": "codes 必须为非空数组"}
+        return _param_error("codes 必须为非空数组")
     if len(raw_codes) > _CODES_MAX:
-        return {"ok": False, "error": f"codes 最多 {_CODES_MAX} 个，当前 {len(raw_codes)} 个"}
+        return _param_error(
+            f"codes 最多 {_CODES_MAX} 个，当前 {len(raw_codes)} 个",
+        )
     codes: list[str] = []
     for item in raw_codes:
         code = str(item).strip()
         if len(code) != 6 or not code.isdigit():
-            return {"ok": False, "error": f"股票代码 {code!r} 必须是 6 位数字"}
+            return _param_error(f"股票代码 {code!r} 必须是 6 位数字")
         codes.append(code)
 
     frequency = str(args.get("frequency") or "1d").strip()
     if frequency not in FREQUENCIES:
-        return {"ok": False, "error": f"不支持的频率: {frequency}"}
+        return _param_error(f"不支持的频率: {frequency}")
 
     start = str(args.get("start") or "").strip() or (
         datetime.now() - timedelta(days=_DEFAULT_START_DAYS)
     ).strftime("%Y%m%d")
     if len(start) != 8 or not start.isdigit():
-        return {"ok": False, "error": "start 必须是 8 位日期 YYYYMMDD"}
+        return _param_error("start 必须是 8 位日期 YYYYMMDD")
     end = str(args.get("end") or "N").strip()
     if end != "N" and (len(end) != 8 or not end.isdigit()):
-        return {"ok": False, "error": 'end 必须是 "N" 或 8 位日期 YYYYMMDD'}
+        return _param_error('end 必须是 "N" 或 8 位日期 YYYYMMDD')
 
     params = args.get("params")
     if params is not None:
         if isinstance(params, (str, int)):
             params = [params]  # 单指标允许直接传标量
         if not isinstance(params, list) or len(params) != len(ind_list):
-            return {"ok": False, "error": "params 数量必须与 indicators 数量一致"}
+            return _param_error("params 数量必须与 indicators 数量一致")
         for i, param in enumerate(params):
             if param is None or isinstance(param, (str, int)) and not isinstance(param, bool):
                 continue
-            return {"ok": False, "error": f"params[{i}] 必须是参数串（如 '5,10,20'）、整数或 None"}
+            return _param_error(
+                f"params[{i}] 必须是参数串（如 '5,10,20'）、整数或 None",
+            )
 
     cross = args.get("cross", False)
     if isinstance(cross, str):
@@ -340,25 +416,27 @@ def compute_indicators(args: dict) -> dict:
         elif lowered in ("true", "false"):
             cross = lowered == "true"
         else:
-            return {"ok": False, "error": 'cross 必须是 false、true 或 "with_value"'}
+            return _param_error('cross 必须是 false、true 或 "with_value"')
     elif not isinstance(cross, bool):
-        return {"ok": False, "error": 'cross 必须是 false、true 或 "with_value"'}
+        return _param_error('cross 必须是 false、true 或 "with_value"')
     if "zhishu" in ind_list and cross is not False:
-        return {"ok": False, "error": "zhishu 指数不支持 cross（必须为 false）"}
+        return _param_error("zhishu 指数不支持 cross（必须为 false）")
 
     fq = args.get("fq", "qfq")
     if isinstance(fq, str):
         fq = fq.strip().lower() or None
         if fq not in ("qfq", "hfq", None):
-            return {"ok": False, "error": 'fq 必须是 "qfq"、"hfq" 或 None'}
+            return _param_error('fq 必须是 "qfq"、"hfq" 或 None')
     elif fq is not None:
-        return {"ok": False, "error": 'fq 必须是 "qfq"、"hfq" 或 None'}
+        return _param_error('fq 必须是 "qfq"、"hfq" 或 None')
 
     fields = args.get("fields")
     fields_list: list[str] | None = None
     if fields is not None:
         if not isinstance(fields, str):
-            return {"ok": False, "error": "fields 必须是逗号分隔字符串（open/high/low/close/volume/amount）"}
+            return _param_error(
+                "fields 必须是逗号分隔字符串（open/high/low/close/volume/amount）",
+            )
         fields_list = [
             item.strip().lower()
             for item in fields.replace("，", ",").split(",")
@@ -369,33 +447,41 @@ def compute_indicators(args: dict) -> dict:
         else:
             for field in fields_list:
                 if field not in DATA_FIELDS:
-                    return {"ok": False, "error": f"不支持的行情字段 {field!r}（可选 open/high/low/close/volume/amount）"}
+                    return _param_error(
+                        f"不支持的行情字段 {field!r}（可选 open/high/low/close/volume/amount）",
+                    )
             if not all(name in BASIC_INDICATORS for name in ind_list):
-                return {"ok": False, "error": "fields 仅支持 ma/ema/sma/wma/dma/std/sum/hhv/llv/ref 基础指标"}
+                return _param_error(
+                    "fields 仅支持 ma/ema/sma/wma/dma/std/sum/hhv/llv/ref 基础指标",
+                )
             if cross is not False and len(fields_list) != 1:
-                return {"ok": False, "error": 'cross=True/cross="with_value" 时 fields 只能选一个字段'}
+                return _param_error(
+                    'cross=True/cross="with_value" 时 fields 只能选一个字段',
+                )
 
     limit = _as_int(args.get("limit"), _DEFAULT_LIMIT)
     if limit is None or limit < 1:
-        return {"ok": False, "error": "limit 必须是正整数"}
+        return _param_error("limit 必须是正整数")
     limit = min(limit, _MAX_LIMIT)
     compact = _as_bool(args.get("compact"), default=True)
 
     try:
         method = int(args.get("method", 1))
         if method not in (1, 2, 3, 4, 5):
-            return {"ok": False, "error": "method 必须是 1-5（1平权/2流通市值/3成交额/4成交量/5总市值）"}
+            return _param_error(
+                "method 必须是 1-5（1平权/2流通市值/3成交额/4成交量/5总市值）",
+            )
     except (TypeError, ValueError):
-        return {"ok": False, "error": "method 必须是整数 1-5"}
+        return _param_error("method 必须是整数 1-5")
     try:
         base = float(args.get("base", 1000.0))
     except (TypeError, ValueError):
-        return {"ok": False, "error": "base 必须是数值（指数初始基点）"}
+        return _param_error("base 必须是数值（指数初始基点）")
 
     # === 加载 pybao（失败降级） ===
     module = get_pybao()
     if module is None:
-        return {"ok": False, "error": PYBAO_UNAVAILABLE}
+        return _pybao_unavailable_error()
 
     # === 一次批量计算（jisuan 原生支持多指标×多股票） ===
     jisuan_codes: str | list[str] = codes[0] if len(codes) == 1 else codes
@@ -418,7 +504,7 @@ def compute_indicators(args: dict) -> dict:
                 cross=cross,
             )
     except Exception as exc:  # noqa: BLE001 - 计算失败转为中文错误
-        return {"ok": False, "error": f"指标计算失败: {type(exc).__name__}: {exc}"}
+        return _internal_error(f"指标计算失败: {type(exc).__name__}: {exc}")
 
     # === 结果加工：每码保留最后 limit 行（最新数据），compact 时列式化 ===
     try:
@@ -446,7 +532,7 @@ def compute_indicators(args: dict) -> dict:
             rows = _trim(_normalize_rows(raw))
             data = _to_columnar(rows) if compact else rows
     except Exception as exc:  # noqa: BLE001 - 加工失败转为中文错误
-        return {"ok": False, "error": f"指标结果加工失败: {type(exc).__name__}: {exc}"}
+        return _internal_error(f"指标结果加工失败: {type(exc).__name__}: {exc}")
 
     return {
         "ok": True,
@@ -475,14 +561,14 @@ def query_boards(args: dict) -> dict:
         limit           结果条目上限（默认 500，硬上限 500）
 
     返回 {"ok": True, "result": {"source", "category", "query", "boards",
-    "total", "truncated", "symbols"?}} 或 {"ok": False, "error": "中文"}。
+    "total", "truncated", "symbols"?}} 或 {"ok": False, "error": "中文", "code": ...}。
     boards 为板块元数据列表（不含 symbols）；include_symbols=True 时额外返回
     去重合并后的 symbols（成分股，超上限截断并标记 truncated）。
     """
     # === 参数校验（先于 pybao 加载） ===
     query = str(args.get("query") or "").strip()
     if not query:
-        return {"ok": False, "error": "query 必须提供板块名称/代码/股票代码"}
+        return _param_error("query 必须提供板块名称/代码/股票代码")
 
     category = args.get("category")
     category_name: str | None = None
@@ -496,7 +582,9 @@ def query_boards(args: dict) -> dict:
         elif isinstance(category, str):
             category_name = BOARD_CATEGORIES.get(category.strip())
         if category_name is None:
-            return {"ok": False, "error": f"不支持的板块分类: {category}（可选 概念/申万一级/申万二级/申万三级 或整数 0-3）"}
+            return _param_error(
+                f"不支持的板块分类: {category}（可选 概念/申万一级/申万二级/申万三级 或整数 0-3）",
+            )
 
     fields = str(args.get("fields") or DEFAULT_BOARD_FIELDS)
     field_list: list[str] = []
@@ -506,7 +594,9 @@ def query_boards(args: dict) -> dict:
             continue
         item = FIELD_ALIASES.get(item, item)
         if item not in BOARD_FIELDS:
-            return {"ok": False, "error": f"不支持的字段 {item!r}（可选 {'/'.join(BOARD_FIELDS)}）"}
+            return _param_error(
+                f"不支持的字段 {item!r}（可选 {'/'.join(BOARD_FIELDS)}）",
+            )
         if item not in field_list:
             field_list.append(item)
     if not field_list:
@@ -515,13 +605,13 @@ def query_boards(args: dict) -> dict:
     include_symbols = _as_bool(args.get("include_symbols"), default=False)
     limit = _as_int(args.get("limit"), _DEFAULT_LIMIT)
     if limit is None or limit < 1:
-        return {"ok": False, "error": "limit 必须是正整数"}
+        return _param_error("limit 必须是正整数")
     limit = min(limit, _MAX_SYMBOLS)
 
     # === 加载 pybao（失败降级） ===
     module = get_pybao()
     if module is None:
-        return {"ok": False, "error": PYBAO_UNAVAILABLE}
+        return _pybao_unavailable_error()
 
     # === 查询（bk.get(x, category)；fields 投影由客户端完成——pybao 的 fields
     # 投影返回无键的扁平值列表，无法可靠归一化） ===
@@ -529,7 +619,7 @@ def query_boards(args: dict) -> dict:
         with _PYBAO_LOCK:
             boards = module.bk.get(query, category=category_name)
     except Exception as exc:  # noqa: BLE001 - 查询失败转为中文错误
-        return {"ok": False, "error": f"板块查询失败: {type(exc).__name__}: {exc}"}
+        return _internal_error(f"板块查询失败: {type(exc).__name__}: {exc}")
 
     items = _normalize_boards(boards)
     # 板块元数据（客户端按 field_list 投影，去掉成分股避免结果爆炸）
@@ -648,27 +738,32 @@ def query_mydb(args: dict) -> dict:
         table  自定义表名（非空、仅字母数字与 _:-、不得与上游保留表冲突）
         key    可选；传了（非空）则只读该键，未传则列出表内全部键值
         limit  未传 key 时最多返回键数（默认 100，硬上限 500），超限 truncated=True
+        cursor 可选字符串；仅未传 key 时生效——作为续取游标，先对键排序、
+               再只保留 > cursor 的键（配合 result.next_key 翻页）
 
-    返回 {"ok": True, "result": {...}} 或 {"ok": False, "error": "中文"}。
+    返回 {"ok": True, "result": {...}} 或 {"ok": False, "error": "中文", "code": ...}。
     result：传 key → {"source","table","key","value"}；
-    未传 key → {"source","table","keys","values","total","truncated"}。
+    未传 key → {"source","table","keys","values","total","truncated","next_key"}；
+    next_key：截断时 = 保留的最后一个原始键（客户端以它为 cursor 续取下一页），
+    未截断时 = None。cursor 参数在传 key 时被忽略。
     """
     # === 参数校验（先于 pybao 加载，离线即可报错） ===
     table = str(args.get("table") or "").strip()
     key = str(args.get("key") or "").strip()
+    cursor = str(args.get("cursor") or "").strip() or None
     limit = _as_int(args.get("limit"), _MYDB_KEY_LIMIT_DEFAULT)
     if limit is None or limit < 1:
-        return {"ok": False, "error": "limit 必须是正整数"}
+        return _param_error("limit 必须是正整数")
     limit = min(limit, _MYDB_KEY_LIMIT_MAX)
 
     try:
         table = _validate_mydb_table(table)
     except ValueError as exc:
-        return {"ok": False, "error": str(exc)}
+        return _param_error(str(exc))
 
     rd = get_mydb_rd()
     if rd is None:
-        return {"ok": False, "error": PYBAO_UNAVAILABLE}
+        return _pybao_unavailable_error()
 
     try:
         if key:
@@ -683,16 +778,25 @@ def query_mydb(args: dict) -> dict:
                 },
             }
         raw_keys = list(rd.keys(table, "*") or [])
+        # 排序保证游标续取的有序性（rd.keys 返回顺序不做假设）
+        raw_keys.sort(key=str)
+        if cursor is not None:
+            raw_keys = [k for k in raw_keys if str(k) > cursor]
         total = len(raw_keys)
         kept_keys = raw_keys if len(raw_keys) <= limit else raw_keys[:limit]
+        truncated = total > limit
+        next_key = kept_keys[-1] if truncated else None
         values: dict[str, object] = {}
         for k in kept_keys:
-            # 键形如 "600633:20260105"，取 ":" 后的日期段作为 get 的 key（同 app.py）
-            date_str = str(k).split(":")[-1]
+            # 键形如 "hk日k:00700:20250425"（含表名前缀）或 "custom:20250425"；
+            # 去掉首个冒号前的表名段，其余部分整体作为 get 的 key（如 "00700:20250425"）。
+            # 不能用 split(":")[-1]：会丢掉港股代码段导致读不到值。
+            full = str(k)
+            lookup_key = full.split(":", 1)[-1] if ":" in full else full
             try:
-                values[str(k)] = _to_py(rd.get(table, date_str))
+                values[full] = _to_py(rd.get(table, lookup_key))
             except Exception:  # noqa: BLE001 - 单键失败不中断整体
-                values[str(k)] = None
+                values[full] = None
         return {
             "ok": True,
             "result": {
@@ -701,11 +805,12 @@ def query_mydb(args: dict) -> dict:
                 "keys": kept_keys,
                 "values": values,
                 "total": total,
-                "truncated": total > limit,
+                "truncated": truncated,
+                "next_key": next_key,
             },
         }
     except Exception as exc:  # noqa: BLE001 - 读取失败转为中文错误
-        return {"ok": False, "error": f"mydb 读取失败: {type(exc).__name__}: {exc}"}
+        return _internal_error(f"mydb 读取失败: {type(exc).__name__}: {exc}")
 
 
 def _as_float_or_none(value: object, label: str) -> float | None:
@@ -744,85 +849,116 @@ def _date_sort_key(value: object) -> int:
 
 
 def screen_stocks(args: dict, universe: list[str], universe_source: str = "full_market") -> dict:
-    """条件选股核心计算：指标交叉 + 流通市值 + ST 过滤。
+    """条件选股核心计算：指标交叉（单/多条件 AND）+ 流通市值 + ST 过滤。
 
     universe 由 server 侧解析后传入（板块成分 / 全市场），本函数不负责取股票列表；
     universe_source 标识股票池来源（full_market / board:<name> / codes），
     板块来源本身即可构成筛选条件（"列出某板块成分股"）。
     参数：
         universe        候选股票代码列表（6 位数字，非空，上限 6000）
-        indicator_cross 可选对象 {"name", "golden"(默认 True), "within_days"(1-60, 默认 5)}；
-                        name 必须在 SUPPORTED_INDICATORS 且 != "zhishu"
+        indicator_cross 可选：单个对象或对象数组（1-3 个），每个条件
+                        {"name", "golden"(默认 True), "within_days"(1-60, 默认 5)}；
+                        name 必须在 SUPPORTED_INDICATORS 且 != "zhishu"，
+                        指标名不允许重复；多条件时取交集（股票须命中全部条件），
+                        各条件独立 jisuan 并按各自收敛特性分档预热
         float_mv_min / float_mv_max  可选流通市值边界（与日K float_mv 同单位：元）
         exclude_st      默认 True（宽松布尔解析）；ST 状态未知时保留并标注 is_st=None
         date            可选 8 位日期；缺省 = 最新交易日（由交叉行日期推导）
         limit           默认 50，1-200
 
-    返回 {"ok": True, "result": {...}} 或 {"ok": False, "error": "中文"}。
+    返回 {"ok": True, "result": {...}} 或 {"ok": False, "error": "中文", "code": ...}。
     result 含 source/date/universe_count/matched_count/candidates/dropped/
-    truncated/limit/conditions/methodology/known_limitations。
+    truncated/limit/conditions/methodology/known_limitations/elapsed_ms。
+    matched_count = 多条件交集数量；candidates 每项含 code/name/close/cross_date/
+    signal/crosses/float_mv/is_st/pct_chg；crosses = {指标名: {"date", "signal"}}，
+    cross_date = 该股各条件日期最大值，signal = 单条件时的信号值、多条件时 None
+    （保留字段向后兼容）；elapsed_ms = 函数入口起计时的整毫秒数。
+    进度：计算期间按阶段调用 notify_progress（stock_pool_ready / indicator_done /
+    filter_done），供 server/app 的 SSE 流式进度推送复用。
     """
+    _t0 = time.time()
+
     # === 参数校验（先于 pybao 加载，离线即可报错） ===
     if isinstance(universe, str):
         universe = [universe]
     if not isinstance(universe, list) or not universe:
-        return {"ok": False, "error": "universe 必须为非空列表"}
+        return _param_error("universe 必须为非空列表")
     if len(universe) > _UNIVERSE_MAX:
-        return {
-            "ok": False,
-            "error": f"universe 最多 {_UNIVERSE_MAX} 个，当前 {len(universe)} 个",
-        }
+        return _param_error(
+            f"universe 最多 {_UNIVERSE_MAX} 个，当前 {len(universe)} 个",
+        )
     codes: list[str] = []
     for item in universe:
         code = str(item).strip()
         if len(code) != 6 or not code.isdigit():
-            return {"ok": False, "error": f"股票代码 {code!r} 必须是 6 位数字"}
+            return _param_error(f"股票代码 {code!r} 必须是 6 位数字")
         codes.append(code)
     universe = codes
 
-    indicator_cross = args.get("indicator_cross")
-    if indicator_cross is not None:
-        if not isinstance(indicator_cross, dict):
-            return {"ok": False, "error": "indicator_cross 必须是对象"}
-        name = str(indicator_cross.get("name") or "").strip().lower()
-        if not name:
-            return {"ok": False, "error": "indicator_cross.name 必须提供指标名"}
-        if name not in SUPPORTED_INDICATORS:
-            return {"ok": False, "error": f"未知指标: {name}"}
-        if name == "zhishu":
-            return {"ok": False, "error": "zhishu 不支持 cross 筛选"}
-        golden = _as_bool(indicator_cross.get("golden"), default=True)
-        within_days = _as_int(indicator_cross.get("within_days"), 5)
-        if within_days is None or not 1 <= within_days <= 60:
-            return {"ok": False, "error": "within_days 必须是 1-60 的整数"}
-        indicator_cross = {"name": name, "golden": golden, "within_days": within_days}
+    raw_cross = args.get("indicator_cross")
+    cross_conditions: list[dict] | None = None
+    if raw_cross is not None:
+        if isinstance(raw_cross, dict):
+            raw_list = [raw_cross]
+        elif isinstance(raw_cross, list):
+            if not raw_cross:
+                return _param_error("indicator_cross 必须提供至少 1 个条件对象")
+            if len(raw_cross) > 3:
+                return _param_error(
+                    f"indicator_cross 最多 3 个条件，当前 {len(raw_cross)} 个",
+                )
+            raw_list = raw_cross
+        else:
+            return _param_error("indicator_cross 必须是对象或对象数组（1-3 个）")
+        cross_conditions = []
+        seen_names: set[str] = set()
+        for item in raw_list:
+            if not isinstance(item, dict):
+                return _param_error("indicator_cross 每个条件必须是对象")
+            name = str(item.get("name") or "").strip().lower()
+            if not name:
+                return _param_error("indicator_cross.name 必须提供指标名")
+            if name not in SUPPORTED_INDICATORS:
+                return _param_error(f"未知指标: {name}")
+            if name == "zhishu":
+                return _param_error("zhishu 不支持 cross 筛选")
+            if name in seen_names:
+                return _param_error("indicator_cross 不允许重复指标")
+            seen_names.add(name)
+            golden = _as_bool(item.get("golden"), default=True)
+            within_days = _as_int(item.get("within_days"), 5)
+            if within_days is None or not 1 <= within_days <= 60:
+                return _param_error("within_days 必须是 1-60 的整数")
+            cross_conditions.append({
+                "name": name, "golden": golden, "within_days": within_days,
+            })
 
     try:
         mv_min = _as_float_or_none(args.get("float_mv_min"), "float_mv_min")
         mv_max = _as_float_or_none(args.get("float_mv_max"), "float_mv_max")
     except ValueError as exc:
-        return {"ok": False, "error": str(exc)}
+        return _param_error(str(exc))
     if mv_min is not None and mv_max is not None and mv_min > mv_max:
-        return {"ok": False, "error": "float_mv_min 不能大于 float_mv_max"}
+        return _param_error("float_mv_min 不能大于 float_mv_max")
 
     exclude_st = _as_bool(args.get("exclude_st"), default=True)
 
     date = str(args.get("date") or "").strip()
     if date and (len(date) != 8 or not date.isdigit()):
-        return {"ok": False, "error": "date 必须是 8 位日期 YYYYMMDD"}
+        return _param_error("date 必须是 8 位日期 YYYYMMDD")
 
     limit = _as_int(args.get("limit"), _SCREEN_DEFAULT_LIMIT)
     if limit is None or not 1 <= limit <= _SCREEN_LIMIT_MAX:
-        return {"ok": False, "error": "limit 必须是 1-200 的整数"}
+        return _param_error("limit 必须是 1-200 的整数")
 
     # 至少一个筛选条件：指标交叉 / 市值边界 / 板块（板块来源本身即条件）
     if (
-        indicator_cross is None
+        cross_conditions is None
         and mv_min is None
         and mv_max is None
         and universe_source == "full_market"
     ):
-        return {"ok": False, "error": "至少提供一个筛选条件"}
+        return _param_error("至少提供一个筛选条件")
 
     # === 计算（全程在 _PYBAO_LOCK 内） ===
     try:
@@ -830,64 +966,109 @@ def screen_stocks(args: dict, universe: list[str], universe_source: str = "full_
             # a) 加载 pybao（失败降级）
             module = get_pybao()
             if module is None:
-                return {"ok": False, "error": PYBAO_UNAVAILABLE}
+                return _pybao_unavailable_error()
 
-            # b) 指标交叉：预热期按指标收敛特性分档（EMA/累积类 120 自然日，
-            # SMA 滚动类 60 自然日），end = date 或 "N"
-            cross_window_note = ""
-            if indicator_cross is not None:
-                name = indicator_cross["name"]
-                golden = indicator_cross["golden"]
-                within_days = indicator_cross["within_days"]
-                warmup_days = (
-                    _CROSS_WARMUP_DAYS
-                    if name in _CROSS_WARMUP_LONG
-                    else _CROSS_WARMUP_DAYS_SHORT
-                )
-                cross_start = date or (
-                    datetime.now() - timedelta(days=warmup_days)
-                ).strftime("%Y%m%d")
-                cross_end = date or "N"
-                jisuan_codes = universe[0] if len(universe) == 1 else universe
-                raw = module.jisuan(
-                    name, jisuan_codes, start=cross_start, end=cross_end, cross=True,
-                )
-                # 归一化每码行列表：批量 {code: rows}；单码 list
-                if isinstance(raw, dict):
-                    per_code = {code: _normalize_rows(raw.get(code)) for code in universe}
-                else:
-                    per_code = {universe[0]: _normalize_rows(raw)}
-                matched: list[tuple[str, object, object]] = []
-                for code in universe:
-                    rows = per_code.get(code) or []
-                    window = rows[-within_days:] if within_days > 0 else rows
-                    best: tuple[object, object] | None = None
-                    for row in window:
-                        sig = row.get("cross")
-                        if sig is None:
-                            sig = row.get(name + "_cross")
-                        is_match = (sig == 1) if golden else (sig == -1)
-                        if not is_match:
-                            continue
-                        d = row.get("date")
-                        if best is None or _date_sort_key(d) > _date_sort_key(best[0]):
-                            best = (d, sig)
-                    if best is not None:
-                        matched.append((code, best[0], best[1]))
-                cross_window_note = (
-                    f"最近 {within_days} 个交易日；指标自 {cross_start}"
-                    f"(前{warmup_days}自然日)起算以包含预热期"
-                )
+            # a2) 进度：股票池就绪（jisuan 前）
+            notify_progress("stock_pool_ready", f"股票池 {len(universe)} 只")
+
+            # b) 指标交叉：多条件各自 jisuan（预热期按指标收敛特性分档：
+            # EMA/累积类 120 自然日、SMA 滚动类 60 自然日），
+            # end = date 或 "N"；交集 = 命中全部条件的股票
+            cross_window_notes: list[str] = []
+            if cross_conditions is not None:
+                per_cond_matched: dict[str, dict[str, tuple[object, object]]] = {}
+                for cond in cross_conditions:
+                    name = cond["name"]
+                    golden = cond["golden"]
+                    within_days = cond["within_days"]
+                    warmup_days = (
+                        _CROSS_WARMUP_DAYS
+                        if name in _CROSS_WARMUP_LONG
+                        else _CROSS_WARMUP_DAYS_SHORT
+                    )
+                    cross_start = date or (
+                        datetime.now() - timedelta(days=warmup_days)
+                    ).strftime("%Y%m%d")
+                    cross_end = date or "N"
+                    jisuan_codes = universe[0] if len(universe) == 1 else universe
+                    raw = module.jisuan(
+                        name, jisuan_codes, start=cross_start, end=cross_end, cross=True,
+                    )
+                    # 归一化每码行列表：批量 {code: rows}；单码 list
+                    if isinstance(raw, dict):
+                        per_code = {code: _normalize_rows(raw.get(code)) for code in universe}
+                    else:
+                        per_code = {universe[0]: _normalize_rows(raw)}
+                    cond_matched: dict[str, tuple[object, object]] = {}
+                    for code in universe:
+                        rows = per_code.get(code) or []
+                        window = rows[-within_days:] if within_days > 0 else rows
+                        best: tuple[object, object] | None = None
+                        for row in window:
+                            sig = row.get("cross")
+                            if sig is None:
+                                sig = row.get(name + "_cross")
+                            is_match = (sig == 1) if golden else (sig == -1)
+                            if not is_match:
+                                continue
+                            d = row.get("date")
+                            if best is None or _date_sort_key(d) > _date_sort_key(best[0]):
+                                best = (d, sig)
+                        if best is not None:
+                            cond_matched[code] = best
+                    per_cond_matched[name] = cond_matched
+                    cross_window_notes.append(
+                        f"{name}: 最近 {within_days} 个交易日；指标自 {cross_start}"
+                        f"(前{warmup_days}自然日)起算以包含预热期"
+                    )
+                # 交集：股票须命中全部条件
+                matched_codes: set[str] | None = None
+                for cond_matched in per_cond_matched.values():
+                    if matched_codes is None:
+                        matched_codes = set(cond_matched)
+                    else:
+                        matched_codes &= set(cond_matched)
+                matched: list[dict] = []
+                for code in sorted(matched_codes or []):
+                    crosses = {
+                        name: {
+                            "date": per_cond_matched[name][code][0],
+                            "signal": per_cond_matched[name][code][1],
+                        }
+                        for name in per_cond_matched
+                    }
+                    cross_date = max(
+                        (crosses[name]["date"] for name in crosses),
+                        key=_date_sort_key,
+                    )
+                    signal = (
+                        crosses[cross_conditions[0]["name"]]["signal"]
+                        if len(cross_conditions) == 1 else None
+                    )
+                    matched.append({
+                        "code": code,
+                        "cross_date": cross_date,
+                        "signal": signal,
+                        "crosses": crosses,
+                    })
+                cross_window_note = "；".join(cross_window_notes)
             else:
                 # 无指标交叉条件：全部 universe 候选，cross_date/signal 为空
-                matched = [(code, None, None) for code in universe]
+                matched = [
+                    {"code": code, "cross_date": None, "signal": None, "crosses": {}}
+                    for code in universe
+                ]
+                cross_window_note = ""
+
+            # b2) 进度：交叉计算完成（交集数量）
+            notify_progress("indicator_done", f"满足交叉条件 {len(matched)} 只")
 
             # c) effective_date = date 参数或 matched 中最大交叉行日期
             # 注意：SDK 的 get_data 对 start/end 做 len() 处理，必须传字符串
             if date:
                 effective_date = date
             else:
-                dated = [m[1] for m in matched if m[1] is not None]
+                dated = [m["cross_date"] for m in matched if m["cross_date"] is not None]
                 effective_date = max(dated, key=_date_sort_key) if dated else None
             if effective_date is not None:
                 effective_date = str(effective_date)
@@ -896,13 +1077,13 @@ def screen_stocks(args: dict, universe: list[str], universe_source: str = "full_
             # 再用 SDK 批量 pipeline 一次拉取所有候选的单日 bar（单码循环太慢）
             client = get_sdk_client()
             if client is None:
-                return {"ok": False, "error": PYBAO_UNAVAILABLE}
+                return _pybao_unavailable_error()
 
             ordered = sorted(
                 matched,
                 key=lambda m: (
-                    -_date_sort_key(m[1]) if m[1] is not None else 1,
-                    m[0],
+                    -_date_sort_key(m["cross_date"]) if m["cross_date"] is not None else 1,
+                    m["code"],
                 ),
             )
             truncated = False
@@ -919,7 +1100,7 @@ def screen_stocks(args: dict, universe: list[str], universe_source: str = "full_
             st_unknown_seen = False
 
             # 批量拉取（SDK pipeline mget）；失败时降级为逐只拉取
-            fetch_codes = [m[0] for m in ordered]
+            fetch_codes = [m["code"] for m in ordered]
             bars_by_code: dict[str, list[dict]] = {}
             if fetch_codes and effective_date:
                 try:
@@ -942,7 +1123,11 @@ def screen_stocks(args: dict, universe: list[str], universe_source: str = "full_
             fallback_single = not bars_by_code
 
             kept: list[dict] = []
-            for code, cross_date, signal in ordered:
+            for item in ordered:
+                code = item["code"]
+                cross_date = item["cross_date"]
+                signal = item["signal"]
+                crosses = item["crosses"]
                 if fallback_single:
                     try:
                         rows = _normalize_rows(client.get_data(
@@ -991,9 +1176,13 @@ def screen_stocks(args: dict, universe: list[str], universe_source: str = "full_
                     "close": bar.get("close"),
                     "cross_date": cross_date,
                     "signal": signal,
+                    "crosses": crosses,
+                    "pct_chg": bar.get("pct_chg"),
                     "float_mv": float_mv,
                     "is_st": is_st,
                 })
+            # d2) 进度：bar 过滤完成（候选数）
+            notify_progress("filter_done", f"候选 {len(kept)} 只")
             if st_unknown_seen:
                 known_limitations.append("上市日期无涨跌幅限制期/ST 状态未知")
 
@@ -1010,7 +1199,7 @@ def screen_stocks(args: dict, universe: list[str], universe_source: str = "full_
 
             cross_window_text = (
                 cross_window_note
-                if indicator_cross is not None
+                if cross_conditions is not None
                 else "未启用指标交叉（候选按板块/市值/ST 条件筛选）"
             )
             return {
@@ -1030,7 +1219,7 @@ def screen_stocks(args: dict, universe: list[str], universe_source: str = "full_
                     "truncated": truncated,
                     "limit": limit,
                     "conditions": {
-                        "indicator_cross": indicator_cross,
+                        "indicator_cross": cross_conditions,
                         "float_mv_min": mv_min,
                         "float_mv_max": mv_max,
                         "exclude_st": exclude_st,
@@ -1040,10 +1229,11 @@ def screen_stocks(args: dict, universe: list[str], universe_source: str = "full_
                         "mv_unit": "与日K float_mv 字段同单位（元）",
                     },
                     "known_limitations": known_limitations,
+                    "elapsed_ms": int((time.time() - _t0) * 1000),
                 },
             }
     except Exception as exc:  # noqa: BLE001 - 计算异常统一转为中文错误
-        return {"ok": False, "error": f"选股计算失败: {type(exc).__name__}: {exc}"}
+        return _internal_error(f"选股计算失败: {type(exc).__name__}: {exc}")
 
 
 if __name__ == "__main__":

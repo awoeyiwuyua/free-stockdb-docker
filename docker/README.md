@@ -125,7 +125,7 @@ WEBUI_PORT=18080 ./docker/webui/dev.sh           # 换本地端口
 只读 MCP server 已迁入本仓库 `docker/webui/mcp/stockdb_mcp_server.py`（纯标准库，连 `STOCKDB_HOST:7899`），
 随 webui 镜像一起分发，由 webui 的 `POST /mcp` 路由承载（与 stdio 共用同一份 dispatch）。
 
-现共 **9 个只读工具**：
+现共 **11 个只读工具**：
 
 | 工具 | 能力 |
 |------|------|
@@ -138,6 +138,8 @@ WEBUI_PORT=18080 ./docker/webui/dev.sh           # 换本地端口
 | `get_board_members` | 板块 ↔ 股票 双向查询 |
 | `screen_stocks` | 全市场条件选股（板块过滤 + 指标金叉/死叉 + 流通市值 + 剔除 ST） |
 | `get_mydb_data` | mydb 私有库只读（港股日K / AI 自定义表） |
+| `get_trading_days` | A股交易日历（2024-2026 休市表） |
+| `get_data_status` | 数据基座状态（最新交易日/滞后天数/pybao 可用性/版本） |
 
 > **pybao 依赖**：`get_indicators` / `get_board_members` / `screen_stocks` / `get_mydb_data`，
 > 以及 `get_kline` 的复权（fq）、1m/1w/1M 周期、批量 codes 能力，均依赖容器内 pybao
@@ -164,6 +166,14 @@ webui 容器已内嵌 `/mcp` 路由（无需单独 mcp 容器），走 8081：
 > 由于 webui 同时暴露同步/重启 stockdb 容器等写操作接口，若通过 `type:http` 把 webui
 > 暴露给公网 agent，务必修整：改走 Tailscale（`100.66.1.1`）等内网地址、或在前加反向
 > 代理鉴权，否则等于把可操控容器的高权限接口裸奔在公网。
+
+**体验特性**（`get_*` 工具通用）：
+
+- **结构化错误码**：校验失败 / 数据源不可用 / pybao 降级统一返回 `error.code` + 中文 `error.message`，客户端可按 code 分支处理，无需解析文案
+- **TTL 缓存**：全市场代码列表、复权因子等低频变化数据带 TTL 缓存，重复调用直接命中缓存，不重复打上游，降低延迟与上游压力
+- **mydb 续取游标**：`get_mydb_data` 大结果集返回游标，客户端携带游标续取下一页，避免单次响应过大
+- **内置 prompts**：`screen-workflow`（选股全流程：建板块 → 选股 → 拉 K 线 → 算指标）与 `limit-up-review`（涨停复盘：筛选 → 开盘效应 → 指标），ZCode 客户端可直接选用
+- **SSE 流式进度**：HTTP 客户端带 `Accept: text/event-stream` 时，长时间工具（如 `screen_stocks` 全市场选股）以 SSE 推送进度事件；普通 JSON 调用不受影响
 
 ---
 
