@@ -34,10 +34,12 @@ Usage:
                         全市场“昨日非一字板涨停、今日开盘溢价”时序
     get_indicators      技术指标计算（pybao，39 项指标，含 zhishu 指数）
     get_board_members   板块 ↔ 股票 双向查询（pybao）
+    screen_stocks       全市场条件选股（pybao：板块过滤 + 指标金叉/死叉 + 流通市值 + 剔除ST）
+    get_mydb_data       只读 mydb 私有库（pybao：港股日K / AI 自定义表）
 
 pybao 为可选外部依赖（容器 /opt/stockdb/pybao，本机 /tmp/pybao_mac 或 PYBAO_DIR）：
-get_indicators / get_board_members，以及 get_kline 的复权/1m/1w/1M/批量能力依赖它；
-缺失时相关能力返回明确降级错误，其余工具不受影响。
+get_indicators / get_board_members / screen_stocks / get_mydb_data，以及 get_kline 的
+复权/1m/1w/1M/批量能力依赖它；缺失时相关能力返回明确降级错误，其余工具不受影响。
 """
 
 from __future__ import annotations
@@ -71,6 +73,12 @@ try:  # noqa: E402  - pybao_tools 为同目录模块（_MCP_DIR 已插入 sys.pa
     import pybao_tools
 except ImportError:  # 防御：模块缺失时 get_indicators/get_board_members 返回明确错误而非崩溃
     pybao_tools = None  # type: ignore[assignment]
+
+try:  # noqa: E402  - query_mydb / screen_stocks 由 Task A2 加入 pybao_tools（Phase 2）
+    from pybao_tools import query_mydb, screen_stocks
+except ImportError:  # 防御：与 pybao_tools=None 同语义，相关工具返回明确降级错误
+    query_mydb = None  # type: ignore[assignment]
+    screen_stocks = None  # type: ignore[assignment]
 
 PROTOCOL_VERSION = "2025-06-18"
 SERVER_NAME = "stockdb-native"
@@ -334,6 +342,82 @@ def query_kline(args: dict) -> dict:
         "total": total,
         "truncated": truncated,
     }
+
+
+def query_screen(args: dict) -> dict:
+    """全市场条件选股（pybao）：解析筛选条件 → 决定股票池 → screen_stocks。
+
+    股票池解析顺序：codes（调试限定）> board（板块成分股）> 全市场 A 股；
+    每个来源都带 universe.source / universe.count 审计字段。codes 传入即
+    is_partial=True（调试语义，同 get_board_open_effect_history 先例），并标记
+    partial_reasons=["EXPLICIT_CODES_DEBUG"]，结果不得当作市场结论。
+    参数非法抛中文 ValueError，由 _call_tool 转 isError。
+    成功返回 screen_stocks 的 result 并并入 universe/is_partial/partial_reasons。
+    """
+    # === 参数校验（先于任何网络/pybao 访问，离线即可报错） ===
+    codes = args.get("codes")
+    board = args.get("board")
+    if codes is not None:
+        if not isinstance(codes, list):
+            raise ValueError("screen_stocks: codes 必须为数组")
+        if not 1 <= len(codes) <= 200:
+            raise ValueError(f"screen_stocks: codes 数量必须为 1-200，当前 {len(codes)} 个")
+        normalized_codes: list[str] = []
+        for item in codes:
+            code = str(item).strip()
+            if len(code) != 6 or not code.isdigit():
+                raise ValueError(f"screen_stocks: 股票代码 {item!r} 必须是 6 位数字")
+            normalized_codes.append(code)
+        codes = normalized_codes
+    if board is not None:
+        if not isinstance(board, dict):
+            raise ValueError("screen_stocks: board 必须为对象")
+        board_name = str(board.get("name") or "").strip()
+        if not board_name:
+            raise ValueError("screen_stocks: board.name 不能为空")
+
+    # pybao 依赖检查：board 分支与最终计算都需要
+    # （_call_tool 已先行拦截，此处为直接调用本函数时的防御降级）
+    if pybao_tools is None:
+        raise ValueError(
+            "pybao 不可用：全市场条件选股需要 pybao（容器 /opt/stockdb/pybao 或 PYBAO_DIR）"
+        )
+
+    # === 决定股票池 ===
+    if codes is not None:
+        universe = codes
+        universe_source = "codes"
+    elif board is not None:
+        outcome = pybao_tools.query_boards({
+            "query": board_name,
+            "category": board.get("category"),
+            "include_symbols": True,
+        })
+        if not outcome.get("ok"):
+            raise ValueError(outcome.get("error", "未知错误"))
+        symbols = (outcome.get("result") or {}).get("symbols") or []
+        if not symbols:
+            raise ValueError("board 无成分股")
+        universe = [str(symbol) for symbol in symbols]
+        universe_source = f"board:{board_name}"
+    else:
+        stock_list = query_stock_list()
+        universe = [
+            str(code) for code in (stock_list.get("codes") or [])
+            if is_supported_a_share_code(str(code))
+        ]
+        universe_source = "full_market"
+
+    # === 执行筛选，并在 result 中并入股票池审计字段 ===
+    out = pybao_tools.screen_stocks(args, universe, universe_source=universe_source)
+    if not out.get("ok"):
+        raise ValueError(out.get("error", "未知错误"))
+    result = out.get("result")
+    result["universe"] = {"source": universe_source, "count": len(universe)}
+    result["is_partial"] = codes is not None
+    if codes is not None:
+        result["partial_reasons"] = ["EXPLICIT_CODES_DEBUG"]
+    return result
 
 
 def query_stock_list() -> object:
@@ -764,7 +848,7 @@ TOOLS: list[dict] = [
                 },
                 "start": {
                     "type": "string",
-                    "description": "8位起始日期(如20260601)。缺省=最近60个自然日",
+                    "description": "8位起始日期(如20260601)。缺省=最近120个自然日（保证MACD类指标收敛）",
                 },
                 "end": {
                     "type": "string",
@@ -847,6 +931,107 @@ TOOLS: list[dict] = [
             "required": ["query"],
         },
     },
+    {
+        "name": "screen_stocks",
+        "description": (
+            "全市场条件选股：单次调用完成 板块过滤 + 指标金叉/死叉"
+            "（39种指标除zhishu）+ 流通市值区间 + 剔除ST，返回候选列表。"
+            "耗时参考：板块范围约 15-20 秒，全市场约 1-2 分钟（pybao 批量计算）。"
+            "不传 board 时扫全市场；"
+            "codes 仅用于调试（传入即 is_partial=true，结果不得当作市场结论）。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "board": {
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "板块名称（支持模糊），如 算力",
+                        },
+                        "category": {
+                            "type": ["string", "integer"],
+                            "description": "概念/申万一级/申万二级/申万三级 或 0-3",
+                        },
+                    },
+                    "description": "可选：限定板块成分股",
+                },
+                "indicator_cross": {
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "指标名（39种中除 zhishu），如 macd/ma/kdj",
+                        },
+                        "golden": {
+                            "type": "boolean",
+                            "default": True,
+                            "description": "true=金叉；false=死叉",
+                        },
+                        "within_days": {
+                            "type": "integer",
+                            "default": 5,
+                            "description": "最近 N 个交易日内出现（1-60）",
+                        },
+                    },
+                    "description": "可选：指标交叉信号条件",
+                },
+                "float_mv_min": {
+                    "type": "number",
+                    "description": "流通市值下限（与日K float_mv 同单位，元；1亿元=1e8）",
+                },
+                "float_mv_max": {"type": "number", "description": "流通市值上限"},
+                "exclude_st": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "剔除 ST（默认开启）",
+                },
+                "date": {
+                    "type": "string",
+                    "description": "截面日期 8 位（默认最新交易日）",
+                },
+                "limit": {
+                    "type": "integer",
+                    "default": 50,
+                    "description": "候选返回上限（1-200）",
+                },
+                "codes": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "调试用：限定股票池（1-200；传入即 is_partial=true）",
+                },
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "get_mydb_data",
+        "description": (
+            "读取 mydb 私有库（港股日K表 hk日k、AI 写入的自定义表）。只读；"
+            "依赖 pybao（容器自动携带）。key 形如 00700:20260813 或前缀通配"
+            "（如 00700:*）；不传 key 列出表内全部键值（上限500，超出截断）。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "table": {
+                    "type": "string",
+                    "description": "表名，如 hk日k 或自定义表（禁止上游保留表名）",
+                },
+                "key": {
+                    "type": "string",
+                    "description": "键或前缀通配（可选；缺省列出全表）",
+                },
+                "limit": {
+                    "type": "integer",
+                    "default": 100,
+                    "description": "key 缺省时全表键值上限（硬上限500）",
+                },
+            },
+            "required": ["table"],
+        },
+    },
 ]
 
 
@@ -899,6 +1084,22 @@ def _call_tool(name: str, args: dict) -> dict:
         if pybao_tools is None:
             return _pybao_tool_missing_error("get_board_members")
         outcome = pybao_tools.query_boards(args)
+        if not outcome.get("ok"):
+            return {"content": [{"type": "text", "text": json.dumps(
+                {"error": outcome.get("error", "未知错误")}, ensure_ascii=False)}], "isError": True}
+        result = outcome.get("result")
+    elif name == "screen_stocks":
+        if pybao_tools is None:
+            return _pybao_tool_missing_error("screen_stocks")
+        try:
+            result = query_screen(args)
+        except ValueError as exc:
+            return {"content": [{"type": "text", "text": json.dumps(
+                {"error": str(exc)}, ensure_ascii=False)}], "isError": True}
+    elif name == "get_mydb_data":
+        if pybao_tools is None:
+            return _pybao_tool_missing_error("get_mydb_data")
+        outcome = pybao_tools.query_mydb(args)
         if not outcome.get("ok"):
             return {"content": [{"type": "text", "text": json.dumps(
                 {"error": outcome.get("error", "未知错误")}, ensure_ascii=False)}], "isError": True}
