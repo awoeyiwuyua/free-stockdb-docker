@@ -87,6 +87,8 @@ COPY stockdb.conf /etc/stockdb/stockdb.conf
 # ---- webui 运维面板 + 只读 MCP（app.py 的 /mcp 路由复用其 dispatch，纯标准库） ----
 COPY webui/app.py webui/entrypoint.sh /opt/webui/
 COPY webui/mcp/ /opt/webui/mcp/
+# ---- 模拟盘模块（任务E：paper_core/paper_db/mx_client/paper_engine，与 app.py 同目录分发） ----
+COPY webui/paper_core.py webui/paper_db.py webui/mx_client.py webui/paper_engine.py /opt/webui/
 
 # pybao 写库客户端路径注入（webui 的 mydb 私有存储 / 港股落盘）
 ENV PYTHONPATH=/opt/stockdb/pybao

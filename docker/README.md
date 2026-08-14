@@ -111,6 +111,15 @@ WEBUI_PORT=18080 ./docker/webui/dev.sh           # 换本地端口
 | 数据同步 | 主状态区（数据是否最新 + 立即热更新 + 更多操作→停服同步备用）、同步进度（阶段/耗时/进度条）、自动同步设置卡（多时间点、仅交易日、失败自动重试）、数据概况（股票/ETF 数量、覆盖范围）、最近同步（桌面表格 + 手机卡片、失败原因展开）、日志（运行中/失败自动展开） |
 | 系统 | 健康检查面板（行情服务延迟 / stockdb 进程 / 自动任务三卡）、存储空间条、运行信息（数据卷/进程状态/进程时长/节点）、运维工具（stockdb 日志、重启 stockdb，描边警告样式）、stockdb 不可控警告卡、开发工具（原始查询代理，直查 stockdb 任意表） |
 | 私有存储（同步页子页签） | 港股日K 手动拉取（东财/腾讯，写入 `hk日k` 表）、AI 写入接口（自定义表，表名与上游保留表隔离） |
+| 模拟盘 | 固定机器策略合同（`emotion-trend-159915-v1`，159915，目标仓位 0%/50%/100%）：每日时间轴（08:45 日线校验+MA / 09:27 冻结情绪 / 09:28 不可变决策 / 14:45 风控 / 14:50-14:56:30 可成交限价下单 / 14:57 停止追单 / 15:05 以成交回报对账）、账户总览/持仓/委托/决策/订单审计、收益曲线、人工暂停、连通自检。**默认 `trading_enabled=false`**，接入的是东方财富妙想模拟盘（非实盘） |
+
+> **模拟盘配置（重要）**：`MX_APIKEY` 环境变量或 `/data/mx_apikey.txt`（首行，建议 0600 权限）提供
+> 东方财富妙想 apikey（[妙想 Skills 页面](https://dl.dfcfs.com/m/itc4)获取，需先创建并绑定模拟组合账户）；
+> 情绪信号由研究流程每日 09:25 后投递 JSON 到 `/data/emotion/<YYYYMMDD>.json`（字段
+> `current_rank/previous_rank/metric_value/history_count==60/formal_usable/source_contract_version/known_at>=当日09:25`）。
+> 隐私：apikey 永不回显、日志仅掩码；交易接口只在 webui（不挂 /mcp）；SQLite 账本
+> `/data/paper.sqlite3`（WAL、追加式修订，可重放审计）。未配置 apikey 或
+> `trading_enabled=false` 时调度不执行并在面板明确显示原因。
 
 > **0.5.0 单镜像架构**：stockdb（7899）与 webui（8080）同容器，进程级控制（pidfile + SIGTERM），
 > 不再挂载 docker.sock。webui 崩溃自动重启，不影响 stockdb 数据服务。
