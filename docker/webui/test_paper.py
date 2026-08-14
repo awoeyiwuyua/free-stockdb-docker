@@ -38,6 +38,7 @@ from unittest import mock
 
 # === paper_core ===
 import paper_core
+import mx_client
 from paper_core import (
     STRATEGY_ID, STRATEGY_VERSION, SYMBOL, POSITION_STATES, LOT_SIZE,
     DECISION_TIME, EXEC_WINDOW_START, EXEC_CUTOFF, STOP_CHASE, RECONCILE,
@@ -1182,6 +1183,33 @@ class PaperEngineTest(unittest.TestCase):
         _, _, _, engine = self._make_env()
         with self.assertRaises(ValueError):
             engine.run_timepoint("12:00")
+
+    # ---------------- apikey 保存（webui 面板填写入口） ----------------
+    def test_save_apikey_write_and_mask(self):
+        """保存：原子写入、0600、返回掩码、不返回原文。"""
+        import stat as stat_mod
+        with tempfile.TemporaryDirectory() as tmp:
+            p = os.path.join(tmp, "mx_apikey.txt")
+            masked = mx_client.save_apikey(p, "abcdef1234567890")
+            self.assertEqual(masked, "abcd****7890")
+            with open(p, encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), "abcdef1234567890")
+            mode = stat_mod.S_IMODE(os.stat(p).st_mode)
+            self.assertEqual(mode, 0o600)
+
+    def test_save_apikey_empty_clears(self):
+        """空串 → 删除文件、返回未配置。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            p = os.path.join(tmp, "mx_apikey.txt")
+            mx_client.save_apikey(p, "abcdef1234567890")
+            self.assertTrue(os.path.exists(p))
+            self.assertEqual(mx_client.save_apikey(p, ""), "未配置")
+            self.assertFalse(os.path.exists(p))
+
+    def test_mask_key_short(self):
+        """短密钥全掩码。"""
+        self.assertEqual(mx_client.mask_key("12345678"), "****")
+        self.assertEqual(mx_client.mask_key(None), "未配置")
 
 
 if __name__ == "__main__":

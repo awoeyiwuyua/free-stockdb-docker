@@ -33,6 +33,7 @@ import json
 import os
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 # === 8 错误码（冻结契约全集，与 paper_core 同值） ===
 ERROR_INVALID_ARGUMENT = "INVALID_ARGUMENT"        # 参数非法
@@ -139,11 +140,7 @@ class MXClient:
 
         密钥过短（<=8 字符）时全部掩码为 ****，不暴露任何片段。
         """
-        if not self._apikey:
-            return "未配置"
-        if len(self._apikey) <= 8:
-            return "****"
-        return f"{self._apikey[:4]}****{self._apikey[-4:]}"
+        return mask_key(self._apikey)
 
     # ---------------- 内部请求 ----------------
     def _post(self, endpoint: str, payload: dict) -> dict:
@@ -353,6 +350,40 @@ class MXClient:
     def query_market(self, query: str) -> dict:
         """行情/盘口查询（收盘后验证价等）。POST /api/claw/query {"toolQuery": query}。"""
         return self._post(_ENDPOINT_QUERY, {"toolQuery": str(query)})
+
+
+def mask_key(key: str | None) -> str:
+    """apikey 掩码（模块级，save_apikey/客户端共用）。"""
+    if not key:
+        return "未配置"
+    if len(key) <= 8:
+        return "****"
+    return f"{key[:4]}****{key[-4:]}"
+
+
+def save_apikey(path: str, key: str) -> str:
+    """原子写入 apikey 文件（tmp+rename、0600 权限）；空串 = 清除（删除文件）。
+
+    仅落盘本地 DATA_DIR，永不回显原文；返回掩码（"未配置" 表示已清除）。
+    写入失败抛中文 ValueError（不吞磁盘错误）。
+    """
+    key = (key or "").strip()
+    p = Path(path)
+    try:
+        if not key:
+            p.unlink(missing_ok=True)
+            return "未配置"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(".tmp")
+        tmp.write_text(key, encoding="utf-8")
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:  # noqa: BLE001 - 权限设置失败不阻断（多数文件系统默认已足够）
+            pass
+        os.replace(tmp, p)
+        return mask_key(key)
+    except OSError as exc:
+        raise ValueError(f"apikey 保存失败：{exc}") from exc
 
 
 # ==================== 自测（本地 http.server mock，纯标准库） ====================
