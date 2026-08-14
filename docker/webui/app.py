@@ -1439,7 +1439,7 @@ try:
                             SYMBOL as PAPER_SYMBOL,
                             DATA_NOT_QUALIFIED as PAPER_DATA_NOT_QUALIFIED)
     from paper_db import PaperDB
-    from mx_client import MXClient, MXError
+    from mx_client import MXClient, MXError, save_apikey as paper_save_apikey
     from paper_engine import PaperEngine
     PAPER_MODULES_AVAILABLE = True
     PAPER_IMPORT_ERROR = ""
@@ -2193,6 +2193,11 @@ color:var(--text);padding:8px 10px;border-radius:8px;width:220px}
     <div class="card"><div class="card-title">状态</div>
       <div class="info-grid">
         <div class="it"><span class="lk">apikey</span><span id="ppCfg">…</span></div>
+        <div class="it"><span class="lk">apikey 配置</span>
+          <input type="password" id="ppKey" placeholder="粘贴 MX_APIKEY，仅存本机 /data/mx_apikey.txt" style="width:56%;box-sizing:border-box" autocomplete="off">
+          <button class="btn-ghost btn-sm" onclick="paperSaveKey()">保存</button>
+          <button class="btn-ghost btn-sm" onclick="paperClearKey()">清除</button>
+        </div>
         <div class="it"><span class="lk">交易开关</span><span id="ppTrading">…</span></div>
         <div class="it"><span class="lk">引擎</span><span id="ppEngine">…</span></div>
         <div class="it"><span class="lk">下次触发</span><span id="ppNext">…</span></div>
@@ -2760,6 +2765,25 @@ async function paperSetPause(){
   }catch(e){toast('切换失败: '+e);$('ppPause').checked=!enabled}
   refresh(true);
 }
+async function paperSaveKey(){
+  const k=$('ppKey').value.trim();
+  if(!k){toast('请先粘贴 apikey');return}
+  try{
+    const r=await j('/api/paper/apikey',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({apikey:k})});
+    $('ppKey').value='';
+    toast(r.configured?('apikey 已保存（仅存本机 /data，掩码 '+r.masked+'）'):'未生效，请检查');
+    refresh(true);
+  }catch(e){toast('保存失败: '+e)}
+}
+async function paperClearKey(){
+  if(!confirm('确认清除本地保存的 apikey？'))return;
+  try{
+    const r=await j('/api/paper/apikey',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({apikey:''})});
+    $('ppKey').value='';
+    toast('已清除本地 apikey');
+    refresh(true);
+  }catch(e){toast('清除失败: '+e)}
+}
 async function paperRunNow(){
   const tp=$('ppTp').value;
   if(!tp){toast('请选择要手动执行的时点');return}
@@ -2852,6 +2876,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._hk_sync()
             elif path == "/api/paper/connectivity":
                 self._paper_connectivity()
+            elif path == "/api/paper/apikey":
+                self._paper_apikey()
             elif path == "/api/paper/pause":
                 self._paper_pause()
             elif path == "/api/paper/run-now":
@@ -3308,6 +3334,29 @@ class Handler(BaseHTTPRequestHandler):
             "masked_key": engine.mx.masked_key,
             "raw": json.dumps(raw, ensure_ascii=False)[:500],   # raw 截断 500 字符
         }, ensure_ascii=False))
+
+    def _paper_apikey(self):
+        """POST /api/paper/apikey {"apikey": "..."}：写 DATA_DIR/mx_apikey.txt（0600，空串=清除），
+        保存后 force 重建引擎立即生效。只返回掩码，永不回显原文；日志只记掩码。
+        注意：若设了 MX_APIKEY 环境变量，环境变量优先于文件（本接口只管理文件）。"""
+        if not PAPER_MODULES_AVAILABLE:
+            self._send(501, json.dumps(
+                {"error": "模拟盘模块不可用"}, ensure_ascii=False))
+            return
+        body = self._read_json()
+        key = str(body.get("apikey") or "")
+        try:
+            masked = paper_save_apikey(str(DATA_DIR / "mx_apikey.txt"), key)
+        except ValueError as exc:
+            self._send(500, json.dumps({"error": str(exc)}, ensure_ascii=False))
+            return
+        try:  # 强制重建引擎，让新 key 立即生效（重建失败不影响 key 文件落盘）
+            paper_get_engine(force=True)
+        except Exception:  # noqa: BLE001 - 下一次调用会自动重试构建
+            pass
+        log(f"📈 模拟盘 apikey {'已保存' if masked != '未配置' else '已清除'}（{masked}，仅存本地 DATA_DIR）")
+        self._send(200, json.dumps(
+            {"configured": masked != "未配置", "masked": masked}, ensure_ascii=False))
 
     def _paper_pause(self):
         """POST /api/paper/pause {"enabled": bool}：写/删 DATA_DIR/paper_pause.flag。"""
