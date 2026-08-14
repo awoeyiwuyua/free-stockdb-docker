@@ -212,9 +212,20 @@ class MXClient:
                 f"MX 接口不存在（HTTP 404）: {self._msg_from_body(body) or '接口地址有误'}",
                 hint="联系管理员检查接口地址",
             )
+        if status == 403:
+            # 网关/WAF 层拒绝（空响应体典型）：多为来源网络、DNS 节点或访问特征被风控，
+            # 与 apikey 无关。附原始响应片段便于定位。
+            snippet = raw.decode("utf-8", errors="replace")[:300] if raw else ""
+            raise MXError(
+                ERROR_DEPENDENCY_UNAVAILABLE,
+                f"MX 接口拒绝访问（HTTP 403）: {snippet or '空响应体（疑似网关/WAF 拦截）'}",
+                hint="检查 NAS 出口网络/DNS/代理；本机直连同接口应返回业务码而非 403",
+            )
         # 其它非 2xx：按 8 码全集映射（复用契约表）
         code, hint = _MX_ERROR_MAP.get(status, (ERROR_INTERNAL_ERROR, None))
-        detail = self._msg_from_body(body)
+        detail = self._msg_from_body(body) or (
+            raw.decode("utf-8", errors="replace")[:300] if raw else None
+        )
         raise MXError(
             code,
             f"MX 接口返回非成功 HTTP 状态 {status}: {detail or '无详细信息'}",
