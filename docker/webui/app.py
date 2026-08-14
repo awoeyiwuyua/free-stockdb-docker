@@ -23,6 +23,7 @@ import http.client
 import json
 import os
 import signal
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -74,7 +75,7 @@ _last_verify_result: str | None = None  # 最近一次完整性验证结果（pa
 _scheduler_alive = False             # 定时线程心跳（每次循环更新时间戳）
 _scheduler_heartbeat = 0.0           # 定时线程最近一次心跳时间戳（unix）
 _webui_started = time.time()         # webui 进程启动时间戳
-WEBUI_VERSION = "0.5.4"
+WEBUI_VERSION = "0.5.5"
 
 HISTORY_FILE = DATA_DIR / "sync_history.json"
 SCHEDULE_FILE = DATA_DIR / "sync_schedule.json"
@@ -1429,6 +1430,431 @@ def stockdb_get(table: str) -> str:
         return resp.read().decode("utf-8", "replace")
 
 
+# ==================== 模拟盘（任务E：paper_core / paper_db / mx_client / paper_engine 集成） ====================
+# 惰性 import：任一模块缺失/加载失败 → 页签降级提示，webui 其余功能不受影响
+# （engine_available=false + 中文原因，见 /api/paper/status 与「模拟盘」页签）。
+try:
+    from paper_core import (STRATEGY_ID as PAPER_STRATEGY_ID,
+                            STRATEGY_VERSION as PAPER_STRATEGY_VERSION,
+                            SYMBOL as PAPER_SYMBOL,
+                            DATA_NOT_QUALIFIED as PAPER_DATA_NOT_QUALIFIED)
+    from paper_db import PaperDB
+    from mx_client import MXClient, MXError
+    from paper_engine import PaperEngine
+    PAPER_MODULES_AVAILABLE = True
+    PAPER_IMPORT_ERROR = ""
+except Exception as _paper_import_exc:  # noqa: BLE001 - 惰性降级：模块缺失不拖垮 webui
+    PAPER_MODULES_AVAILABLE = False
+    PAPER_IMPORT_ERROR = f"{type(_paper_import_exc).__name__}: {_paper_import_exc}"
+
+# 冻结时间轴：默认 7 时点；PAPER_TIMES 环境变量（逗号分隔）可覆盖
+_PAPER_TIMES_DEFAULT = ("08:45", "09:27", "09:28", "14:45", "14:50", "14:57", "15:05")
+PAPER_TIMES = sorted({t.strip() for t in
+                      os.environ.get("PAPER_TIMES", "").split(",") if t.strip()}
+                     or set(_PAPER_TIMES_DEFAULT))
+
+# 时点文案（今日时间轴卡用）
+_PAPER_TIMEPOINT_LABELS = {
+    "08:45": "盘前均线准备", "09:27": "信号冻结+决策", "09:28": "决策确认",
+    "14:45": "执行前风控", "14:50": "窗口下单", "14:57": "停止追价", "15:05": "收盘对账",
+}
+
+# 交易时点（涉及券商 MX 接口：执行前风控/下单/停追价/对账）——手动 run-now 演练时
+# 仍受 trading_enabled 约束；数据时点（08:45/09:27/09:28）不触碰券商，可离线演练决策流水线。
+_PAPER_TRADING_TIMEPOINTS = frozenset({"14:45", "14:50", "14:57", "15:05"})
+
+_paper_lock = threading.Lock()        # 引擎构造/重建互斥（调度线程与 HTTP 线程并发）
+_paper_db_lock = threading.Lock()     # 引擎 DB 写串行化（调度触发 / 手动 run-now 防并发写库）
+_paper_engine = None                  # PaperEngine 实例（惰性构造；配置变化自动重建）
+_paper_engine_ready = False           # 引擎是否可用
+_paper_engine_reason = ""             # 引擎不可用原因（中文，页签降级提示）
+_paper_fired = set()                  # 内存 fire 记录：{(trade_date, timepoint)} 当日每时点仅触发一次
+_paper_last_events = []               # 最近触发/跳过记录（内存，/api/paper/status last_events）
+_PAPER_LAST_EVENTS_MAX = 50
+_paper_scheduler_alive = False        # 调度线程心跳（status 展示）
+_paper_scheduler_heartbeat = 0.0
+_paper_pause_flag = DATA_DIR / "paper_pause.flag"   # 暂停标记：文件存在即暂停
+
+# 资金摘要提取键（连通自检 balance_summary；防御式匹配，未知形态回退数值字段子集）
+_BALANCE_SUMMARY_KEYS = ("cash", "available_cash", "frozen", "total_money",
+                         "available", "total", "balance", "资金", "可用",
+                         "冻结", "总资产", "持仓市值", "market_value")
+
+
+def paper_trading_enabled() -> bool:
+    """模拟盘交易总开关：环境变量 PAPER_TRADING_ENABLED（true/1/yes/on，大小写不敏感）。"""
+    return (os.environ.get("PAPER_TRADING_ENABLED") or "").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def paper_is_paused() -> bool:
+    """暂停状态：DATA_DIR/paper_pause.flag 存在即暂停。"""
+    return _paper_pause_flag.exists()
+
+
+def paper_set_paused(enabled: bool) -> bool:
+    """写/删暂停标记文件（临时文件 + os.replace 原子写）。"""
+    try:
+        if enabled:
+            _paper_pause_flag.parent.mkdir(parents=True, exist_ok=True)
+            tmp = _paper_pause_flag.with_suffix(".flag.tmp")
+            tmp.write_text("paused\n", encoding="utf-8")
+            os.replace(tmp, _paper_pause_flag)
+        else:
+            if _paper_pause_flag.exists():
+                _paper_pause_flag.unlink()
+        return True
+    except OSError:
+        return False
+
+
+def _paper_model_nav() -> float:
+    """模型名义本金：环境变量 PAPER_MODEL_NAV（缺省 100000）。"""
+    try:
+        v = float(os.environ.get("PAPER_MODEL_NAV", "100000"))
+    except (TypeError, ValueError):
+        v = 100000.0
+    return v if v > 0 else 100000.0
+
+
+def _paper_holidays() -> list[str]:
+    """把 A 股休市表（XSHG_HOLIDAYS：year → {"MM-DD",...}）转为 YYYYMMDD 注入引擎（交易日判定）。"""
+    out = []
+    try:
+        for year, days in XSHG_HOLIDAYS.items():
+            for md in days:
+                out.append(f"{year}{str(md).replace('-', '')}")
+    except Exception:  # noqa: BLE001 - 休市表解析失败不阻塞引擎（缺省按工作日=交易日）
+        return []
+    return out
+
+
+def _paper_fetch_daily(code, start, end) -> dict:
+    """生产 fetch_daily：经 stockdb 本地 HTTP 拉取 159915 日K（T-60 自然日 → T-1）。
+
+    start/end 为 datetime.date。stockdb HTTP 层仅支持单点与 YYYYMM/YYYY 前缀通配
+    （cmd=vals），按自然月前缀拉取后客户端严格过滤 [start, end]（口径同 mcp 查询）。
+    返回 {"bars": [{"date": "YYYYMMDD", "close": float}, ...]}（升序）；网络/解析
+    异常原样上抛，由引擎步骤记录 DATA_NOT_QUALIFIED / INTERNAL_ERROR 事件。
+    """
+    import urllib.parse
+    import urllib.request
+    s, e = start.strftime("%Y%m%d"), end.strftime("%Y%m%d")
+    rows = []
+    y, m = start.year, start.month
+    while (y, m) <= (end.year, end.month):
+        prefix = f"{y:04d}{m:02d}"
+        url = (f"http://{STOCKDB_HOST}:{STOCKDB_PORT}/?cmd=vals&t="
+               + urllib.parse.quote(f"日k:{code}:{prefix}*"))
+        with urllib.request.urlopen(url, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+        if isinstance(data, list):
+            rows.extend(data)
+        elif isinstance(data, dict):
+            rows.append(data)
+        m += 1
+        if m > 12:
+            m, y = 1, y + 1
+    s_i, e_i = int(s), int(e)
+    bars = []
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        d, c = r.get("date"), r.get("close")
+        if d is None or c is None:
+            continue
+        try:
+            d_s = str(d).strip()
+            c_f = float(c)
+        except (TypeError, ValueError):
+            continue
+        if len(d_s) == 8 and d_s.isdigit() and s_i <= int(d_s) <= e_i:
+            bars.append({"date": d_s, "close": c_f})
+    bars.sort(key=lambda b: b["date"])
+    return {"bars": bars}
+
+
+def _paper_config_matches(engine) -> bool:
+    """引擎配置是否与当前运行门控一致（trading_enabled/paused 变化时触发重建）。"""
+    try:
+        return (bool(engine.config.get("trading_enabled")) == paper_trading_enabled()
+                and bool(engine.config.get("paused")) == paper_is_paused())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def paper_get_engine(force: bool = False):
+    """惰性构造 / 重建 PaperEngine；返回 (engine_or_None, reason)。
+
+    apikey 是否配置不阻塞构造（构造后由运行时门控判定）；trading_enabled / paused
+    变化时自动重建引擎，保证引擎内部门控（14:45/14:50 步）与 webui 门控一致。
+    重建持有 _paper_db_lock，不与进行中的 run_timepoint 写库并发。
+    """
+    global _paper_engine, _paper_engine_ready, _paper_engine_reason
+    with _paper_lock:
+        if (not force and _paper_engine_ready and _paper_engine is not None
+                and _paper_config_matches(_paper_engine)):
+            return _paper_engine, ""
+        if not PAPER_MODULES_AVAILABLE:
+            _paper_engine, _paper_engine_ready = None, False
+            _paper_engine_reason = f"模拟盘模块缺失：{PAPER_IMPORT_ERROR}"
+            return None, _paper_engine_reason
+        try:
+            with _paper_db_lock:
+                old = _paper_engine
+                if old is not None and getattr(old, "db", None) is not None:
+                    try:
+                        old.db.close()
+                    except Exception:  # noqa: BLE001
+                        pass
+                db = PaperDB.connect()   # 路径解析：PAPER_DB > DATA_DIR/paper.sqlite3（自动建父目录/建表）
+                mx = MXClient()          # apikey 三级解析：参数 > MX_APIKEY > DATA_DIR/mx_apikey.txt
+                engine = PaperEngine(
+                    db=db, mx=mx,
+                    fetch_daily=_paper_fetch_daily,
+                    signal_dir=str(DATA_DIR / "emotion"),   # 情绪文件 /data/emotion/<YYYYMMDD>.json
+                    clock=datetime.now,
+                    config={
+                        "model_nav": _paper_model_nav(),
+                        "trading_enabled": paper_trading_enabled(),
+                        "paused": paper_is_paused(),
+                        "supported_signal_contracts": ["emotion-v1"],
+                        "holidays": _paper_holidays(),
+                    },
+                )
+                _paper_engine, _paper_engine_ready, _paper_engine_reason = engine, True, ""
+            return _paper_engine, ""
+        except Exception as exc:  # noqa: BLE001 - 构造失败 → 页签降级提示（原因回显）
+            _paper_engine, _paper_engine_ready = None, False
+            _paper_engine_reason = f"模拟盘引擎初始化失败：{type(exc).__name__}: {exc}"
+            return None, _paper_engine_reason
+
+
+def paper_gate(require_trading: bool = True):
+    """运行门控（调度线程 / 手动 run-now 共用）。
+
+    返回 (engine_or_None, ok: bool, reason: str)。ok=False 时不执行：
+      1. 引擎不可用（模块缺失/初始化失败）→ reason 为中文原因
+      2. MX apikey 未配置
+      3. 模拟盘已暂停（paper_pause.flag）
+      4. require_trading=True 且交易开关未启用（PAPER_TRADING_ENABLED）
+    """
+    engine, reason = paper_get_engine()
+    if engine is None:
+        return None, False, reason or "模拟盘引擎不可用"
+    try:
+        if engine.mx.masked_key == "未配置":
+            return engine, False, "MX apikey 未配置（设环境变量 MX_APIKEY 或写 DATA_DIR/mx_apikey.txt）"
+    except Exception as exc:  # noqa: BLE001
+        return engine, False, f"apikey 检测异常：{type(exc).__name__}: {exc}"
+    if paper_is_paused():
+        return engine, False, "模拟盘已暂停（paper_pause.flag）"
+    if require_trading and not paper_trading_enabled():
+        return engine, False, "模拟盘交易开关未启用（PAPER_TRADING_ENABLED=true 开启）"
+    return engine, True, ""
+
+
+def _paper_describe_result(tp: str, result) -> str:
+    """run_timepoint 返回值 → 一行中文摘要（时间轴卡 / last_events 用）。"""
+    if result is True:
+        return "执行成功"
+    if result is False:
+        return "执行失败（详见库内事件）"
+    if result == PAPER_DATA_NOT_QUALIFIED:
+        return "数据不合格：目标保持、不生成订单"
+    if isinstance(result, dict):
+        if tp in ("09:27", "09:28"):
+            return (f"决策{'落库' if tp == '09:27' else '确认'}："
+                    f"desired={result.get('desired_target', '?')}")
+        return "执行成功"
+    if isinstance(result, (tuple, list)) and len(result) >= 2:
+        ok, detail = bool(result[0]), result[1]
+        if isinstance(detail, dict):
+            detail_s = "，".join(f"{k}={v}" for k, v in list(detail.items())[:6])
+        else:
+            detail_s = str(detail)
+        return ("成功：" if ok else "失败：") + detail_s[:120]
+    return f"完成（{type(result).__name__}）"
+
+
+def _paper_push_last_event(entry: dict) -> None:
+    """内存最近事件环形缓存（_paper_lock 保护，status last_events 用）。"""
+    with _paper_lock:
+        _paper_last_events.append(entry)
+        if len(_paper_last_events) > _PAPER_LAST_EVENTS_MAX:
+            del _paper_last_events[:len(_paper_last_events) - _PAPER_LAST_EVENTS_MAX]
+
+
+def _paper_run_timepoint(tp: str, source: str = "scheduled",
+                         require_trading: bool = True) -> dict:
+    """执行单个时点（调度线程 / 手动 run-now 共用）。
+
+    门控不过 → 不执行，原因记录进内存 last_events + paper 系统事件（RUN_SKIPPED）；
+    门控通过 → engine.run_timepoint（_paper_db_lock 串行化，防调度/手动并发写库），
+    结果摘要记录 last_events。日志只含 masked_key，apikey 永不回显。
+    """
+    entry = {"ts": now(), "trade_date": datetime.now().strftime("%Y%m%d"),
+             "timepoint": tp, "source": source, "ok": False, "detail": ""}
+    engine, ok, reason = paper_gate(require_trading=require_trading)
+    if not ok:
+        entry["detail"] = f"未执行：{reason}"
+        entry["skipped"] = True
+        _paper_push_last_event(entry)
+        if engine is not None:
+            try:
+                engine.db.add_event(event="RUN_SKIPPED", level="WARN",
+                                    trade_date=entry["trade_date"], timepoint=tp,
+                                    detail=reason)
+            except Exception:  # noqa: BLE001
+                pass
+        log(f"📈 模拟盘跳过时点 {tp}（{source}）：{reason}")
+        return entry
+    try:
+        with _paper_db_lock:
+            result = engine.run_timepoint(tp)
+        entry["ok"] = True
+        entry["detail"] = _paper_describe_result(tp, result)
+        log(f"📈 模拟盘触发时点 {tp}（{datetime.now().strftime('%Y%m%d')}，{source}）")
+    except Exception as exc:  # noqa: BLE001 - 单时点异常不拖垮调度线程
+        entry["detail"] = f"执行异常：{type(exc).__name__}: {exc}"
+        try:
+            engine.db.add_event(event="RUN_ERROR", level="ERROR",
+                                trade_date=entry["trade_date"], timepoint=tp,
+                                detail=str(exc)[:300])
+        except Exception:  # noqa: BLE001
+            pass
+        log(f"📈 模拟盘时点 {tp}（{source}）异常：{exc}")
+    _paper_push_last_event(entry)
+    return entry
+
+
+def _paper_ro_query(sql: str, params=()) -> list:
+    """对模拟盘 SQLite（WAL）做只读查询：返回 list[dict]。
+
+    WAL 模式下读者不阻塞写者；引擎不可用/库文件不存在/不可读 → []（不抛异常，
+    页面显示空数据降级）。HTTP 读接口与调度写线程互不干扰。
+    """
+    engine, _ = paper_get_engine()
+    if engine is None:
+        return []
+    path = engine.db.db_path
+    if not path or path == ":memory:":
+        return []
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2.0)
+        conn.row_factory = sqlite3.Row
+        try:
+            return [dict(r) for r in conn.execute(sql, params).fetchall()]
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001 - 只读查询失败返回空（页面显示降级）
+        return []
+
+
+def paper_next_runs(now_dt=None) -> list[str]:
+    """最近 3 个「交易日 + 未触发未来时点」（YYYYMMDD HH:MM），供 status.next_runs。"""
+    now_dt = now_dt or datetime.now()
+    out = []
+    probe = now_dt.date()
+    for _ in range(60):  # 最多向后看 60 天
+        if is_trading_day(probe):
+            today_key = probe.strftime("%Y%m%d")
+            base_hm = now_dt.strftime("%H:%M") if probe == now_dt.date() else "00:00"
+            for tp in PAPER_TIMES:
+                if tp > base_hm and (today_key, tp) not in _paper_fired:
+                    out.append(f"{today_key} {tp}")
+                    if len(out) >= 3:
+                        return out
+        probe += timedelta(days=1)
+    return out
+
+
+def _paper_timeline() -> list[dict]:
+    """今日时间轴（8 时点状态）：09:25 信号发布（被动里程碑）+ PAPER_TIMES 7 触发时点。
+
+    状态口径：fired（调度已到点触发/内存）＋ DB system_events 今日该时点最近一条
+    事件级别（INFO→ok、WARN→warn、ERROR→err）；无事件 → wait（待触发）。
+    """
+    today = datetime.now().strftime("%Y%m%d")
+    by_tp: dict = {}
+    for r in _paper_ro_query(
+            "SELECT timepoint, level, event FROM system_events "
+            "WHERE trade_date = ? AND timepoint IS NOT NULL ORDER BY id", (today,)):
+        by_tp.setdefault(r["timepoint"], []).append(r)
+    sigs = _paper_ro_query(
+        "SELECT known_at FROM signal_snapshots WHERE trade_date = ?", (today,))
+    out = [{
+        "tp": "09:25", "label": "信号发布", "fired": bool(sigs),
+        "state": "ok" if sigs else "wait",
+        "detail": ("known_at=" + sigs[0]["known_at"]) if sigs else "信号文件未入库",
+    }]
+    for tp in PAPER_TIMES:
+        fired = (today, tp) in _paper_fired
+        ev_list = by_tp.get(tp) or []
+        state, detail = "wait", ""
+        if fired:
+            state = "run"
+        if ev_list:
+            last = ev_list[-1]
+            detail = f"{last['event']}"
+            state = {"INFO": "ok", "WARN": "warn", "ERROR": "err"}.get(last["level"], state)
+        out.append({"tp": tp, "label": _PAPER_TIMEPOINT_LABELS.get(tp, tp),
+                    "fired": fired, "state": state, "detail": detail})
+    return out
+
+
+def paper_scheduler_loop() -> None:
+    """模拟盘调度线程：每 2 秒检查 PAPER_TIMES 时点，交易日才触发（独立线程）。
+
+    每 (trade_date, timepoint) 仅触发一次：fire 记录在内存 _paper_fired 集合，
+    并写 paper 系统事件 TIMEPOINT_FIRE（引擎可用时）。进程重启后内存集合清空，
+    当日已过时点可能被再次触发一次 —— 引擎各步骤幂等（决策/意图去重、快照覆盖），
+    不产生重复下单。
+    """
+    global _paper_scheduler_alive, _paper_scheduler_heartbeat
+    while True:
+        _paper_scheduler_alive = True
+        _paper_scheduler_heartbeat = time.time()
+        try:
+            dt = datetime.now()
+            if not is_trading_day(dt.date()):   # 非交易日：不触发（A 股休市表判定）
+                time.sleep(2)
+                continue
+            today = dt.strftime("%Y%m%d")
+            now_hm = dt.strftime("%H:%M")
+            for tp in PAPER_TIMES:
+                key = (today, tp)
+                if now_hm >= tp and key not in _paper_fired:
+                    _paper_fired.add(key)       # fire 记录：内存集合（防重复触发）
+                    engine, _, _ = paper_gate(require_trading=True)
+                    if engine is not None:
+                        try:
+                            engine.db.add_event(event="TIMEPOINT_FIRE", level="INFO",
+                                                trade_date=today, timepoint=tp,
+                                                detail="调度线程到点触发（PAPER_TIMES）")
+                        except Exception:  # noqa: BLE001
+                            pass
+                    _paper_run_timepoint(tp, source="scheduled", require_trading=True)
+        except Exception as exc:  # noqa: BLE001 - 调度线程异常不退出
+            log(f"📈 模拟盘调度线程异常: {exc}")
+        time.sleep(2)
+
+
+def _paper_balance_summary(raw) -> dict:
+    """从 get_balance 响应提取资金摘要字段（防御式：未知形态时回退数值字段子集）。"""
+    data = raw.get("data") if isinstance(raw, dict) else None
+    if not isinstance(data, dict):
+        data = raw if isinstance(raw, dict) else {}
+    out = {}
+    for k, v in data.items():
+        if k in _BALANCE_SUMMARY_KEYS:
+            out[str(k)] = v
+    if not out:
+        out = dict(list((k, v) for k, v in data.items()
+                        if isinstance(v, (int, float)) and not isinstance(v, bool))[:6])
+    return out
+
+
 # ==================== HTTP 服务 ====================
 PAGE = r"""<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
@@ -1567,6 +1993,7 @@ color:var(--text);padding:8px 10px;border-radius:8px;width:220px}
   <nav class="tabs">
     <button class="tab-btn active" data-tab="sync" onclick="showTab('sync',this)">数据同步</button>
     <button class="tab-btn" data-tab="system" onclick="showTab('system',this)">系统</button>
+    <button class="tab-btn" data-tab="paper" onclick="showTab('paper',this)">模拟盘</button>
   </nav>
 </div></div>
 <div class="wrap">
@@ -1748,6 +2175,72 @@ color:var(--text);padding:8px 10px;border-radius:8px;width:220px}
     </details>
   </div>
 </div>
+
+<!-- 模拟盘：状态 / 账户总览 / 今日时间轴 / 决策 / 订单 / 收益曲线 / 连通自检 -->
+<div id="tab-paper" class="tab-panel">
+  <div class="hero">
+    <div class="hero-status"><span id="ppDot" style="display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:8px"></span><span id="ppTitle">模拟盘</span></div>
+    <div class="hero-sub" id="ppSub">…</div>
+    <div class="hero-actions">
+      <span class="hint" id="ppGate"></span>
+      <span style="flex:1"></span>
+      <span class="hint">暂停开关</span>
+      <label class="switch"><input type="checkbox" id="ppPause" onchange="paperSetPause()"><span class="sl"></span></label>
+      <button class="btn-ghost btn-sm" onclick="paperConnectivity()">连通自检</button>
+    </div>
+  </div>
+  <div class="cols">
+    <div class="card"><div class="card-title">状态</div>
+      <div class="info-grid">
+        <div class="it"><span class="lk">apikey</span><span id="ppCfg">…</span></div>
+        <div class="it"><span class="lk">交易开关</span><span id="ppTrading">…</span></div>
+        <div class="it"><span class="lk">引擎</span><span id="ppEngine">…</span></div>
+        <div class="it"><span class="lk">下次触发</span><span id="ppNext">…</span></div>
+        <div class="it"><span class="lk">数据库</span><span id="ppDb">…</span></div>
+        <div class="it"><span class="lk">时点</span><span id="ppTimes">…</span></div>
+      </div>
+      <div id="ppReason" class="warn-card" style="display:none"><div class="t">不可用原因</div><div class="d" id="ppReasonText"></div></div>
+    </div>
+    <div class="card"><div class="card-title">账户总览 <span class="hint" style="font-weight:normal">（本地账本 · 最新组合快照）</span></div>
+      <div class="row">
+        <div><div class="k">总资产（净值）</div><div class="v" id="ppNav">…</div></div>
+        <div><div class="k">可用资金</div><div class="v" id="ppCash">…</div></div>
+        <div><div class="k">持仓</div><div class="v" id="ppPos" style="font-size:14px">…</div></div>
+        <div><div class="k">浮盈（对初始本金）</div><div class="v" id="ppPnl">…</div></div>
+      </div>
+      <div class="hint" style="margin-top:8px" id="ppSnapTs"></div>
+    </div>
+  </div>
+  <div class="card"><div class="card-title">今日时间轴 <span class="hint" style="font-weight:normal" id="ppToday"></span></div>
+    <div id="ppTimeline" style="display:grid;grid-template-columns:repeat(8,1fr);gap:8px;margin-bottom:12px"></div>
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+      <select id="ppTp"><option value="">选择时点手动触发</option></select>
+      <button class="btn-ghost btn-sm" onclick="paperRunNow()">手动执行</button>
+      <span class="hint" id="ppRunMsg"></span>
+    </div>
+  </div>
+  <div class="cols">
+    <div class="card"><div class="card-title">决策 <span class="hint" style="font-weight:normal">（最近 30 条）</span></div>
+      <table><thead><tr><th>交易日</th><th>信号（prev→cur）</th><th>目标（prev→desired）</th><th>理由</th><th>状态</th></tr></thead>
+      <tbody id="ppDecBody"><tr><td colspan="5" class="hint">（暂无决策）</td></tr></tbody></table>
+    </div>
+    <div class="card"><div class="card-title">订单 <span class="hint" style="font-weight:normal">（最近 30 条）</span></div>
+      <table><thead><tr><th>交易日</th><th>动作</th><th>目标 / 差额</th><th>价格类型</th><th>状态</th></tr></thead>
+      <tbody id="ppOrdBody"><tr><td colspan="5" class="hint">（暂无订单）</td></tr></tbody></table>
+    </div>
+  </div>
+  <div class="cols">
+    <div class="card"><div class="card-title">收益曲线 <span class="hint" style="font-weight:normal">（组合净值 · 最近 60 个快照）</span></div>
+      <div id="ppCurve"></div>
+    </div>
+    <div class="card"><div class="card-title">最近事件 <span class="hint" style="font-weight:normal">（最近 50 条）</span></div>
+      <div id="ppEvents" style="max-height:260px;overflow:auto"></div>
+    </div>
+  </div>
+  <div class="card"><div class="card-title">连通自检结果 <span class="hint" style="font-weight:normal">（POST /api/paper/connectivity）</span></div>
+    <pre id="ppConn">（点击上方「连通自检」查看结果）</pre>
+  </div>
+</div>
 </div>
 <script>
 async function j(url,opt){const r=await fetch(url,opt);if(!r.ok)throw new Error(r.status);return r.json()}
@@ -1816,6 +2309,8 @@ async function refresh(force){
       if(h)_healthCache=h;
       renderSystem(s);
       loadHistory();
+    }else if(active==='tab-paper'){
+      await refreshPaper();
     }
   }catch(e){
     $('log').textContent='状态刷新失败: '+e;$('log').style.display='block';
@@ -2131,6 +2626,161 @@ setInterval(()=>{if($('syncProgress')&&$('syncProgress').style.display==='block'
 document.addEventListener('keydown',e=>{
   if(e.key==='Enter'&&e.target&&e.target.id==='hkCodes'){e.preventDefault();hkSync()}
 });
+// ==================== 模拟盘页（任务E：状态 / 账户总览 / 时间轴 / 决策 / 订单 / 收益曲线 / 连通自检） ====================
+let _ppEngineOk=false;
+function fmtMoney(v){return Number(v).toLocaleString('zh-CN',{minimumFractionDigits:2,maximumFractionDigits:2})}
+async function refreshPaper(){
+  let s=null;
+  try{s=await j('/api/paper/status')}
+  catch(e){renderPaperStatus({engine_available:false,modules_ok:false,reason:'状态接口异常: '+e,trading_enabled:false,paused:false});return}
+  renderPaperStatus(s);
+  if(!s.engine_available)return;   // 引擎不可用：读接口 501，直接停在降级提示
+  try{renderPaperOverview(await j('/api/paper/overview'))}catch(e){}
+  try{const d=await j('/api/paper/decisions?limit=30');renderPaperDecisions(d.decisions||[])}catch(e){}
+  try{const o=await j('/api/paper/orders?limit=30');renderPaperOrders(o.orders||[])}catch(e){}
+  try{const sn=await j('/api/paper/snapshot?limit=60');renderPaperCurve(sn.snapshots||[])}catch(e){}
+  try{const ev=await j('/api/paper/events?limit=50');renderPaperEvents(ev.events||[])}catch(e){}
+}
+function renderPaperStatus(s){
+  _ppEngineOk=!!s.engine_available;
+  const title=$('ppTitle'),dot=$('ppDot');
+  const reasons=[];
+  if(!s.engine_available){reasons.push(s.reason||'模拟盘模块缺失，功能降级')}
+  if(s.engine_available&&!s.configured)reasons.push('MX apikey 未配置');
+  if(s.engine_available&&!s.trading_enabled)reasons.push('交易开关未启用');
+  if(s.engine_available&&s.paused)reasons.push('已暂停');
+  if(!s.engine_available){
+    title.textContent='模拟盘（引擎不可用）';
+    dot.style.background='var(--err)';
+  }else{
+    title.textContent='模拟盘';
+    dot.style.background=s.configured?(s.paused?'var(--warn)':'var(--ok)'):'var(--warn)';
+  }
+  $('ppSub').textContent=s.engine_available
+    ?('apikey '+(s.configured?('已配置（'+esc(s.masked_key||'')+'）'):'未配置')+' ｜ 交易开关 '+(s.trading_enabled?'已开启':'未开启')+' ｜ 暂停 '+(s.paused?'是':'否'))
+    :(s.reason||'模拟盘模块缺失，功能降级');
+  $('ppGate').textContent=reasons.length?('⛔ '+reasons.join('；')):'';
+  $('ppCfg').textContent=s.configured?(esc(s.masked_key||'已配置')):'未配置';
+  $('ppTrading').innerHTML=s.trading_enabled?'<span style="color:var(--ok)">已开启</span>':'<span style="color:var(--warn)">未开启</span>';
+  $('ppEngine').textContent=s.engine_available?'可用':'不可用';
+  $('ppNext').textContent=(s.next_runs&&s.next_runs.length)?s.next_runs.join(' · '):'（今日无未来时点）';
+  $('ppDb').textContent=s.db_path?esc(s.db_path):'—';
+  $('ppTimes').textContent=(s.times||[]).join(' / ');
+  $('ppPause').checked=!!s.paused;
+  $('ppPause').disabled=!s.engine_available;
+  $('ppReason').style.display=(s.engine_available&&s.reason)?'block':'none';
+  $('ppReasonText').textContent=s.reason||'';
+  renderPaperTimeline(s);
+  renderPaperRunSelect(s);
+}
+function renderPaperTimeline(s){
+  const colors={ok:'var(--ok)',warn:'var(--warn)',err:'var(--err)',run:'var(--brand)',wait:'var(--panel2)'};
+  $('ppToday').textContent=s.today?('· '+fmtYMD(s.today)):'';
+  $('ppTimeline').innerHTML=(s.timeline||[]).map(x=>
+    '<div style="background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:10px 12px;min-width:104px">'
+    +'<div style="display:flex;align-items:center;gap:6px">'
+    +'<i style="display:inline-block;width:8px;height:8px;border-radius:50%;background:'+(colors[x.state]||'var(--muted)')+'"></i>'
+    +'<b style="font-size:14px">'+esc(x.tp)+'</b></div>'
+    +'<div class="hint" style="margin-top:2px;font-size:12px">'+esc(x.label)+'</div>'
+    +'<div class="hint" style="margin-top:2px;font-size:11px">'+(x.detail?esc(x.detail):(x.fired?'已触发':'待触发'))+'</div>'
+    +'</div>').join('');
+}
+function renderPaperRunSelect(s){
+  const sel=$('ppTp');
+  sel.innerHTML='<option value="">选择时点手动触发</option>'
+    +(s.times||[]).map(t=>'<option value="'+esc(t)+'">'+esc(t)+' '+(s.timepoint_labels&&s.timepoint_labels[t]?esc(s.timepoint_labels[t]):'')+'</option>').join('');
+}
+function renderPaperOverview(ov){
+  const pnl=ov&&ov.pnl?ov.pnl:null;
+  $('ppNav').textContent=pnl&&pnl.nav!=null?fmtMoney(pnl.nav):'—';
+  const cash=ov&&ov.latest_snapshot?ov.latest_snapshot.available_cash:null;
+  $('ppCash').textContent=cash==null?'—':fmtMoney(cash);
+  const qty=ov&&ov.latest_snapshot?ov.latest_snapshot.position_qty:null;
+  const mv=ov&&ov.latest_snapshot?ov.latest_snapshot.position_mv:null;
+  $('ppPos').textContent=qty==null?'—':(qty+' 股'+(mv!=null?' · '+fmtMoney(mv):''));
+  const pv=pnl&&pnl.pnl!=null?pnl.pnl:null;
+  const pc=pnl&&pnl.pnl_pct!=null?pnl.pnl_pct:null;
+  $('ppPnl').innerHTML=pv==null?'—':'<span style="color:'+(pv>=0?'#F87171':'#4ADE80')+'">'+(pv>0?'+':'')+fmtMoney(pv)+(pc!=null?'（'+(pc>0?'+':'')+pc.toFixed(2)+'%）':'')+'</span>';
+  $('ppSnapTs').textContent=ov&&ov.latest_snapshot?('快照交易日 '+fmtYMD(ov.latest_snapshot.trade_date)+' · 名义本金 '+fmtMoney(ov.model_nav||0)):'（暂无组合快照，收盘对账后生成）';
+}
+function renderPaperDecisions(ds){
+  $('ppDecBody').innerHTML=ds.map(d=>'<tr>'
+    +'<td>'+fmtYMD(d.trade_date)+'</td>'
+    +'<td>'+esc(d.previous_rank==null?'—':d.previous_rank)+' → '+esc(d.current_rank==null?'—':d.current_rank)+'</td>'
+    +'<td>'+esc(d.previous_target==null?'—':d.previous_target)+' → '+esc(d.desired_target==null?'—':d.desired_target)+'</td>'
+    +'<td>'+esc(d.reason_code||'—')+'</td>'
+    +'<td>'+esc(d.status||'—')+'</td>'
+    +'</tr>').join('')||'<tr><td colspan="5" class="hint">（暂无决策）</td></tr>';
+}
+function renderPaperOrders(os){
+  $('ppOrdBody').innerHTML=os.map(o=>'<tr>'
+    +'<td>'+fmtYMD(o.trade_date)+'</td>'
+    +'<td>'+esc(o.action||'—')+'</td>'
+    +'<td>'+esc(o.target_qty)+'（差额 '+esc(o.delta_qty)+'）</td>'
+    +'<td>'+esc(o.price_type||'—')+'</td>'
+    +'<td>'+esc(o.status||'—')+'</td>'
+    +'</tr>').join('')||'<tr><td colspan="5" class="hint">（暂无订单）</td></tr>';
+}
+function renderPaperCurve(snaps){
+  const el=$('ppCurve');
+  if(!snaps.length){el.innerHTML='<div class="hint">（暂无净值快照，收盘对账后生成收益曲线）</div>';return}
+  const rev=snaps.slice().reverse();            // 旧 → 新
+  const vals=rev.map(s=>Number(s.nav)||0);
+  const w=560,h=140,pad=8;
+  let min=Math.min(...vals),max=Math.max(...vals);
+  if(max===min)max=min+1;
+  const pts=vals.map((v,i)=>{
+    const x=pad+(w-2*pad)*(vals.length===1?0.5:i/(vals.length-1));
+    const y=h-pad-(h-2*pad)*(v-min)/(max-min);
+    return x.toFixed(1)+','+y.toFixed(1);
+  }).join(' ');
+  const up=vals[vals.length-1]>=vals[0];
+  const last=rev[rev.length-1];
+  el.innerHTML='<div class="hint" style="margin-bottom:4px">'+esc(last.trade_date)+' 净值 '+fmtMoney(vals[vals.length-1])+'（'+(up?'▲':'▼')+'）</div>'
+    +'<svg viewBox="0 0 '+w+' '+h+'" preserveAspectRatio="none" style="width:100%;max-width:640px;height:150px;display:block;background:#0A0F1C;border:1px solid var(--line);border-radius:8px">'
+    +'<polyline fill="none" stroke="'+(up?'#22C55E':'#EF4444')+'" stroke-width="2" points="'+pts+'"/>'
+    +'</svg>';
+}
+function renderPaperEvents(evs){
+  $('ppEvents').innerHTML=evs.map(e=>{
+    const color=e.level==='ERROR'?'var(--err)':e.level==='WARN'?'var(--warn)':'var(--muted)';
+    return '<div style="display:flex;gap:8px;padding:4px 0;border-bottom:1px solid var(--line);font-size:12px">'
+      +'<span class="hint" style="flex-shrink:0">'+esc(String(e.ts||'').slice(11,19))+'</span>'
+      +'<span style="color:'+color+';flex-shrink:0;min-width:34px">'+esc(e.level||'')+'</span>'
+      +'<span style="flex-shrink:0;color:var(--text)">'+esc(e.event||'')+'</span>'
+      +'<span class="hint" style="overflow:hidden;text-overflow:ellipsis">'+esc(e.detail||'')+'</span>'
+      +'</div>';
+  }).join('')||'<div class="hint">（暂无事件）</div>';
+}
+async function paperSetPause(){
+  const enabled=$('ppPause').checked;
+  try{
+    const r=await j('/api/paper/pause',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled})});
+    toast(r.msg||(enabled?'已暂停':'已恢复'));
+  }catch(e){toast('切换失败: '+e);$('ppPause').checked=!enabled}
+  refresh(true);
+}
+async function paperRunNow(){
+  const tp=$('ppTp').value;
+  if(!tp){toast('请选择要手动执行的时点');return}
+  $('ppRunMsg').textContent='执行中…';
+  try{
+    const r=await j('/api/paper/run-now',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({timepoint:tp})});
+    $('ppRunMsg').textContent=(r.error?('未执行：'+r.error):(r.detail||(r.ok?'执行完成':'执行失败')));
+    if(r.error)toast(r.error);else toast(r.ok?'手动执行完成':'未执行：'+(r.detail||''));
+    refresh(true);
+  }catch(e){$('ppRunMsg').textContent='请求失败: '+e;toast('手动执行失败: '+e)}
+}
+async function paperConnectivity(){
+  const pre=$('ppConn');pre.textContent='检测中…';
+  try{
+    const r=await fetch('/api/paper/connectivity',{method:'POST'});
+    const body=await r.text();
+    let obj=null;try{obj=JSON.parse(body)}catch(e){}
+    pre.textContent=r.ok?JSON.stringify(obj,null,2):((obj&&obj.error)?obj.error:('HTTP '+r.status+' '+body));
+    toast(r.ok?(obj&&obj.ok?'连通自检通过':'自检完成'):'连通自检失败');
+  }catch(e){pre.textContent='连通自检失败: '+e}
+}
 refresh();setInterval(()=>refresh(),4000);
 </script></body></html>"""
 
@@ -2172,6 +2822,18 @@ class Handler(BaseHTTPRequestHandler):
                 self._data_read()
             elif path == "/api/hk/sync":
                 self._hk_sync()
+            elif path == "/api/paper/status":
+                self._paper_status()
+            elif path == "/api/paper/overview":
+                self._paper_overview()
+            elif path == "/api/paper/decisions":
+                self._paper_decisions()
+            elif path == "/api/paper/orders":
+                self._paper_orders()
+            elif path == "/api/paper/snapshot":
+                self._paper_snapshot()
+            elif path == "/api/paper/events":
+                self._paper_events()
             else:
                 self._send(404, json.dumps({"error": "not found"}))
         except Exception as exc:
@@ -2188,6 +2850,12 @@ class Handler(BaseHTTPRequestHandler):
                 self._data_write()
             elif path == "/api/hk/sync":
                 self._hk_sync()
+            elif path == "/api/paper/connectivity":
+                self._paper_connectivity()
+            elif path == "/api/paper/pause":
+                self._paper_pause()
+            elif path == "/api/paper/run-now":
+                self._paper_run_now()
             elif path == "/mcp":
                 self._mcp()
             else:
@@ -2497,10 +3165,210 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, json.dumps({"msg": f"重启失败: {exc}"}))
 
 
+    # ==================== 模拟盘 API（任务E：status/overview/decisions/orders/snapshot/events/连通自检/暂停/手动单步） ====================
+    # 隐私：全部响应不含 apikey 原文；日志只记 masked_key；交易接口不挂 /mcp。
+    def _paper_require_engine(self):
+        """模拟盘引擎不可用 → 发 501 中文降级并返回 None；可用返回 engine。"""
+        engine, reason = paper_get_engine()
+        if engine is None:
+            self._send(501, json.dumps(
+                {"error": reason or "模拟盘引擎不可用"}, ensure_ascii=False))
+            return None
+        return engine
+
+    def _paper_limit(self, default: int) -> int:
+        """?limit= 参数：夹取 1..500，非法/缺省用 default。"""
+        try:
+            v = int(parse_qs(urlparse(self.path).query).get("limit", [str(default)])[0])
+        except (TypeError, ValueError):
+            v = default
+        return max(1, min(v, 500))
+
+    def _paper_status(self):
+        """GET /api/paper/status：配置/开关/暂停/下次触发/最近事件/引擎可用性（始终 200）。"""
+        engine, ok, reason = paper_gate(require_trading=True)
+        configured = False
+        masked = "未配置"
+        if engine is not None:
+            try:
+                masked = engine.mx.masked_key
+            except Exception:  # noqa: BLE001
+                masked = "?"
+            configured = masked != "未配置"
+        self._send(200, json.dumps({
+            "configured": configured,
+            "trading_enabled": paper_trading_enabled(),
+            "paused": paper_is_paused(),
+            "next_runs": paper_next_runs(),
+            "last_events": list(_paper_last_events),
+            "engine_available": engine is not None,
+            "reason": reason if not ok else "",
+            "modules_ok": PAPER_MODULES_AVAILABLE,
+            "times": PAPER_TIMES,
+            "timepoint_labels": _PAPER_TIMEPOINT_LABELS,
+            "today": datetime.now().strftime("%Y%m%d"),
+            "timeline": _paper_timeline(),
+            "scheduler_alive": _paper_scheduler_alive,
+            "scheduler_heartbeat": _paper_scheduler_heartbeat,
+            "masked_key": masked,
+            "db_path": str(engine.db.db_path) if engine is not None else None,
+        }, ensure_ascii=False))
+
+    def _paper_overview(self):
+        """GET /api/paper/overview：本地账本账户总览（最新组合快照）+ pnl（对初始名义本金）。"""
+        if self._paper_require_engine() is None:
+            return
+        rows = _paper_ro_query(
+            "SELECT * FROM portfolio_snapshots ORDER BY trade_date DESC LIMIT 1")
+        latest = rows[0] if rows else None
+        initial = _paper_model_nav()
+        pnl = None
+        if latest is not None:
+            nav = float(latest.get("nav") or 0)
+            pnl = {"nav": nav, "initial": initial,
+                   "pnl": round(nav - initial, 2),
+                   "pnl_pct": round((nav - initial) / initial * 100, 4) if initial else None}
+        self._send(200, json.dumps({
+            "balance": ({"nav": latest["nav"], "available_cash": latest["available_cash"]}
+                        if latest else None),
+            "positions": ({"position_qty": latest["position_qty"],
+                           "position_mv": latest["position_mv"],
+                           "available_to_sell_qty": latest["available_to_sell_qty"]}
+                          if latest else None),
+            "latest_snapshot": latest,
+            "pnl": pnl,
+            "model_nav": initial,
+        }, ensure_ascii=False))
+
+    def _paper_decisions(self):
+        """GET /api/paper/decisions?limit=30：策略决策（读 paper_db，最新在前）。"""
+        if self._paper_require_engine() is None:
+            return
+        rows = _paper_ro_query(
+            "SELECT * FROM strategy_decisions ORDER BY trade_date DESC, id DESC LIMIT ?",
+            (self._paper_limit(30),))
+        self._send(200, json.dumps({"decisions": rows}, ensure_ascii=False))
+
+    def _paper_orders(self):
+        """GET /api/paper/orders?limit=30：订单意图（读 paper_db order_intents，最新在前）。"""
+        if self._paper_require_engine() is None:
+            return
+        rows = _paper_ro_query(
+            "SELECT * FROM order_intents ORDER BY trade_date DESC, created_at DESC LIMIT ?",
+            (self._paper_limit(30),))
+        self._send(200, json.dumps({"orders": rows}, ensure_ascii=False))
+
+    def _paper_snapshot(self):
+        """GET /api/paper/snapshot?limit=60：组合快照（读 paper_db，最新在前，收益曲线数据源）。"""
+        if self._paper_require_engine() is None:
+            return
+        rows = _paper_ro_query(
+            "SELECT * FROM portfolio_snapshots ORDER BY trade_date DESC LIMIT ?",
+            (self._paper_limit(60),))
+        self._send(200, json.dumps({"snapshots": rows}, ensure_ascii=False))
+
+    def _paper_events(self):
+        """GET /api/paper/events?limit=50：系统事件（读 paper_db，最新在前）。"""
+        if self._paper_require_engine() is None:
+            return
+        rows = _paper_ro_query(
+            "SELECT * FROM system_events ORDER BY id DESC LIMIT ?",
+            (self._paper_limit(50),))
+        self._send(200, json.dumps({"events": rows}, ensure_ascii=False))
+
+    def _paper_connectivity(self):
+        """POST /api/paper/connectivity：mx.get_balance 一次；返回 masked_key + raw 截断 500。"""
+        if self._paper_require_engine() is None:
+            return
+        engine = _paper_engine
+        if engine.mx.masked_key == "未配置":
+            self._send(501, json.dumps({
+                "ok": False,
+                "detail": "MX apikey 未配置（设环境变量 MX_APIKEY 或写 DATA_DIR/mx_apikey.txt）",
+                "balance_summary": None, "masked_key": "未配置"}, ensure_ascii=False))
+            return
+        try:
+            raw = engine.mx.get_balance()
+        except MXError as exc:
+            self._send(200, json.dumps({
+                "ok": False, "detail": f"[{exc.code}] {exc.message}",
+                "balance_summary": None, "masked_key": engine.mx.masked_key},
+                ensure_ascii=False))
+            return
+        except Exception as exc:  # noqa: BLE001
+            self._send(200, json.dumps({
+                "ok": False, "detail": f"{type(exc).__name__}: {exc}",
+                "balance_summary": None, "masked_key": engine.mx.masked_key},
+                ensure_ascii=False))
+            return
+        self._send(200, json.dumps({
+            "ok": True,
+            "balance_summary": _paper_balance_summary(raw),
+            "detail": "MX 模拟盘资金接口连通正常",
+            "masked_key": engine.mx.masked_key,
+            "raw": json.dumps(raw, ensure_ascii=False)[:500],   # raw 截断 500 字符
+        }, ensure_ascii=False))
+
+    def _paper_pause(self):
+        """POST /api/paper/pause {"enabled": bool}：写/删 DATA_DIR/paper_pause.flag。"""
+        body = self._read_json()
+        enabled = bool(body.get("enabled"))
+        if not paper_set_paused(enabled):
+            self._send(500, json.dumps(
+                {"error": f"暂停标记写入失败：{_paper_pause_flag}"}, ensure_ascii=False))
+            return
+        log(f"📈 模拟盘{'暂停' if enabled else '恢复'}")
+        self._send(200, json.dumps({
+            "ok": True, "paused": paper_is_paused(),
+            "msg": "模拟盘已暂停" if enabled else "模拟盘已恢复"}, ensure_ascii=False))
+
+    def _paper_run_now(self):
+        """POST /api/paper/run-now {"timepoint":"14:50"}：手动单步。
+
+        引擎不可用/无 apikey/已暂停 → 501 中文降级；交易时点（14:45/14:50/14:57/15:05）
+        仍受 trading_enabled 约束（数据时点 08:45/09:27/09:28 可离线演练决策流水线）。
+        """
+        body = self._read_json()
+        tp = str(body.get("timepoint") or "").strip()
+        if tp not in PAPER_TIMES:
+            self._send(400, json.dumps({
+                "error": f"非法时点 {tp!r}；合法时点：{' / '.join(PAPER_TIMES)}"},
+                ensure_ascii=False))
+            return
+        if self._paper_require_engine() is None:
+            return
+        engine = _paper_engine
+        if engine.mx.masked_key == "未配置":
+            self._send(501, json.dumps({
+                "error": "MX apikey 未配置（设环境变量 MX_APIKEY 或写 DATA_DIR/mx_apikey.txt）"},
+                ensure_ascii=False))
+            return
+        if paper_is_paused():
+            self._send(501, json.dumps({"error": "模拟盘已暂停（paper_pause.flag）"},
+                                       ensure_ascii=False))
+            return
+        if tp in _PAPER_TRADING_TIMEPOINTS and not paper_trading_enabled():
+            self._send(501, json.dumps({
+                "error": "交易时点需先开启交易开关（PAPER_TRADING_ENABLED=true）"},
+                ensure_ascii=False))
+            return
+        entry = _paper_run_timepoint(tp, source="manual",
+                                     require_trading=tp in _PAPER_TRADING_TIMEPOINTS)
+        self._send(200, json.dumps({
+            "ok": entry["ok"], "timepoint": tp, "detail": entry["detail"],
+            "error": None if entry["ok"] else entry["detail"]}, ensure_ascii=False))
+
+
 def main():
     print(f"webui listening on 0.0.0.0:{LISTEN_PORT}", file=sys.stderr)
     print(f"stockdb: {STOCKDB_HOST}:{STOCKDB_PORT}（同容器进程）| data: {DATA_DIR}", file=sys.stderr)
+    if PAPER_MODULES_AVAILABLE:
+        print(f"paper: 模块就绪，时点 {'/'.join(PAPER_TIMES)}"
+              f" | trading_enabled={paper_trading_enabled()}", file=sys.stderr)
+    else:
+        print(f"paper: 模块缺失，页签降级：{PAPER_IMPORT_ERROR}", file=sys.stderr)
     threading.Thread(target=scheduler_loop, daemon=True).start()
+    threading.Thread(target=paper_scheduler_loop, daemon=True).start()  # 模拟盘调度（2s 轮询，独立线程）
     ThreadingHTTPServer(("0.0.0.0", LISTEN_PORT), Handler).serve_forever()
 
 
