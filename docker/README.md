@@ -125,7 +125,7 @@ WEBUI_PORT=18080 ./docker/webui/dev.sh           # 换本地端口
 只读 MCP server 已迁入本仓库 `docker/webui/mcp/stockdb_mcp_server.py`（纯标准库，连 `STOCKDB_HOST:7899`），
 随 webui 镜像一起分发，由 webui 的 `POST /mcp` 路由承载（与 stdio 共用同一份 dispatch）。
 
-现共 **7 个只读工具**：
+现共 **9 个只读工具**：
 
 | 工具 | 能力 |
 |------|------|
@@ -136,11 +136,14 @@ WEBUI_PORT=18080 ./docker/webui/dev.sh           # 换本地端口
 | `get_board_open_effect_history` | 板块开盘效应历史（涨停股次日开盘溢价统计） |
 | `get_indicators` | 技术指标计算（39 项，含 zhishu 指数） |
 | `get_board_members` | 板块 ↔ 股票 双向查询 |
+| `screen_stocks` | 全市场条件选股（板块过滤 + 指标金叉/死叉 + 流通市值 + 剔除 ST） |
+| `get_mydb_data` | mydb 私有库只读（港股日K / AI 自定义表） |
 
-> **pybao 依赖**：`get_indicators` / `get_board_members`，以及 `get_kline` 的复权（fq）、
-> 1m/1w/1M 周期、批量 codes 能力，均依赖容器内 pybao（镜像自带 `/opt/stockdb/pybao`，无需额外配置）。
+> **pybao 依赖**：`get_indicators` / `get_board_members` / `screen_stocks` / `get_mydb_data`，
+> 以及 `get_kline` 的复权（fq）、1m/1w/1M 周期、批量 codes 能力，均依赖容器内 pybao
+> （镜像自带 `/opt/stockdb/pybao`，无需额外配置）。
 > 本机 dev 开发（dev.sh）需把 macOS 版 pybao 放到 `/tmp/pybao_mac` 或设置 `PYBAO_DIR` 环境变量，
-> 否则这三类能力返回**明确降级错误**（其余工具不受影响）。
+> 否则这几类能力返回**明确降级错误**（其余工具不受影响）。
 
 **A. stdio（本机 ZCode）**
 ```bash
