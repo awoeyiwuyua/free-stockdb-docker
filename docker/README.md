@@ -125,7 +125,7 @@ WEBUI_PORT=18080 ./docker/webui/dev.sh           # 换本地端口
 只读 MCP server 已迁入本仓库 `docker/webui/mcp/stockdb_mcp_server.py`（纯标准库，连 `STOCKDB_HOST:7899`），
 随 webui 镜像一起分发，由 webui 的 `POST /mcp` 路由承载（与 stdio 共用同一份 dispatch）。
 
-现共 **11 个只读工具**：
+现共 **12 个只读工具**：
 
 | 工具 | 能力 |
 |------|------|
@@ -135,11 +135,22 @@ WEBUI_PORT=18080 ./docker/webui/dev.sh           # 换本地端口
 | `get_market_snapshot` | 指定交易日多只股票的单日行情快照 |
 | `get_board_open_effect_history` | 板块开盘效应历史（涨停股次日开盘溢价统计） |
 | `get_indicators` | 技术指标计算（39 项，含 zhishu 指数） |
-| `get_board_members` | 板块 ↔ 股票 双向查询 |
+| `get_board_members` | 板块 ↔ 股票 双向查询（board_count / symbol_count 分列） |
 | `screen_stocks` | 全市场条件选股（板块过滤 + 指标金叉/死叉 + 流通市值 + 剔除 ST） |
 | `get_mydb_data` | mydb 私有库只读（港股日K / AI 自定义表） |
 | `get_trading_days` | A股交易日历（2024-2026 休市表） |
 | `get_data_status` | 数据基座状态（最新交易日/滞后天数/pybao 可用性/版本） |
+| `get_point_snapshot` | 指定交易日时点快照（TRADED / INVALID_SYMBOL / NOT_PUBLISHED / SUSPENDED 四分类 + 全市场覆盖率） |
+
+> **统一响应契约（数据可信度一等字段）**：全部工具成功结果恒含 8 键 envelope——
+> `source` / `source_contract_version`（按工具族，如 kline-v2）/ `known_at`（数据覆盖的最后时点，
+> 日线 8 位、分钟 14 位）/ `is_partial` / `truncated` / `total`（截断前数量）/ `errors`（元素
+> `{code, symbol, message}`）/ `known_limitations`。K 线区间语义统一为**闭区间 [start, end]**，
+> 分钟K 支持 point（精确一根）与 range（区间）两种显式模式，并固化 `price_unit`（元）/
+> `volume_unit`（股）元数据。**错误码 8 码体系**：`INVALID_ARGUMENT` / `NO_DATA` /
+> `NOT_PUBLISHED` / `INVALID_SYMBOL` / `DEPENDENCY_UNAVAILABLE` / `PARTIAL_RESULT`（数据面
+> is_partial 语义）/ `RATE_LIMITED`（预留）/ `INTERNAL_ERROR`。日线级数据无盘中 09:25 实时
+> 时点（`get_point_snapshot` 的 `known_at` 诚实标注最新已入库时点）。
 
 > **pybao 依赖**：`get_indicators` / `get_board_members` / `screen_stocks` / `get_mydb_data`，
 > 以及 `get_kline` 的复权（fq）、1m/1w/1M 周期、批量 codes 能力，均依赖容器内 pybao
