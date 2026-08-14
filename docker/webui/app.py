@@ -39,6 +39,19 @@ try:
 except Exception:  # noqa: BLE001 - MCP 模块缺失时优雅降级
     mcp_dispatch = None
 
+# /mcp SSE 流式进度推送依赖 pybao_tools 的线程级 progress hook
+# （set_progress_hook/clear_progress_hook，见 pybao_tools 模块）；
+# 注意：必须用顶层 `import pybao_tools`（而非 `from mcp import pybao_tools`），
+# 与 mcp.stockdb_mcp_server 内的 `import pybao_tools` 共用同一模块实例——
+# 否则 threading.local 进度钩子分属两个模块对象，SSE 进度帧永不触发
+# （mcp_dispatch 已在上方导入，server 已将 mcp/ 插入 sys.path，身份一致）。
+# 缺失/加载失败时 webui 其余功能不受影响，SSE 流式请求退化为现有 JSON 响应。
+try:
+    import pybao_tools
+except ImportError:  # noqa: BLE001 - pybao_tools 缺失时优雅降级
+    pybao_tools = None
+    print("webui: 未加载 pybao_tools，/mcp SSE 流式退化为 JSON 响应", file=sys.stderr)
+
 STOCKDB_HOST = os.environ.get("STOCKDB_HOST", "127.0.0.1")
 STOCKDB_PORT = int(os.environ.get("STOCKDB_PORT", "7899"))
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
@@ -61,7 +74,7 @@ _last_verify_result: str | None = None  # 最近一次完整性验证结果（pa
 _scheduler_alive = False             # 定时线程心跳（每次循环更新时间戳）
 _scheduler_heartbeat = 0.0           # 定时线程最近一次心跳时间戳（unix）
 _webui_started = time.time()         # webui 进程启动时间戳
-WEBUI_VERSION = "0.5.2"
+WEBUI_VERSION = "0.5.3"
 
 HISTORY_FILE = DATA_DIR / "sync_history.json"
 SCHEDULE_FILE = DATA_DIR / "sync_schedule.json"
@@ -2195,43 +2208,126 @@ class Handler(BaseHTTPRequestHandler):
         """只读 MCP JSON-RPC 端点：复用 stockdb_mcp_server.dispatch（与 stdio 同协议）。
 
         单请求单响应：请求 dict → JSON-RPC 响应体；通知（无 id）返回 202 空体。
+        Accept 含 text/event-stream 时切换 SSE 流式响应（向后兼容：非流式客户端
+        行为完全不变）：先发进度通知帧（pybao_tools 线程级 hook），再发结果帧；
+        通知（无 id）不写结束帧直接返回。
         """
+        accept = self.headers.get("Accept", "")
+        if "text/event-stream" not in accept or pybao_tools is None:
+            # ===== 非流式（或 pybao_tools 缺失的流式退化）：现有 JSON 返回路径，行为不变 =====
+            if "text/event-stream" in accept:
+                # pybao_tools 加载失败：流式退化为 JSON 响应并在 stderr 提示
+                print("webui: 未加载 mcp.pybao_tools，/mcp SSE 流式退化为 JSON 响应",
+                      file=sys.stderr)
+            if mcp_dispatch is None:
+                self._send(500, json.dumps({"error": "MCP 模块不可用"}))
+                return
+            length = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(length) if length > 0 else b""
+            if not raw.strip():
+                self._send(200, json.dumps({
+                    "jsonrpc": "2.0", "id": None,
+                    "error": {"code": -32700, "message": "Parse error: 空请求体"},
+                }))
+                return
+            try:
+                msg = json.loads(raw.decode("utf-8"))
+                if not isinstance(msg, dict):
+                    raise ValueError("请求体必须是 JSON 对象")
+            except Exception as exc:  # noqa: BLE001 - 解析失败返回 JSON-RPC parse error
+                self._send(200, json.dumps({
+                    "jsonrpc": "2.0", "id": None,
+                    "error": {"code": -32700, "message": f"Parse error: {exc}"},
+                }))
+                return
+            try:
+                response = mcp_dispatch(msg)
+            except Exception as exc:  # noqa: BLE001 - 分发异常转为 JSON-RPC internal error
+                self._send(200, json.dumps({
+                    "jsonrpc": "2.0", "id": msg.get("id"),
+                    "error": {"code": -32603, "message": f"Internal error: {exc}"},
+                }))
+                return
+            if response is None:
+                # 通知：无 JSON-RPC 响应，202 空体
+                self.send_response(202)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            self._send(200, json.dumps(response, ensure_ascii=False))
+            return
+
+        # ===== SSE 流式分支（Accept: text/event-stream 且 pybao_tools 可用）=====
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+
+        def _sse_frame(data: dict) -> None:
+            """写一个 SSE 帧：event: message + data: <json>（双换行结尾、utf-8、flush）。
+
+            客户端断连等写失败静默忽略（SSE 无重发语义）。
+            """
+            try:
+                frame = ("event: message\ndata: "
+                         + json.dumps(data, ensure_ascii=False) + "\n\n")
+                self.wfile.write(frame.encode("utf-8"))
+                self.wfile.flush()
+            except Exception:  # noqa: BLE001 - 断连等写失败静默忽略
+                pass
+
         if mcp_dispatch is None:
-            self._send(500, json.dumps({"error": "MCP 模块不可用"}))
+            _sse_frame({"jsonrpc": "2.0", "id": None,
+                        "error": {"code": -32603, "message": "MCP 模块不可用"}})
             return
         length = int(self.headers.get("Content-Length") or 0)
         raw = self.rfile.read(length) if length > 0 else b""
         if not raw.strip():
-            self._send(200, json.dumps({
-                "jsonrpc": "2.0", "id": None,
-                "error": {"code": -32700, "message": "Parse error: 空请求体"},
-            }))
+            _sse_frame({"jsonrpc": "2.0", "id": None,
+                        "error": {"code": -32700, "message": "Parse error: 空请求体"}})
             return
         try:
             msg = json.loads(raw.decode("utf-8"))
             if not isinstance(msg, dict):
                 raise ValueError("请求体必须是 JSON 对象")
         except Exception as exc:  # noqa: BLE001 - 解析失败返回 JSON-RPC parse error
-            self._send(200, json.dumps({
-                "jsonrpc": "2.0", "id": None,
-                "error": {"code": -32700, "message": f"Parse error: {exc}"},
-            }))
+            _sse_frame({"jsonrpc": "2.0", "id": None,
+                        "error": {"code": -32700, "message": f"Parse error: {exc}"}})
             return
+        # 进度 token：优先 params._meta.progressToken / params.progressToken，缺省用请求 id
+        params = msg.get("params") or {}
+        if not isinstance(params, dict):
+            params = {}
+        meta = params.get("_meta") or {}
+        if not isinstance(meta, dict):
+            meta = {}
+        token = (meta.get("progressToken") or params.get("progressToken")
+                 or msg.get("id"))
         try:
-            response = mcp_dispatch(msg)
-        except Exception as exc:  # noqa: BLE001 - 分发异常转为 JSON-RPC internal error
-            self._send(200, json.dumps({
-                "jsonrpc": "2.0", "id": msg.get("id"),
-                "error": {"code": -32603, "message": f"Internal error: {exc}"},
-            }))
-            return
-        if response is None:
-            # 通知：无 JSON-RPC 响应，202 空体
-            self.send_response(202)
-            self.send_header("Content-Length", "0")
-            self.end_headers()
-            return
-        self._send(200, json.dumps(response, ensure_ascii=False))
+            pybao_tools.set_progress_hook(
+                lambda stage, detail=None: _sse_frame({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/progress",
+                    "params": {
+                        "progressToken": token,
+                        "message": stage + (": " + detail if detail else ""),
+                    },
+                })
+            )
+            try:
+                response = mcp_dispatch(msg)
+            except Exception as exc:  # noqa: BLE001 - 分发异常转为 JSON-RPC internal error
+                _sse_frame({
+                    "jsonrpc": "2.0", "id": msg.get("id"),
+                    "error": {"code": -32603, "message": f"Internal error: {exc}"},
+                })
+                return
+            if response is not None:
+                # 响应 dict → 写事件帧；通知（None）不写结束帧直接返回
+                _sse_frame(response)
+        finally:
+            pybao_tools.clear_progress_hook()
 
     def _status(self):
         state = container_state()
