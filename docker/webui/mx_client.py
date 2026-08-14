@@ -159,7 +159,12 @@ class MXClient:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         req = urllib.request.Request(
             url, data=body, method="POST",
-            headers={"Content-Type": "application/json", "apikey": self._apikey},
+            headers={
+                "Content-Type": "application/json",
+                "apikey": self._apikey,
+                # 部分网关/WAF 对默认 Python-urllib UA 直接 403；带浏览器形态 UA
+                "User-Agent": "Mozilla/5.0 (compatible; stockdb-paper/1.0; +local)",
+            },
         )
         try:
             with urllib.request.urlopen(req, timeout=self._timeout) as resp:
