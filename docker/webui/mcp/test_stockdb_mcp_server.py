@@ -23,6 +23,30 @@ class StockdbMcpServerTests(unittest.TestCase):
             "code": code,
         }
 
+    # === Phase 3 数据契约：envelope 8 键恒在（Task D） ===
+
+    def _assert_envelope(self, payload, *, source, contract, known_at=None,
+                         is_partial=False, truncated=False, total=None):
+        """envelope 8 键恒在且类型正确；source/contract/known_at/is_partial/
+        truncated 恒等断言；total 仅当显式传入时断言相等（否则只查类型）。"""
+        self.assertIsInstance(payload["source"], str)
+        self.assertEqual(payload["source"], source)
+        self.assertIsInstance(payload["source_contract_version"], str)
+        self.assertEqual(payload["source_contract_version"], contract)
+        self.assertTrue(
+            payload["known_at"] is None or isinstance(payload["known_at"], str),
+        )
+        self.assertEqual(payload["known_at"], known_at)
+        self.assertIsInstance(payload["is_partial"], bool)
+        self.assertEqual(payload["is_partial"], is_partial)
+        self.assertIsInstance(payload["truncated"], bool)
+        self.assertEqual(payload["truncated"], truncated)
+        self.assertIsInstance(payload["total"], (int, dict, type(None)))
+        if total is not None:
+            self.assertEqual(payload["total"], total)
+        self.assertIsInstance(payload["errors"], list)
+        self.assertIsInstance(payload["known_limitations"], list)
+
     def test_long_ranges_use_year_prefixes(self):
         self.assertEqual(
             server._range_prefixes("20230101", "20260807"),
@@ -237,7 +261,7 @@ class StockdbMcpServerTests(unittest.TestCase):
         self.assertEqual(response["jsonrpc"], "2.0")
         self.assertEqual(response["id"], 1)
         tool_names = {tool["name"] for tool in response["result"]["tools"]}
-        self.assertEqual(len(tool_names), 11)
+        self.assertEqual(len(tool_names), 12)
         self.assertIn("get_stock_list", tool_names)
         self.assertIn("get_board_open_effect_history", tool_names)
         self.assertIn("get_indicators", tool_names)
@@ -246,6 +270,7 @@ class StockdbMcpServerTests(unittest.TestCase):
         self.assertIn("get_mydb_data", tool_names)
         self.assertIn("get_trading_days", tool_names)
         self.assertIn("get_data_status", tool_names)
+        self.assertIn("get_point_snapshot", tool_names)
 
     @mock.patch.object(server, "query_stock_list")
     def test_http_dispatch_tools_call(self, query_stock_list):
@@ -262,7 +287,12 @@ class StockdbMcpServerTests(unittest.TestCase):
         self.assertEqual(len(content), 1)
         self.assertEqual(content[0]["type"], "text")
         payload = json.loads(content[0]["text"])
-        self.assertEqual(payload, {"total": 0, "codes": []})
+        # envelope 8 键逐键断言，业务键 total/codes 不变
+        self._assert_envelope(
+            payload, source="http", contract="stock-list-v1",
+            known_at=None, total=0,
+        )
+        self.assertEqual(payload["codes"], [])
 
     def test_dispatch_notification_returns_none(self):
         self.assertIsNone(server.dispatch({
@@ -444,7 +474,9 @@ class StockdbMcpServerTests(unittest.TestCase):
         self.assertEqual(fake.bk.get.call_count, 1)
         self.assertEqual(fake.bk.get.call_args.kwargs["category"], "申万三级")
         result = outcome["result"]
-        self.assertEqual(result["total"], 600)
+        # Task B/C：query_boards 结果以 board_count/symbol_count 计数（原 total 语义）
+        self.assertEqual(result["board_count"], 1)
+        self.assertEqual(result["symbol_count"], 600)
         self.assertTrue(result["truncated"])
         self.assertEqual(len(result["symbols"]), 500)
 
@@ -517,7 +549,11 @@ class StockdbMcpServerTests(unittest.TestCase):
     def test_http_dispatch_get_board_members_success(self, query_boards):
         expected = {
             "source": "pybao",
-            "data": [{"name": "半导体", "count": 10}],
+            "category": None,
+            "query": "半导体",
+            "boards": [{"name": "半导体", "count": 10}],
+            "board_count": 1,
+            "symbol_count": 10,
             "truncated": False,
         }
         query_boards.return_value = {"ok": True, "result": expected}
@@ -533,7 +569,15 @@ class StockdbMcpServerTests(unittest.TestCase):
         result = response["result"]
         self.assertIsNone(result.get("isError"))
         payload = json.loads(result["content"][0]["text"])
-        self.assertEqual(payload, expected)
+        # envelope 8 键 + 业务键不变（boards/board_count/symbol_count）
+        self._assert_envelope(
+            payload, source="pybao", contract="boards-v1", known_at=None,
+        )
+        self.assertIsNone(payload["total"])
+        self.assertEqual(payload["boards"], expected["boards"])
+        self.assertEqual(payload["board_count"], 1)
+        self.assertEqual(payload["symbol_count"], 10)
+        self.assertFalse(payload["truncated"])
 
     # === QC 锁定：compute_indicators 增强参数校验 ===
 
@@ -612,7 +656,14 @@ class StockdbMcpServerTests(unittest.TestCase):
         self.assertIsNone(response["result"].get("isError"))
         payload = json.loads(response["result"]["content"][0]["text"])
         self.assertEqual(payload["source"], "pybao")
+        self.assertEqual(payload["source_contract_version"], "kline-v2")
+        self.assertEqual(payload["mode"], "point")
+        self.assertEqual(payload["fq"], "qfq")
+        for key in ("price_unit", "volume_unit", "amount_unit"):
+            self.assertIsInstance(payload[key], str)
         self.assertEqual(set(payload["data"].keys()), {"600633", "000001"})
+        # 批量 total 为 {code: n} 形态（截断前数量）
+        self.assertEqual(payload["total"], {"600633": 10, "000001": 10})
         self.assertTrue(payload["truncated"])
         # 保留最新 3 行：日期应为最后 3 个交易日
         self.assertEqual(
@@ -1122,7 +1173,17 @@ class StockdbMcpServerTests(unittest.TestCase):
         result = response["result"]
         self.assertIsNone(result.get("isError"))
         payload = json.loads(result["content"][0]["text"])
-        self.assertEqual(payload, expected)
+        # envelope 8 键 + 业务键不变（table/keys/values）
+        self._assert_envelope(
+            payload, source="pybao", contract="mydb-v1",
+            known_at=None, total=1,
+        )
+        self.assertEqual(payload["table"], "hk日k")
+        self.assertEqual(payload["keys"], ["00700:20260813"])
+        self.assertEqual(
+            payload["values"], {"00700:20260813": {"close": 12.5}},
+        )
+        self.assertFalse(payload["truncated"])
 
     @mock.patch.object(pybao_tools, "query_mydb")
     def test_http_dispatch_get_mydb_data_error(self, query_mydb):
@@ -1151,7 +1212,7 @@ class StockdbMcpServerTests(unittest.TestCase):
             )
 
         self.assertFalse(outcome["ok"])
-        self.assertEqual(outcome["code"], "PYBAO_UNAVAILABLE")
+        self.assertEqual(outcome["code"], "DEPENDENCY_UNAVAILABLE")
         self.assertIn("/tmp/pybao_mac", outcome["hint"])
 
     def test_error_code_unknown_indicator_param_invalid(self):
@@ -1160,7 +1221,7 @@ class StockdbMcpServerTests(unittest.TestCase):
         )
 
         self.assertFalse(outcome["ok"])
-        self.assertEqual(outcome["code"], "PARAM_INVALID")
+        self.assertEqual(outcome["code"], "INVALID_ARGUMENT")
 
     def test_error_code_unknown_tool(self):
         response = server.dispatch({
@@ -1171,7 +1232,8 @@ class StockdbMcpServerTests(unittest.TestCase):
         result = response["result"]
         self.assertTrue(result["isError"])
         payload = json.loads(result["content"][0]["text"])
-        self.assertEqual(payload["code"], "UNKNOWN_TOOL")
+        # 未知工具按契约同样归入 INVALID_ARGUMENT（参数非法）
+        self.assertEqual(payload["code"], "INVALID_ARGUMENT")
 
     # === calendar_xshg（2026 休市表） ===
 
@@ -1238,7 +1300,7 @@ class StockdbMcpServerTests(unittest.TestCase):
         result = response["result"]
         self.assertTrue(result["isError"])
         payload = json.loads(result["content"][0]["text"])
-        self.assertEqual(payload["code"], "PARAM_INVALID")
+        self.assertEqual(payload["code"], "INVALID_ARGUMENT")
 
     # === get_data_status（pair 形态 / pybao 标志 / TTL 去重） ===
 
@@ -1256,7 +1318,7 @@ class StockdbMcpServerTests(unittest.TestCase):
         payload = json.loads(response["result"]["content"][0]["text"])
         self.assertEqual(payload["latest_trade_date"], "20260813")
         self.assertFalse(payload["pybao_available"])
-        self.assertEqual(payload["tool_count"], 11)
+        self.assertEqual(payload["tool_count"], 12)
 
     def test_get_data_status_ttl_dedup_single_http_round(self):
         with mock.patch.object(server, "_TTL", server._TTLCache()):
@@ -1551,6 +1613,532 @@ class StockdbMcpServerTests(unittest.TestCase):
         # 未设 hook 时 notify 不抛异常
         pybao_tools.notify_progress("e")
         self.assertEqual(calls, [("a", "b")])
+
+
+    # === Phase 3：envelope 8 键逐工具断言（Task D，≥8 工具） ===
+
+    @mock.patch.object(server, "query_stock_list")
+    def test_envelope_get_stock_list(self, query_stock_list):
+        query_stock_list.return_value = {"total": 2, "codes": ["600001", "600002"]}
+        response = server.dispatch({
+            "jsonrpc": "2.0", "id": 300, "method": "tools/call",
+            "params": {"name": "get_stock_list", "arguments": {}},
+        })
+        payload = json.loads(response["result"]["content"][0]["text"])
+        self._assert_envelope(
+            payload, source="http", contract="stock-list-v1",
+            known_at=None, total=2,
+        )
+        self.assertEqual(payload["codes"], ["600001", "600002"])
+
+    @mock.patch.object(server, "_http_get")
+    def test_envelope_get_adjust_factors(self, http_get):
+        # dispatch 成功路径：list 结果被包装为 {"data": [...]} 并注入 envelope
+        with mock.patch.object(server, "_TTL", server._TTLCache()):
+            http_get.return_value = [
+                ["复权:600633:20260813",
+                 {"div": 1.0, "give": 0.0, "trans": 0.0, "mult": 1.0, "cum": 1.0}],
+            ]
+            response = server.dispatch({
+                "jsonrpc": "2.0", "id": 301, "method": "tools/call",
+                "params": {
+                    "name": "get_adjust_factors",
+                    "arguments": {"code": "600633", "date_pattern": "20260813"},
+                },
+            })
+        payload = json.loads(response["result"]["content"][0]["text"])
+        self._assert_envelope(
+            payload, source="http", contract="adjust-factors-v1",
+            known_at=None, total=1,
+        )
+        self.assertEqual(payload["data"], [{
+            "date": "20260813", "div": 1.0, "give": 0.0, "trans": 0.0,
+            "mult": 1.0, "cum": 1.0,
+        }])
+
+    @mock.patch.object(server, "_http_get")
+    def test_envelope_get_market_snapshot(self, http_get):
+        http_get.return_value = [
+            {"date": 20260813, "open": 10.0, "close": 10.5, "code": "600633"},
+        ]
+        response = server.dispatch({
+            "jsonrpc": "2.0", "id": 302, "method": "tools/call",
+            "params": {
+                "name": "get_market_snapshot",
+                "arguments": {"date": "20260813", "codes": ["600633"]},
+            },
+        })
+        payload = json.loads(response["result"]["content"][0]["text"])
+        self._assert_envelope(
+            payload, source="http", contract="market-snapshot-v1",
+            known_at="20260813",
+        )
+        self.assertEqual(payload["results"][0]["date"], 20260813)
+        self.assertEqual(payload["errors"], [])
+
+    @mock.patch.object(server, "query_board_open_effect_history")
+    def test_envelope_get_board_open_effect_history(self, query_history):
+        query_history.return_value = {
+            "days": [{"date": "2026-01-05", "eligible_count": 1}],
+            "is_partial": False,
+            "known_limitations": ["测试限制"],
+        }
+        response = server.dispatch({
+            "jsonrpc": "2.0", "id": 303, "method": "tools/call",
+            "params": {
+                "name": "get_board_open_effect_history",
+                "arguments": {"start": "20260101", "end": "20260131"},
+            },
+        })
+        payload = json.loads(response["result"]["content"][0]["text"])
+        self._assert_envelope(
+            payload, source="http", contract="board-open-effect-v1",
+            known_at=None,
+        )
+        self.assertIsNone(payload["total"])
+        self.assertEqual(payload["days"][0]["date"], "2026-01-05")
+        self.assertEqual(payload["known_limitations"], ["测试限制"])
+
+    @mock.patch.object(pybao_tools, "compute_indicators")
+    def test_envelope_get_indicators(self, compute):
+        compute.return_value = {
+            "ok": True,
+            "result": {
+                "source": "pybao", "frequency": "1d", "indicators": ["macd"],
+                "params": None, "compact": True, "truncated": False,
+                "truncated_rows": 0,
+                "data": {"dates": [20260102, 20260105], "macd": [0.5, 0.7]},
+            },
+        }
+        response = server.dispatch({
+            "jsonrpc": "2.0", "id": 304, "method": "tools/call",
+            "params": {
+                "name": "get_indicators",
+                "arguments": {"indicators": ["macd"], "codes": ["600633"]},
+            },
+        })
+        payload = json.loads(response["result"]["content"][0]["text"])
+        self._assert_envelope(
+            payload, source="pybao", contract="indicators-v1",
+            known_at="20260105", total={"dates": 2, "macd": 2},
+        )
+        self.assertEqual(payload["data"]["dates"], [20260102, 20260105])
+
+    @mock.patch.object(pybao_tools, "screen_stocks")
+    @mock.patch.object(server, "query_stock_list")
+    def test_envelope_screen_stocks(self, query_stock_list, screen_stocks):
+        query_stock_list.return_value = {"total": 2, "codes": ["600001", "600002"]}
+        screen_stocks.return_value = {
+            "ok": True,
+            "result": {
+                "source": "pybao", "date": 20260105, "candidates": [],
+                "matched_count": 0, "dropped": {"missing_bar": 0, "st": 0, "mv": 0},
+            },
+        }
+        response = server.dispatch({
+            "jsonrpc": "2.0", "id": 305, "method": "tools/call",
+            "params": {
+                "name": "screen_stocks",
+                "arguments": {"indicator_cross": {"name": "macd"}},
+            },
+        })
+        payload = json.loads(response["result"]["content"][0]["text"])
+        self._assert_envelope(
+            payload, source="pybao", contract="screen-v1",
+            known_at="20260105",
+        )
+        self.assertEqual(payload["universe"]["source"], "full_market")
+        self.assertEqual(payload["candidates"], [])
+
+    @mock.patch.object(pybao_tools, "query_mydb")
+    def test_envelope_get_mydb_data(self, query_mydb):
+        query_mydb.return_value = {
+            "ok": True,
+            "result": {
+                "source": "pybao", "table": "hk日k",
+                "keys": ["00700:20260813"],
+                "values": {"00700:20260813": {"close": 12.5}},
+                "total": 1, "truncated": False,
+            },
+        }
+        response = server.dispatch({
+            "jsonrpc": "2.0", "id": 306, "method": "tools/call",
+            "params": {"name": "get_mydb_data", "arguments": {"table": "hk日k"}},
+        })
+        payload = json.loads(response["result"]["content"][0]["text"])
+        self._assert_envelope(
+            payload, source="pybao", contract="mydb-v1",
+            known_at=None, total=1,
+        )
+        self.assertEqual(payload["keys"], ["00700:20260813"])
+
+    def test_envelope_get_trading_days(self):
+        response = server.dispatch({
+            "jsonrpc": "2.0", "id": 307, "method": "tools/call",
+            "params": {
+                "name": "get_trading_days",
+                "arguments": {"start": "20260810", "end": "20260814"},
+            },
+        })
+        payload = json.loads(response["result"]["content"][0]["text"])
+        self._assert_envelope(
+            payload, source="static", contract="calendar-v1", known_at=None,
+        )
+        self.assertIsNone(payload["total"])
+        self.assertEqual(payload["count"], 5)
+        self.assertEqual(len(payload["trading_days"]), 5)
+
+    @mock.patch.object(pybao_tools, "get_pybao")
+    @mock.patch.object(server, "_latest_trade_date")
+    def test_envelope_get_data_status(self, latest, get_pybao):
+        latest.return_value = "20260813"
+        get_pybao.return_value = None
+        response = server.dispatch({
+            "jsonrpc": "2.0", "id": 308, "method": "tools/call",
+            "params": {"name": "get_data_status", "arguments": {}},
+        })
+        payload = json.loads(response["result"]["content"][0]["text"])
+        self._assert_envelope(
+            payload, source="http", contract="status-v1", known_at="20260813",
+        )
+        self.assertEqual(payload["tool_count"], 12)
+        self.assertFalse(payload["pybao_available"])
+
+    @mock.patch.object(server, "_latest_trade_date")
+    @mock.patch.object(server, "query_stock_list")
+    @mock.patch.object(server, "_http_get")
+    def test_envelope_get_point_snapshot(self, http_get, query_stock_list, latest):
+        query_stock_list.return_value = {"total": 1, "codes": ["600001"]}
+        latest.return_value = "20260813"
+        http_get.return_value = {"date": 20260813, "open": 10.0, "close": 10.5}
+        response = server.dispatch({
+            "jsonrpc": "2.0", "id": 309, "method": "tools/call",
+            "params": {"name": "get_point_snapshot", "arguments": {"date": "20260813"}},
+        })
+        payload = json.loads(response["result"]["content"][0]["text"])
+        self._assert_envelope(
+            payload, source="http", contract="snapshot-v1",
+            known_at="20260813",
+        )
+        self.assertIsNone(payload["total"])
+        self.assertEqual(payload["points"][0]["status"], "TRADED")
+
+    # === Phase 3：kline-v2（mode/units/total 截断前语义） ===
+
+    @mock.patch.object(server, "_http_get")
+    def test_kline_v2_mode_point_and_units(self, http_get):
+        http_get.return_value = [
+            {"date": 20260105, "open": 10.0, "close": 10.2},
+        ]
+        response = server.dispatch({
+            "jsonrpc": "2.0", "id": 320, "method": "tools/call",
+            "params": {
+                "name": "get_kline",
+                "arguments": {"code": "600633", "frequency": "1d", "start": "20260105"},
+            },
+        })
+        payload = json.loads(response["result"]["content"][0]["text"])
+        self._assert_envelope(
+            payload, source="http", contract="kline-v2",
+            known_at="20260105", total=1,
+        )
+        self.assertEqual(payload["mode"], "point")  # 无 end → point
+        self.assertEqual(payload["fq"], "none")
+        for key in ("price_unit", "volume_unit", "amount_unit"):
+            self.assertIsInstance(payload[key], str)
+            self.assertTrue(payload[key])
+
+    @mock.patch.object(server, "_http_get")
+    def test_kline_v2_limit_total_is_pre_truncation(self, http_get):
+        http_get.return_value = [
+            {"date": 20260101 + i, "close": float(i)} for i in range(5)
+        ]
+        response = server.dispatch({
+            "jsonrpc": "2.0", "id": 321, "method": "tools/call",
+            "params": {
+                "name": "get_kline",
+                "arguments": {
+                    "code": "600633", "frequency": "1d",
+                    "start": "20260101", "end": "20260131", "limit": 2,
+                },
+            },
+        })
+        payload = json.loads(response["result"]["content"][0]["text"])
+        self._assert_envelope(
+            payload, source="http", contract="kline-v2",
+            known_at="20260105", truncated=True, total=5,
+        )
+        self.assertEqual(payload["mode"], "range")  # 有 end → range
+        self.assertEqual(len(payload["data"]), 2)   # data 截断变短
+        self.assertEqual(payload["total"], 5)       # total 仍是截断前数量
+
+    # === Phase 3：闭区间 _bump_end 与 SDK 路径 ===
+
+    def test_bump_end_daily(self):
+        self.assertEqual(server._bump_end("20260813", "1d"), "20260814")
+
+    def test_bump_end_minute_8digit_date(self):
+        self.assertEqual(server._bump_end("20260813", "5m"), "20260814000000")
+
+    def test_bump_end_minute_14digit_ts(self):
+        self.assertEqual(
+            server._bump_end("20260813150000", "5m"), "20260813150100",
+        )
+
+    @mock.patch.object(pybao_tools, "get_sdk_client")
+    def test_kline_sdk_range_includes_end_day(self, get_sdk_client):
+        fake_client = mock.Mock()
+        fake_client.get_data.return_value = [
+            {"date": 20260812, "close": 10.0},
+            {"date": 20260813, "close": 10.5},   # end 当日行（闭区间必须保留）
+        ]
+        get_sdk_client.return_value = fake_client
+
+        response = server.dispatch({
+            "jsonrpc": "2.0", "id": 322, "method": "tools/call",
+            "params": {
+                "name": "get_kline",
+                "arguments": {
+                    "code": "600633", "fq": "qfq", "frequency": "1d",
+                    "start": "20260810", "end": "20260813",
+                },
+            },
+        })
+
+        payload = json.loads(response["result"]["content"][0]["text"])
+        # 闭区间生效：含 end 当日行
+        self.assertEqual(
+            [row["date"] for row in payload["data"]], [20260812, 20260813],
+        )
+        # SDK 以 bumped end（end+1 日）查询实现闭区间
+        self.assertEqual(fake_client.get_data.call_args.kwargs["end"], "20260814")
+
+    # === Phase 3：get_point_snapshot 分类 / 覆盖率 / 部分性 ===
+
+    @mock.patch.object(server, "_latest_trade_date")
+    @mock.patch.object(server, "query_stock_list")
+    @mock.patch.object(server, "_http_get")
+    def test_point_snapshot_traded_classification(self, http_get, query_stock_list, latest):
+        query_stock_list.return_value = {"total": 1, "codes": ["600001"]}
+        latest.return_value = "20260813"
+        http_get.return_value = {"date": 20260813, "open": 10.0, "close": 10.5}
+
+        response = server.dispatch({
+            "jsonrpc": "2.0", "id": 330, "method": "tools/call",
+            "params": {"name": "get_point_snapshot", "arguments": {"date": "20260813"}},
+        })
+
+        payload = json.loads(response["result"]["content"][0]["text"])
+        self.assertEqual(payload["points"][0]["status"], "TRADED")
+        self.assertEqual(payload["coverage"]["universe"], 1)
+        self.assertEqual(payload["coverage"]["requested"], 1)
+        self.assertEqual(payload["coverage"]["traded"], 1)
+        self.assertFalse(payload["is_partial"])
+        self.assertTrue(payload["coverage"]["formal_usable"])
+
+    @mock.patch.object(server, "_latest_trade_date")
+    @mock.patch.object(server, "query_stock_list")
+    @mock.patch.object(server, "_http_get")
+    def test_point_snapshot_invalid_symbol(self, http_get, query_stock_list, latest):
+        query_stock_list.return_value = {"total": 1, "codes": ["600001"]}
+        latest.return_value = "20260813"
+        http_get.return_value = None
+
+        response = server.dispatch({
+            "jsonrpc": "2.0", "id": 331, "method": "tools/call",
+            "params": {
+                "name": "get_point_snapshot",
+                "arguments": {"date": "20260813", "codes": ["999999"]},
+            },
+        })
+
+        payload = json.loads(response["result"]["content"][0]["text"])
+        err = payload["errors"][0]
+        self.assertEqual(err["code"], "INVALID_SYMBOL")
+        self.assertEqual(err["symbol"], "999999")
+        self.assertEqual(err["message"], "代码不在股票池")
+        self.assertEqual(payload["coverage"]["invalid_symbol"], 1)
+
+    @mock.patch.object(server, "_latest_trade_date")
+    @mock.patch.object(server, "query_stock_list")
+    @mock.patch.object(server, "_http_get")
+    def test_point_snapshot_not_published(self, http_get, query_stock_list, latest):
+        query_stock_list.return_value = {"total": 1, "codes": ["600001"]}
+        latest.return_value = "20260813"
+        http_get.return_value = None
+
+        response = server.dispatch({
+            "jsonrpc": "2.0", "id": 332, "method": "tools/call",
+            "params": {
+                "name": "get_point_snapshot",
+                "arguments": {"date": "20260814", "codes": ["600001"]},
+            },
+        })
+
+        payload = json.loads(response["result"]["content"][0]["text"])
+        err = payload["errors"][0]
+        self.assertEqual(err["code"], "NOT_PUBLISHED")
+        self.assertEqual(err["message"], "该时点数据尚未入库/尚未发布")
+        self.assertEqual(payload["coverage"]["not_published"], 1)
+
+    @mock.patch.object(server, "_latest_trade_date")
+    @mock.patch.object(server, "query_stock_list")
+    @mock.patch.object(server, "_http_get")
+    def test_point_snapshot_suspended(self, http_get, query_stock_list, latest):
+        query_stock_list.return_value = {"total": 1, "codes": ["600001"]}
+        latest.return_value = "20260813"
+        http_get.return_value = None
+
+        response = server.dispatch({
+            "jsonrpc": "2.0", "id": 333, "method": "tools/call",
+            "params": {
+                "name": "get_point_snapshot",
+                "arguments": {"date": "20260813", "codes": ["600001"]},
+            },
+        })
+
+        payload = json.loads(response["result"]["content"][0]["text"])
+        err = payload["errors"][0]
+        self.assertEqual(err["code"], "NO_DATA")
+        self.assertIn("停牌", err["message"])
+        self.assertEqual(payload["coverage"]["suspended"], 1)
+
+    def test_point_snapshot_non_trading_day_invalid_argument(self):
+        response = server.dispatch({
+            "jsonrpc": "2.0", "id": 334, "method": "tools/call",
+            "params": {"name": "get_point_snapshot", "arguments": {"date": "20260815"}},
+        })
+
+        result = response["result"]
+        self.assertTrue(result["isError"])
+        payload = json.loads(result["content"][0]["text"])
+        self.assertEqual(payload["code"], "INVALID_ARGUMENT")
+        self.assertIn("非交易日", payload["error"])
+        self.assertIn("20260814", payload["hint"])  # 最近交易日提示
+
+    @mock.patch.object(server, "_latest_trade_date")
+    @mock.patch.object(server, "query_stock_list")
+    @mock.patch.object(server, "_http_get")
+    def test_point_snapshot_explicit_codes_partial(self, http_get, query_stock_list, latest):
+        query_stock_list.return_value = {"total": 2, "codes": ["600001", "600002"]}
+        latest.return_value = "20260813"
+        http_get.return_value = {"date": 20260813, "open": 10.0, "close": 10.5}
+
+        response = server.dispatch({
+            "jsonrpc": "2.0", "id": 335, "method": "tools/call",
+            "params": {
+                "name": "get_point_snapshot",
+                "arguments": {"date": "20260813", "codes": ["600001"]},
+            },
+        })
+
+        payload = json.loads(response["result"]["content"][0]["text"])
+        self.assertTrue(payload["is_partial"])
+        self.assertFalse(payload["coverage"]["formal_usable"])
+        self.assertIn("EXPLICIT_CODES_DEBUG", payload["coverage"]["partial_reasons"])
+
+    @mock.patch.object(server, "_latest_trade_date")
+    @mock.patch.object(server, "query_stock_list")
+    @mock.patch.object(server, "_http_get")
+    def test_point_snapshot_full_market_partial_failure(self, http_get, query_stock_list, latest):
+        query_stock_list.return_value = {"total": 2, "codes": ["600001", "300001"]}
+        latest.return_value = "20260813"
+
+        def fake_get(cmd, table):
+            if "300001" in table:
+                raise OSError("timeout")
+            return {"date": 20260813, "open": 10.0, "close": 10.5}
+
+        http_get.side_effect = fake_get
+
+        response = server.dispatch({
+            "jsonrpc": "2.0", "id": 336, "method": "tools/call",
+            "params": {"name": "get_point_snapshot", "arguments": {"date": "20260813"}},
+        })
+
+        payload = json.loads(response["result"]["content"][0]["text"])
+        self.assertEqual(payload["coverage"]["universe"], 2)
+        self.assertEqual(payload["coverage"]["requested"], 2)
+        self.assertEqual(payload["coverage"]["traded"], 1)
+        self.assertEqual(payload["coverage"]["failed"], 1)
+        self.assertFalse(payload["coverage"]["formal_usable"])
+        self.assertIn("SOURCE_REQUEST_FAILED", payload["coverage"]["partial_reasons"])
+        err = payload["errors"][0]
+        self.assertEqual(err["code"], "INTERNAL_ERROR")
+        self.assertEqual(err["symbol"], "300001")
+        self.assertIn("timeout", err["message"])
+
+    # === Phase 3：errors 元素契约形态 {"code","symbol","message"} ===
+
+    @mock.patch.object(server, "_http_get")
+    def test_market_snapshot_errors_contract_shape(self, http_get):
+        def fake_get(cmd, table):
+            if "600002" in table:
+                raise OSError("boom")
+            return None  # 600001 合法查询但无数据
+
+        http_get.side_effect = fake_get
+
+        response = server.dispatch({
+            "jsonrpc": "2.0", "id": 340, "method": "tools/call",
+            "params": {
+                "name": "get_market_snapshot",
+                "arguments": {"date": "20260813", "codes": ["600001", "600002"]},
+            },
+        })
+
+        payload = json.loads(response["result"]["content"][0]["text"])
+        self.assertEqual(len(payload["errors"]), 2)
+        for err in payload["errors"]:
+            self.assertEqual(set(err.keys()), {"code", "symbol", "message"})
+            self.assertIsInstance(err["code"], str)
+            self.assertIsInstance(err["symbol"], str)
+            self.assertIsInstance(err["message"], str)
+        self.assertEqual(payload["errors"][0]["code"], "NO_DATA")
+        self.assertEqual(payload["errors"][0]["symbol"], "600001")
+        self.assertEqual(payload["errors"][1]["code"], "INTERNAL_ERROR")
+        self.assertEqual(payload["errors"][1]["symbol"], "600002")
+
+    # === Phase 3：_apply_contract 派生规则（list 包装 / total / known_at） ===
+
+    def test_apply_contract_wraps_list_result(self):
+        out = server._apply_contract(
+            "get_adjust_factors", [{"date": "20260813", "div": 1.0}],
+        )
+        self.assertEqual(out["data"], [{"date": "20260813", "div": 1.0}])
+        self.assertEqual(out["source"], "http")
+        self.assertEqual(out["source_contract_version"], "adjust-factors-v1")
+        self.assertIsNone(out["known_at"])
+        self.assertEqual(out["total"], 1)  # list → len
+        self.assertFalse(out["truncated"])
+        self.assertEqual(out["errors"], [])
+        self.assertEqual(out["known_limitations"], [])
+
+    def test_apply_contract_total_derived_batch(self):
+        result = {
+            "source": "pybao",
+            "data": {
+                "600633": [{"date": 20260102, "close": 1.0}],
+                "000001": [{"date": 20260102, "close": 1.0},
+                           {"date": 20260103, "close": 1.1}],
+            },
+        }
+        out = server._apply_contract("get_kline", result)
+        self.assertEqual(out["total"], {"600633": 1, "000001": 2})
+
+    def test_apply_contract_known_at_derived_from_data(self):
+        result = {
+            "source": "http",
+            "data": [
+                {"date": 20260102, "close": 1.0},
+                {"date": 20260105, "close": 1.2},
+                {"date": 20260103, "close": 1.1},
+            ],
+        }
+        out = server._apply_contract("get_kline", result)
+        self.assertEqual(out["known_at"], "20260105")  # data 最大 date
+        self.assertEqual(out["total"], 3)
+        self.assertEqual(out["source_contract_version"], "kline-v2")
 
 
 if __name__ == "__main__":

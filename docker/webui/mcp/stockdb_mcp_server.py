@@ -38,6 +38,8 @@ Usage:
     get_mydb_data       只读 mydb 私有库（pybao：港股日K / AI 自定义表）
     get_trading_days    A股交易日历（休市表覆盖 2024-2026，来源 exchange_calendars XSHG）
     get_data_status     数据基座状态（最新交易日/滞后天数/pybao 可用性/版本/日历覆盖）
+    get_point_snapshot  指定交易日全市场/指定股票池的单日时点快照（TRADED/SUSPENDED/… 分类，
+                        纯 HTTP 无 pybao 依赖）
 
     prompts（能力）:
         screen-workflow     条件选股工作流
@@ -107,20 +109,24 @@ _KLINE_CODES_MAX = 50  # 批量 codes 上限
 # query_fullmarket_daily_snapshot（两者都会开线程池拉全市场），用 RLock 避免同线程二次获取死锁。
 _HEAVY_LOCK = threading.RLock()
 
-# === 统一错误码契约（本批全局） ===
-# server.py isError content 统一为 {"error": str, "code": str}（PYBAO_UNAVAILABLE 附加
+# === 统一错误码契约（本批全局：8 码体系） ===
+# server.py isError content 统一为 {"error": str, "code": str}（DEPENDENCY_UNAVAILABLE 附加
 # "hint"）；pybao_tools outcome 携带的 code/hint 直接透传，缺省按文案推断。
-ERROR_PARAM_INVALID = "PARAM_INVALID"
-ERROR_PYBAO_UNAVAILABLE = "PYBAO_UNAVAILABLE"
-ERROR_UNKNOWN_TOOL = "UNKNOWN_TOOL"
-ERROR_INTERNAL = "INTERNAL"
-ERROR_DATA_NOT_FOUND = "DATA_NOT_FOUND"
+# 以下 8 个常量与 pybao_tools.py 中的同名常量值完全一致（Task D 同步）。
+ERROR_INVALID_ARGUMENT = "INVALID_ARGUMENT"  # 参数非法（含未知工具，替换原 PARAM_INVALID/UNKNOWN_TOOL）
+ERROR_NO_DATA = "NO_DATA"  # 合法查询但无数据（替换原 DATA_NOT_FOUND）
+ERROR_NOT_PUBLISHED = "NOT_PUBLISHED"  # 该时点数据尚未入库/尚未发布
+ERROR_INVALID_SYMBOL = "INVALID_SYMBOL"  # 代码不在股票池
+ERROR_DEPENDENCY_UNAVAILABLE = "DEPENDENCY_UNAVAILABLE"  # pybao 缺失（替换原 PYBAO_UNAVAILABLE，hint 文案不变）
+ERROR_PARTIAL_RESULT = "PARTIAL_RESULT"  # 预留：仅作数据面 is_partial 标志的语义说明，不作为 isError code 返回
+ERROR_RATE_LIMITED = "RATE_LIMITED"  # 预留常量，当前无配额实现，不返回
+ERROR_INTERNAL_ERROR = "INTERNAL_ERROR"  # 内部异常（替换原 INTERNAL）
 
 _PYBAO_HINT = (
     "容器镜像自动携带（/opt/stockdb/pybao）；本机开发请把 macOS 版 pybao 放 "
     "/tmp/pybao_mac 或设 PYBAO_DIR"
 )
-# 推断 INTERNAL 的文案标记（与 pybao_tools 的中文错误后缀一致）
+# 推断 INTERNAL_ERROR 的文案标记（与 pybao_tools 的中文错误后缀一致）
 _INTERNAL_ERROR_MARKERS = ("查询失败", "计算失败", "加工失败", "读取失败")
 
 
@@ -281,6 +287,44 @@ def _as_limit(value: object) -> int:
     return max(0, number)
 
 
+_DAILY_KLINE_FREQUENCIES = frozenset({"1d", "1w", "1M"})  # 日K级周期（1w/1M 由日线聚合）
+
+
+def _bump_end(end: str, frequency: str) -> str:
+    """SDK 区间为开区间（start<end 不含 end），将 end 顺延一个粒度后交给 SDK，
+    客户端再过滤 rows 至 <= 原 end，实现闭区间 [start, end] 语义。
+
+    日K（1d/1w/1M）end 8 位 → end+1 自然日（datetime 计算）；分钟K end 8 位 →
+    end+1 日的 "000000"；分钟K end 14 位 → int+100（+1 分钟）；其余形态原样返回。
+    """
+    if len(end) == 8 and end.isdigit():
+        try:
+            next_day = (
+                datetime.strptime(end, "%Y%m%d") + timedelta(days=1)
+            ).strftime("%Y%m%d")
+        except ValueError:
+            return end
+        if frequency in _DAILY_KLINE_FREQUENCIES:
+            return next_day
+        return next_day + "000000"
+    if len(end) == 14 and end.isdigit():
+        return str(int(end) + 100)
+    return end
+
+
+def _row_date_within_end(date_value: object, end: str) -> bool:
+    """行 date 是否 <= 原 end（闭区间客户端过滤，字符串比较）。
+
+    8 位 end 与 14 位分钟行日期比较时取行日期前 8 位（当日任意分钟 bar 均属当日）。
+    """
+    if date_value is None:
+        return False
+    s = str(date_value)
+    if len(end) == 8:
+        return s[:8] <= end
+    return s <= end
+
+
 def _pybao_sdk_client() -> object | None:
     """pybao SDK client（可为 None）。pybao_tools 缺失时同样返回 None。"""
     if pybao_tools is None:
@@ -304,8 +348,12 @@ def _query_kline_via_sdk(
     对接 stock_sdk 真实接口 StockDBClient.get_data(code|codes, start, end,
     frequency, fields=None, fq, limit=None)：单码返回行列表，批量返回
     {code: rows}；复权/周月K 聚合由 SDK 内存完成；8 位日期在分钟频率下
-    由 SDK 自动补全为 14 位时间戳区间。返回 {"source", "code", "codes",
-    "frequency", "data", "total", "truncated"}；limit>0 时每码保留最新 limit 行。
+    由 SDK 自动补全为 14 位时间戳区间。SDK 区间为开区间（start<end 不含 end），
+    本函数用 _bump_end 顺延 end 后查询，再客户端过滤 rows <= 原 end，
+    对外统一为闭区间 [start, end] 语义。
+    返回 {"source", "code", "codes", "frequency", "fq", "price_unit",
+    "volume_unit", "amount_unit", "mode", "start", "end", "data", "total",
+    "truncated"}；limit>0 时每码保留最新 limit 行。
     """
     client = _pybao_sdk_client()
     if client is None:
@@ -315,11 +363,12 @@ def _query_kline_via_sdk(
         )
     target_codes = codes or ([code] if code else [])
     sdk_fq = None if fq in ("", "none") else fq
+    sdk_end = _bump_end(end, frequency) if end else None
     try:
         raw = client.get_data(
             target_codes[0] if len(target_codes) == 1 else target_codes,
             start=start or None,
-            end=end or None,
+            end=sdk_end,
             frequency=frequency,
             fields=None,
             fq=sdk_fq,
@@ -335,9 +384,19 @@ def _query_kline_via_sdk(
         per_code = {target_codes[0]: _normalize_rows(raw)}
     # 防御：单码查询时若 SDK 返回空 dict {}（而非空 list）导致 per_code 缺键，
     # 补齐空行列表，避免下方 per_code[target_codes[0]]/total_by_code 抛 KeyError
-    # 落入 tools/call 的 INTERNAL 兜底（真实 SDK 单码返回 list 不触发该分支）。
+    # 落入 tools/call 的 INTERNAL_ERROR 兜底（真实 SDK 单码返回 list 不触发该分支）。
     if len(target_codes) == 1 and target_codes[0] not in per_code:
         per_code[target_codes[0]] = []
+    # 闭区间语义：SDK 开区间已用 bumped end 查询，客户端按原 end 过滤（先于 fields
+    # 投影，保证 fields 不含 date 时仍能过滤）。
+    if end:
+        per_code = {
+            item: [
+                row for row in rows
+                if isinstance(row, dict) and _row_date_within_end(row.get("date"), end)
+            ]
+            for item, rows in per_code.items()
+        }
     # fields 投影（SDK 的 fields 参数返回二维值列表，这里统一客户端投影为 dict 行）
     if fields:
         keys = [k.strip() for k in fields.split(",")]
@@ -357,6 +416,13 @@ def _query_kline_via_sdk(
         "code": code or target_codes[0],
         "codes": codes,
         "frequency": frequency,
+        "fq": sdk_fq or "none",
+        "price_unit": "元",
+        "volume_unit": "股",
+        "amount_unit": "元",
+        "mode": "range" if end else "point",
+        "start": start,
+        "end": end,
         "data": per_code[target_codes[0]] if len(target_codes) == 1 else per_code,
         "total": (
             total_by_code[target_codes[0]]
@@ -397,7 +463,8 @@ def query_kline(args: dict) -> dict:
     - HTTP 路径：1d/5m/15m/30m/60m，走 free-stockdb HTTP API（无需 pybao）
     - pybao SDK 路径：fq 复权、1m/1w/1M 周期、批量 codes（需 pybao，不可用时报明确降级错误）
     参数非法时抛 ValueError（中文文案），由 _call_tool 转 isError。
-    返回 {"source", "code", "frequency", "data", "total", "truncated"}。
+    返回 {"source", "code", "frequency", "fq", "price_unit", "volume_unit",
+    "amount_unit", "mode", "start", "end", "data", "total", "truncated"}。
     """
     frequency = str(args.get("frequency", "1d") or "1d")
     fq = str(args.get("fq", "none") or "none").lower()
@@ -440,6 +507,13 @@ def query_kline(args: dict) -> dict:
         "source": "http",
         "code": code,
         "frequency": frequency,
+        "fq": "none",
+        "price_unit": "元",
+        "volume_unit": "股",
+        "amount_unit": "元",
+        "mode": "range" if end else "point",
+        "start": start,
+        "end": end,
         "data": kept,
         "total": total,
         "truncated": truncated,
@@ -619,7 +693,12 @@ def _latest_trade_date() -> str | None:
 
 
 def query_market_snapshot(date: str, codes: list[str]) -> object:
-    """指定交易日多只股票的单日行情。HTTP 层不支持 code 通配，逐只查询。"""
+    """指定交易日多只股票的单日行情。HTTP 层不支持 code 通配，逐只查询。
+
+    errors 元素为契约形态 {"code", "symbol", "message"}（code ∈ NO_DATA /
+    INTERNAL_ERROR）；结果键保持 {"results", ...} 并附加 "date"（供 envelope
+    known_at 派生）。
+    """
     results: list[dict] = []
     errors: list[dict] = []
     for code in codes:
@@ -632,10 +711,14 @@ def query_market_snapshot(date: str, codes: list[str]) -> object:
             if rows:
                 results.append(rows[0])
             else:
-                errors.append({"code": code, "error": "无数据"})
+                errors.append({
+                    "code": ERROR_NO_DATA, "symbol": code, "message": "无数据",
+                })
         except Exception as exc:  # noqa: BLE001 - 单只失败不影响整体
-            errors.append({"code": code, "error": str(exc)})
-    return {"results": results, "errors": errors}
+            errors.append({
+                "code": ERROR_INTERNAL_ERROR, "symbol": code, "message": str(exc),
+            })
+    return {"results": results, "errors": errors, "date": date}
 
 
 def _parse_yyyymmdd(value: str, *, field: str) -> datetime:
@@ -869,7 +952,7 @@ def get_trading_days(args: dict) -> dict:
 
     start 必填（8 位）；end 缺省 = start 后 90 个自然日；limit 为返回上限
     （硬上限 400，超出截断并标记 truncated）。参数非法抛中文 ValueError，
-    由 _call_tool 转 isError（code=PARAM_INVALID）。
+    由 _call_tool 转 isError（code=INVALID_ARGUMENT）。
     """
     start = str(args.get("start") or "")
     if len(start) != 8 or not start.isdigit():
@@ -921,6 +1004,217 @@ def get_data_status() -> dict:
     }
 
 
+# === get_point_snapshot（单日时点快照，纯 HTTP，无 pybao 依赖） ===
+
+_POINT_SNAPSHOT_CODES_MAX = 200  # codes 显式数量上限
+_POINT_SNAPSHOT_LIMIT_MAX = 200  # points 返回硬上限
+_POINT_SNAPSHOT_DEFAULT_LIMIT = 50
+
+_POINT_SNAPSHOT_KNOWN_LIMITATIONS = [
+    "日线级时点事实：开盘价为当日收盘同步后的值，无盘中 09:25 实时数据",
+    "单日 bar 缺失无法区分停牌与当日未上市/已退市（均标 SUSPENDED）",
+]
+
+
+def _a_share_universe_set() -> set[str]:
+    """全市场 A 股代码集合（query_stock_list 结果 TTL 缓存 300s）。"""
+    stock_list = query_stock_list()
+    return {
+        str(code) for code in (stock_list.get("codes") or [])
+        if is_supported_a_share_code(str(code))
+    }
+
+
+def _bar_from_get(data: object) -> dict | None:
+    """cmd=get 精确日K 响应 → 单日 bar dict（兼容单行 dict / {key: row} / [键, 行] 对），
+    无数据返回 None。"""
+    if isinstance(data, dict):
+        if "date" in data:
+            return data
+        for value in data.values():
+            if isinstance(value, dict):
+                return value
+        return None
+    if isinstance(data, list):
+        for item in data:
+            if isinstance(item, dict):
+                return item
+            if isinstance(item, list) and len(item) == 2 and isinstance(item[1], dict):
+                return item[1]
+        return None
+    return None
+
+
+def _point_snapshot_item(code: str, bar: dict) -> dict:
+    """TRADED 点的业务行：{code, name, status, open, prev_close, close, high, low,
+    volume, amount, is_st}。"""
+    return {
+        "code": code,
+        "name": bar.get("name") or "",
+        "status": "TRADED",
+        "open": bar.get("open"),
+        "prev_close": bar.get("pre_close"),
+        "close": bar.get("close"),
+        "high": bar.get("high"),
+        "low": bar.get("low"),
+        "volume": bar.get("volume"),
+        "amount": bar.get("amount"),
+        "is_st": bar.get("is_st"),
+    }
+
+
+def query_point_snapshot(args: dict) -> dict:
+    """指定交易日单日时点快照（纯 HTTP，无 pybao 依赖）。
+
+    date 缺省 = 最新交易日探针（无法确定 → NO_DATA）；非交易日 → INVALID_ARGUMENT
+    + hint 最近交易日。codes 显式（1-200，逐只顺序拉取）为调试语义；缺省 = 全市场
+    A 股（ThreadPoolExecutor(16) 并发）。每 code 取 日k:{code}:{date}：有 bar →
+    TRADED 进 points；无 bar 按 universe 归属 / 时点是否已发布 分类为
+    INVALID_SYMBOL / NOT_PUBLISHED / SUSPENDED（分类与失败进 errors，上限 100 条）。
+    返回 {"source", "date", "points", "truncated", "coverage", "errors",
+    "known_limitations"}；envelope known_at = date。
+    """
+    date = str(args.get("date") or "")
+    if not date:
+        date = _latest_trade_date() or ""
+        if not date:
+            raise _ToolError(
+                "get_point_snapshot: 无法确定最新交易日，请显式传 date", ERROR_NO_DATA
+            )
+    if len(date) != 8 or not date.isdigit():
+        raise ValueError("get_point_snapshot: date 必须是 8 位日期 YYYYMMDD")
+    try:
+        trading = calendar_xshg.is_trading_day(date)
+    except ValueError:  # 防御：日历模块对异常日期抛错
+        trading = False
+    if not trading:
+        nearest = calendar_xshg.nearest_trading_day(date)
+        raise _ToolError(
+            f"get_point_snapshot: {date} 非交易日",
+            ERROR_INVALID_ARGUMENT,
+            hint=(f"最近交易日 {nearest}" if nearest else None),
+        )
+
+    raw_codes = args.get("codes")
+    explicit = raw_codes is not None
+    if explicit:
+        if not isinstance(raw_codes, list):
+            raise ValueError("get_point_snapshot: codes 必须为数组")
+        if not 1 <= len(raw_codes) <= _POINT_SNAPSHOT_CODES_MAX:
+            raise ValueError(
+                f"get_point_snapshot: codes 数量必须为 1-200，当前 {len(raw_codes)} 个"
+            )
+        requested: list[str] = []
+        for item in raw_codes:
+            code = str(item).strip()
+            if len(code) != 6 or not code.isdigit():
+                raise ValueError(
+                    f"get_point_snapshot: 股票代码 {item!r} 必须是 6 位数字"
+                )
+            requested.append(code)
+    else:
+        requested = sorted(_a_share_universe_set())
+
+    try:
+        limit = int(
+            args.get("limit", _POINT_SNAPSHOT_DEFAULT_LIMIT)
+            or _POINT_SNAPSHOT_DEFAULT_LIMIT
+        )
+    except (TypeError, ValueError):
+        raise ValueError("get_point_snapshot: limit 必须是整数") from None
+    if limit < 1:
+        raise ValueError("get_point_snapshot: limit 必须是正整数")
+    limit = min(limit, _POINT_SNAPSHOT_LIMIT_MAX)
+
+    universe_set = _a_share_universe_set()
+    latest = _latest_trade_date()
+
+    def fetch_one(code: str) -> tuple[str, dict | None, str | None]:
+        try:
+            return code, _bar_from_get(_http_get("get", f"日k:{code}:{date}")), None
+        except Exception as exc:  # noqa: BLE001 - 单只失败保留诊断，不影响整体
+            return code, None, str(exc)
+
+    if explicit:
+        outcomes = [fetch_one(code) for code in requested]
+    else:
+        outcomes = []
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            futures = {pool.submit(fetch_one, code): code for code in requested}
+            for future in as_completed(futures):
+                outcomes.append(future.result())
+
+    points: list[dict] = []
+    errors: list[dict] = []
+    traded = suspended = invalid_symbol = not_published = failed = 0
+    for code, bar, error in outcomes:
+        if error is not None:
+            failed += 1
+            errors.append({
+                "code": ERROR_INTERNAL_ERROR, "symbol": code, "message": error,
+            })
+            continue
+        if bar is not None:
+            traded += 1
+            points.append(_point_snapshot_item(code, bar))
+            continue
+        # 无 bar 分类：不在股票池 → INVALID_SYMBOL；时点晚于最新交易日 → NOT_PUBLISHED；
+        # 其余 → SUSPENDED（单日 bar 无法进一步区分）
+        if code not in universe_set:
+            invalid_symbol += 1
+            errors.append({
+                "code": ERROR_INVALID_SYMBOL, "symbol": code,
+                "message": "代码不在股票池",
+            })
+        elif latest is not None and date > latest:
+            not_published += 1
+            errors.append({
+                "code": ERROR_NOT_PUBLISHED, "symbol": code,
+                "message": "该时点数据尚未入库/尚未发布",
+            })
+        else:
+            suspended += 1
+            errors.append({
+                "code": ERROR_NO_DATA, "symbol": code,
+                "message": "交易日无 bar（停牌/未上市/退市，单日 bar 无法进一步区分）",
+            })
+
+    truncated = len(points) > limit
+    kept = points[:limit] if truncated else points
+
+    partial_reasons: list[str] = []
+    if explicit:
+        partial_reasons.append("EXPLICIT_CODES_DEBUG")
+    if truncated:
+        partial_reasons.append("LIMIT_APPLIED")
+    if failed:
+        partial_reasons.append("SOURCE_REQUEST_FAILED")
+    full_scope = set(requested) == universe_set and len(requested) == len(universe_set)
+    formal_usable = full_scope and failed == 0 and not truncated
+
+    coverage = {
+        "universe": len(universe_set),
+        "requested": len(requested),
+        "traded": traded,
+        "suspended": suspended,
+        "invalid_symbol": invalid_symbol,
+        "not_published": not_published,
+        "failed": failed,
+        "formal_usable": formal_usable,
+        "partial_reasons": partial_reasons,
+    }
+    return {
+        "source": "http",
+        "date": date,
+        "points": kept,
+        "truncated": truncated,
+        "is_partial": bool(partial_reasons),
+        "coverage": coverage,
+        "errors": errors[:100],
+        "known_limitations": list(_POINT_SNAPSHOT_KNOWN_LIMITATIONS),
+    }
+
+
 # === MCP 工具定义 ===
 
 
@@ -964,7 +1258,7 @@ TOOLS: list[dict] = [
                     "type": "string",
                     "description": "日K：8位起始日期(如 20260620)；分钟K：14位时间戳(如 20260625145200)",
                 },
-                "end": {"type": "string", "description": "日K 结束日期(可选，与 start 构成开区间 start<end)"},
+                "end": {"type": "string", "description": "日K 结束日期(可选；与 start 构成闭区间 [start, end]，含端点)"},
                 "fields": {"type": "string", "description": "投影字段，逗号分隔（可选）"},
             },
             "required": [],
@@ -1297,6 +1591,37 @@ TOOLS: list[dict] = [
         ),
         "inputSchema": {"type": "object", "properties": {}},
     },
+    {
+        "name": "get_point_snapshot",
+        "description": (
+            "获取指定交易日全市场/指定股票池的单日时点快照：每只股票返回 开盘/前收/收盘/"
+            "最高/最低/量额/is_st 及状态分类（TRADED/SUSPENDED/INVALID_SYMBOL/NOT_PUBLISHED）"
+            "与覆盖率 coverage。纯 HTTP，无 pybao 依赖。date 缺省=最新交易日（无法确定或非交易日"
+            "报错）；codes 缺省=全市场 A 股（16 线程并发），显式传入（1-200，顺序逐只）为调试语义"
+            "（is_partial=true）；limit 为 points 返回上限（默认 50，硬上限 200，超出截断）。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "date": {
+                    "type": "string",
+                    "description": "时点日期 8 位 YYYYMMDD（缺省=最新交易日自动探测）",
+                },
+                "codes": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "股票代码列表 1-200 个（每项 6 位数字）；缺省=全市场 A 股",
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "points 返回上限（默认 50，硬上限 200，超出截断并标记 truncated）",
+                    "default": 50,
+                },
+            },
+            "required": [],
+        },
+    },
 ]
 
 
@@ -1366,16 +1691,16 @@ class _ToolError(ValueError):
 
 
 def _resolve_error(message: str, code: object, hint: object) -> tuple[str, str | None]:
-    """错误码解析：显式 code 优先；缺省按文案推断（pybao 不可用→PYBAO_UNAVAILABLE 等）。"""
+    """错误码解析：显式 code 优先；缺省按文案推断（pybao 不可用→DEPENDENCY_UNAVAILABLE 等）。"""
     if isinstance(code, str) and code:
         return code, (hint if isinstance(hint, str) and hint else None)
     if "pybao 不可用" in message:
-        return ERROR_PYBAO_UNAVAILABLE, (
+        return ERROR_DEPENDENCY_UNAVAILABLE, (
             hint if isinstance(hint, str) and hint else _PYBAO_HINT
         )
     if any(marker in message for marker in _INTERNAL_ERROR_MARKERS):
-        return ERROR_INTERNAL, (hint if isinstance(hint, str) and hint else None)
-    return ERROR_PARAM_INVALID, (hint if isinstance(hint, str) and hint else None)
+        return ERROR_INTERNAL_ERROR, (hint if isinstance(hint, str) and hint else None)
+    return ERROR_INVALID_ARGUMENT, (hint if isinstance(hint, str) and hint else None)
 
 
 def _pybao_outcome_error(outcome: dict) -> dict:
@@ -1395,18 +1720,153 @@ def _value_error_result(exc: ValueError) -> dict:
 
 
 def _pybao_tool_missing_error(tool_name: str) -> dict:
-    """pybao_tools 模块整体缺失时的明确降级错误（code=PYBAO_UNAVAILABLE + hint）。"""
+    """pybao_tools 模块整体缺失时的明确降级错误（code=DEPENDENCY_UNAVAILABLE + hint）。"""
     return _error_result(
-        f"{tool_name}: pybao 工具模块不可用", ERROR_PYBAO_UNAVAILABLE, hint=_PYBAO_HINT
+        f"{tool_name}: pybao 工具模块不可用",
+        ERROR_DEPENDENCY_UNAVAILABLE,
+        hint=_PYBAO_HINT,
     )
+
+
+# === 响应 envelope（数据契约规范化：8 键恒在，全部工具成功结果必须包含） ===
+# source/source_contract_version 按工具族注入；known_at 为数据内容覆盖的最后时点
+# （日线 8 位、分钟 14 位；静态数据 null）；is_partial/truncated/total/errors/
+# known_limitations 已有则保留，否则按规则补默认。
+
+_CONTRACT_BY_TOOL: dict[str, tuple[str | None, str]] = {
+    "get_stock_list": ("http", "stock-list-v1"),
+    "get_adjust_factors": ("http", "adjust-factors-v1"),
+    "get_kline": (None, "kline-v2"),  # source 取 result（http/pybao 双路径）
+    "get_market_snapshot": ("http", "market-snapshot-v1"),
+    "get_board_open_effect_history": ("http", "board-open-effect-v1"),
+    "get_indicators": ("pybao", "indicators-v1"),
+    "get_board_members": ("pybao", "boards-v1"),
+    "screen_stocks": ("pybao", "screen-v1"),
+    "get_mydb_data": ("pybao", "mydb-v1"),
+    "get_trading_days": ("static", "calendar-v1"),
+    "get_data_status": ("http", "status-v1"),
+    "get_point_snapshot": ("http", "snapshot-v1"),
+}
+
+
+def _known_at_str(value: object) -> str | None:
+    """known_at 归一化：int/str 日期 → str，None/空 → None。"""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value if value else None
+    if isinstance(value, int):
+        return str(value)
+    return None
+
+
+def _max_date_in_data(data: object) -> str | None:
+    """data（行列表 / {code: 行} 批量 / 列式 {"dates": [...]}）中最大 date，int→str，
+    空 → None。"""
+    candidates: list[object] = []
+    if isinstance(data, list):
+        candidates = list(data)
+    elif isinstance(data, dict):
+        dates_col = data.get("dates")
+        if isinstance(dates_col, list):
+            candidates.extend({"date": d} for d in dates_col)
+        for value in data.values():
+            if isinstance(value, list):
+                candidates.extend(item for item in value if isinstance(item, dict))
+    max_date: int | None = None
+    for row in candidates:
+        if not isinstance(row, dict):
+            continue
+        try:
+            day = int(row.get("date"))
+        except (TypeError, ValueError):
+            continue
+        if max_date is None or day > max_date:
+            max_date = day
+    return None if max_date is None else str(max_date)
+
+
+def _derive_known_at(tool_name: str, result: dict) -> str | None:
+    """known_at 派生规则：get_kline/get_indicators → data 最大 date；screen_stocks /
+    get_market_snapshot / get_point_snapshot → date；get_data_status →
+    latest_trade_date；mydb 与其余静态工具 → null。"""
+    if tool_name in ("get_kline", "get_indicators"):
+        return _max_date_in_data(result.get("data"))
+    if tool_name in ("screen_stocks", "get_market_snapshot", "get_point_snapshot"):
+        return _known_at_str(result.get("date"))
+    if tool_name == "get_data_status":
+        return _known_at_str(result.get("latest_trade_date"))
+    return None
+
+
+def _row_count(value: object) -> int | None:
+    """数据单元行数：list → len；列式 dict → "dates" 列长度；其余 → None。"""
+    if isinstance(value, list):
+        return len(value)
+    if isinstance(value, dict):
+        dates = value.get("dates")
+        if isinstance(dates, list):
+            return len(dates)
+        return len(value)
+    return None
+
+
+def _derive_total(result: dict) -> object:
+    """total 兜底：按 data 行数（list → len；dict 批量 → {"code": n}；无 data → null）。"""
+    data = result.get("data")
+    if isinstance(data, list):
+        return len(data)
+    if isinstance(data, dict):
+        return {str(key): _row_count(value) for key, value in data.items()}
+    return None
+
+
+def _is_contract_errors(errors: object) -> bool:
+    """errors 元素均为 {"code","symbol","message"} 形态才保留，否则 envelope 置 []。"""
+    if not isinstance(errors, list):
+        return False
+    for item in errors:
+        if not isinstance(item, dict):
+            return False
+        if not all(key in item for key in ("code", "symbol", "message")):
+            return False
+    return True
+
+
+def _apply_contract(tool_name: str, result: object) -> dict:
+    """成功结果注入统一 envelope（8 键恒在）：list 结果（如 get_adjust_factors）先包
+    {"data": result} 再注入；时间/覆盖率/部分性/失败原因成为一等字段。"""
+    if isinstance(result, list):
+        result = {"data": result}
+    if not isinstance(result, dict):
+        result = {"data": result}
+    family_source, contract_version = _CONTRACT_BY_TOOL.get(tool_name, (None, None))
+    source = result.get("source") or family_source or "http"
+    out = {
+        "source": str(source),
+        "source_contract_version": contract_version or "unknown-v0",
+        "known_at": _derive_known_at(tool_name, result),
+        "is_partial": bool(result.get("is_partial", False)),
+        "truncated": bool(result.get("truncated", False)),
+        "total": result.get("total", _derive_total(result)),
+        "errors": (
+            result.get("errors") if _is_contract_errors(result.get("errors")) else []
+        ),
+        "known_limitations": list(result.get("known_limitations") or []),
+    }
+    for key, value in result.items():
+        if key not in out:
+            out[key] = value
+    return out
 
 
 def _call_tool(name: str, args: dict) -> dict:
     """Dispatch a tools/call request to a handler. Returns MCP result dict.
 
     所有 isError 分支按统一错误码契约返回 content={"error", "code"(, "hint")}：
-    参数类 PARAM_INVALID；pybao 相关 PYBAO_UNAVAILABLE（带 hint）；未知工具
-    UNKNOWN_TOOL；其余 INTERNAL；pybao_tools outcome 的 code/hint 直接透传。
+    参数类与未知工具 INVALID_ARGUMENT；pybao 相关 DEPENDENCY_UNAVAILABLE（带 hint）；
+    其余 INTERNAL_ERROR；pybao_tools outcome 的 code/hint 直接透传。
+    成功分支统一经 _apply_contract 注入 8 键 envelope。
     """
     if name == "get_kline":
         try:
@@ -1421,22 +1881,22 @@ def _call_tool(name: str, args: dict) -> dict:
         codes = args.get("codes") or []
         if not isinstance(codes, list):
             return _error_result(
-                "get_market_snapshot: codes 必须为数组", ERROR_PARAM_INVALID
+                "get_market_snapshot: codes 必须为数组", ERROR_INVALID_ARGUMENT
             )
         date = str(args.get("date") or "")
         if not date:
-            # date 缺省 = 最新交易日探针；探针失败（无法确定）时报 DATA_NOT_FOUND
+            # date 缺省 = 最新交易日探针；探针失败（无法确定）时报 NO_DATA
             date = _latest_trade_date() or ""
             if not date:
                 return _error_result(
-                    "无法确定最新交易日，请显式传 date", ERROR_DATA_NOT_FOUND
+                    "无法确定最新交易日，请显式传 date", ERROR_NO_DATA
                 )
         result = query_market_snapshot(date, [str(c) for c in codes])
     elif name == "get_board_open_effect_history":
         codes = args.get("codes")
         if codes is not None and not isinstance(codes, list):
             return _error_result(
-                "get_board_open_effect_history: codes 必须为数组", ERROR_PARAM_INVALID
+                "get_board_open_effect_history: codes 必须为数组", ERROR_INVALID_ARGUMENT
             )
         try:
             result = query_board_open_effect_history(
@@ -1484,9 +1944,20 @@ def _call_tool(name: str, args: dict) -> dict:
             return _value_error_result(exc)
     elif name == "get_data_status":
         result = get_data_status()
+    elif name == "get_point_snapshot":
+        try:
+            result = query_point_snapshot(args)
+        except ValueError as exc:
+            return _value_error_result(exc)
     else:
-        return _error_result(f"未知工具: {name}", ERROR_UNKNOWN_TOOL)
-    return {"content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False)}]}
+        # 未知工具同样按 INVALID_ARGUMENT（契约：未知工具 = 参数非法）
+        return _error_result(f"未知工具: {name}", ERROR_INVALID_ARGUMENT)
+    return {
+        "content": [{
+            "type": "text",
+            "text": json.dumps(_apply_contract(name, result), ensure_ascii=False),
+        }],
+    }
 
 
 def _log_tool_call(tool: str, result: dict, elapsed_ms: int) -> None:
@@ -1568,7 +2039,7 @@ def _handle_request(msg: dict) -> dict:
         try:
             result = _call_tool(str(tool_name), arguments)
         except Exception as exc:  # noqa: BLE001 - 工具异常转为 MCP 错误响应
-            result = _error_result(str(exc), ERROR_INTERNAL)
+            result = _error_result(str(exc), ERROR_INTERNAL_ERROR)
         _log_tool_call(str(tool_name), result, int((time.monotonic() - started) * 1000))
         return {"jsonrpc": "2.0", "id": request_id, "result": result}
     else:
