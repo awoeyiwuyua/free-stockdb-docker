@@ -586,6 +586,32 @@ class MXClientTest(unittest.TestCase):
     def _respond(self, status, body):
         _MockMXHandler.responses.append((status, body))
 
+    # ---------------- 默认 base / 成功码字符串 / 114（联调实测校准） ----------------
+    def test_default_base_full_finskillshub(self):
+        """默认 base 必须完整（截断到 finskill 会打到错误路径被网关 403）。"""
+        self.assertTrue(MXClient()._base_url.endswith("finskillshub"))
+
+    def test_parse_success_string_code_200(self):
+        """真实接口成功响应 code 为字符串 "200"（而非 int 0/200）→ 应透传不抛。"""
+        client = self._client()
+        body = {"code": "200", "message": "成功", "data": {"totalAssets": 200000.0}}
+        out = client._parse_response(200, json.dumps(body).encode("utf-8"))
+        self.assertEqual(out["data"]["totalAssets"], 200000.0)
+
+    def test_parse_business_114_key_invalid(self):
+        """业务码 114（密钥不存在/失效）→ DEPENDENCY_UNAVAILABLE。"""
+        client = self._client()
+        body = {"success": False, "status": 114, "code": 114, "message": "API密钥不存在或已失效"}
+        with self.assertRaises(MXError) as ctx:
+            client._parse_response(200, json.dumps(body).encode("utf-8"))
+        self.assertEqual(ctx.exception.code, "DEPENDENCY_UNAVAILABLE")
+
+    def test_is_rate_limited_string_code(self):
+        """频率限制码 int/str 兼容。"""
+        client = self._client()
+        self.assertTrue(client._is_rate_limited({"code": 113}))
+        self.assertTrue(client._is_rate_limited({"code": "113"}))
+
     # ---------------- 成功路径 ----------------
     def test_mx_success_payload_and_header(self):
         """成功：place_order market payload 结构 + apikey 请求头透传。"""
