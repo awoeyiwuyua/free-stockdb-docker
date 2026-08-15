@@ -941,6 +941,22 @@ class _AuctionBackfillTests(_OpsTestCase):
         self.assertFalse(app._auction_backfill_state["running"])
         self.assertEqual(app._auction_backfill_state["result"]["backfilled_days"], 3)
 
+    def test_points_for_codes_chunks_at_200(self):
+        """清单 >200 只时分块拉取：每批 ≤200，合并去重。"""
+        captured = []
+
+        def fake_snapshot_capture(args):
+            captured.append(list(args.get("codes") or []))
+            return {"points": [{"code": c} for c in (args.get("codes") or [])]}
+
+        with mock.patch.object(app, "_auction_query_snapshot", side_effect=fake_snapshot_capture):
+            pts = app._auction_points_for_codes(
+                "20260814", [f"{600000 + i}" for i in range(250)])
+        self.assertEqual(len(captured), 2)
+        self.assertEqual(len(captured[0]), 200)
+        self.assertEqual(len(captured[1]), 50)
+        self.assertEqual(len(pts), 250)
+
     def test_backfill_guard_single_flight(self):
         """回填进行中再触发 → 拒绝并返回进行中提示（防并发两份重扫描）。"""
         app._auction_backfill_state.update(running=True, started="2026-08-15T00:00:00")
