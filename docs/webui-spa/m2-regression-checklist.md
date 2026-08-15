@@ -43,6 +43,8 @@
 
 ## 模拟盘 `/paper`
 
+> ⚠️ **0.8.0 已移除**：用户拍板砍掉整个模拟盘，本节验收项不再适用。
+
 - [ ] 状态卡 `GET /api/paper/status`（configured / trading_enabled / paused / engine_available / masked_key / next_runs / scheduler_alive / modules_ok / reason 降级文案）
 - [ ] 暂停/恢复 `POST /api/paper/pause`
 - [ ] 手动单步 `POST /api/paper/run-now`（7 时点选择器，数据/交易时点分组提示）
@@ -56,11 +58,15 @@
 
 ## 审计报告 `/paper/audit`（**legacy 无 UI，M2 补位**）
 
+> ⚠️ **0.8.0 已移除**：模拟盘整体下线，本节验收项不再适用。
+
 - [ ] `GET /api/paper/audit` 全字段渲染：replay_mismatches / duplicate_intents / illegal_transitions / slippage（统计 + 明细行）
 - [ ] 净值 vs 基准双曲线（nav_series + benchmark_series，ECharts 双序列）
 - [ ] 空库 / 数据库缺失降级态（全 0 / [] 不抛错）
 
 ## 信号体检 `/paper/signal`（**legacy 无 UI，M2 补位**）
+
+> ⚠️ **0.8.0 已移除**：模拟盘整体下线，本节验收项不再适用。
 
 - [ ] `GET /api/paper/signal-status`：exists / parsed / error / fields 摘要
 - [ ] 7 项 checks 逐项渲染（history_count / current_rank / metric_value / formal_usable / contract_supported / known_at / previous_rank），通过/失败色区分

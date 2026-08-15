@@ -1,8 +1,8 @@
 <template>
-  <!-- ═══════════════ 总览页（Phase 5.1 LuCI 驾驶舱版）：5 指标卡 + 4 紧凑区块卡 ═══════════════
+  <!-- ═══════════════ 总览页（Phase 5.1 LuCI 驾驶舱版 → 0.8.0 收敛版）：4 指标卡 + 2 紧凑区块卡 ═══════════════
        学习点：
-       1) 全局数据（健康/告警/模拟盘/MCP/版本）全部读 Pinia store —— App 层已做 30s 轮询，
-          本页只为两个独立数据源自管轮询：情绪投递 getSignalStatus()、版本 getVersion()。
+       1) 全局数据（健康/告警/MCP/版本）全部读 Pinia store —— App 层已做 30s 轮询，
+          本页只为一个独立数据源自管轮询：版本 getVersion()（0.8.0 已移除模拟盘/情绪投递）。
        2) 三态齐备：总览 null 未出错 → 骨架屏；出错 → ElAlert + 错误空态；有数据 → 正常渲染。
        3) 密度哲学：StatCard 网格 minmax(180px,1fr)、卡片内边距 12-14px、标题行紧凑。 -->
   <div class="overview-page">
@@ -14,7 +14,7 @@
           最近刷新 {{ store.lastRefresh ? hhmmss(store.lastRefresh) : '等待首次刷新' }}
         </span>
       </div>
-      <!-- 手动刷新：总览 store + 情绪信号 + 版本，三个数据源一起刷 -->
+      <!-- 手动刷新：总览 store + 版本，两个数据源一起刷 -->
       <el-button type="primary" :icon="Refresh" :loading="refreshing" size="small" @click="onRefresh">
         刷新
       </el-button>
@@ -33,12 +33,12 @@
     <!-- ── 加载态：首次数据还没回来（overview 为 null 且无报错）→ 骨架屏 ── -->
     <template v-if="store.overview === null && !store.error">
       <div class="stat-grid">
-        <div v-for="i in 5" :key="i" class="sk-card">
+        <div v-for="i in 4" :key="i" class="sk-card">
           <el-skeleton animated :rows="2" />
         </div>
       </div>
       <div class="cards-grid">
-        <div v-for="i in 4" :key="'c' + i" class="sk-card">
+        <div v-for="i in 2" :key="'c' + i" class="sk-card">
           <el-skeleton animated :rows="5" />
         </div>
       </div>
@@ -56,64 +56,16 @@
 
     <!-- ── 正常内容（数据到位后渲染） ── -->
     <template v-else>
-      <!-- ① 第一行：5 张指标卡（值行更紧凑，样式用 :deep 压缩 StatCard） -->
+      <!-- ① 第一行：4 张指标卡（值行更紧凑，样式用 :deep 压缩 StatCard） -->
       <div class="stat-grid">
         <StatCard label="数据最新" :value="dataLatestValue" :sub="dataLatestSub" :tone="dataLatestTone" />
         <StatCard label="告警" :value="alertCountValue" :sub="alertCountSub" :tone="alertCountTone" />
-        <StatCard label="模拟盘" :value="paperStateText" :sub="paperStateSub" :tone="paperStateTone" />
         <StatCard label="MCP 成功率" :value="mcpRateValue" :sub="mcpRateSub" tone="ok" />
         <StatCard label="面板版本" :value="versionValue" :sub="versionSub" :tone="versionTone" />
       </div>
 
-      <!-- ② 区块卡：4 张紧凑卡（模拟盘进度 / 告警 / 情绪投递 / 版本） -->
+      <!-- ② 区块卡：2 张紧凑卡（告警 / 版本） -->
       <div class="cards-grid">
-        <!-- 模拟盘今日进度摘要：下一触发 + 完成计数 + 最后状态（完整时间轴已移至 /paper） -->
-        <section class="card">
-          <div class="card-head">
-            <h3 class="card-title">模拟盘今日进度</h3>
-          </div>
-
-          <!-- 总览接口未返回模拟盘块 → 降级空态 -->
-          <EmptyState
-            v-if="store.paper === null"
-            icon="Warning"
-            title="模拟盘数据不可用"
-            description="总览接口未返回模拟盘状态"
-          />
-          <template v-else-if="timeline.length">
-            <!-- 下一触发：next_runs[0]，形如 '20260815 09:27'，日期套 fmtYMD -->
-            <div class="kv-row">
-              <span class="kv-label">下一触发</span>
-              <el-tag size="small" type="info" effect="plain">{{ nextRunText }}</el-tag>
-            </div>
-
-            <!-- 完成/未完成计数：细进度条 + "已完成 x/y" 文案 -->
-            <div class="progress-row">
-              <el-progress
-                :percentage="progressPct"
-                :stroke-width="6"
-                :show-text="false"
-                class="progress-bar"
-              />
-              <span class="progress-text">已完成 {{ firedCount }}/{{ totalCount }}</span>
-            </div>
-
-            <!-- 最后状态：最后一个已触发时点的 label + 状态文案 -->
-            <p class="muted last-fired">{{ lastFiredText }}</p>
-          </template>
-          <!-- 时间轴为空（今日还没触发过）→ 空态 -->
-          <EmptyState
-            v-else
-            icon="Clock"
-            title="今日暂无进度"
-            description="调度尚未触发或模拟盘数据未生成"
-          />
-
-          <div class="card-foot">
-            <RouterLink to="/paper" class="foot-link">查看模拟盘 →</RouterLink>
-          </div>
-        </section>
-
         <!-- 告警摘要：只保留 count + 最近 3 条极简（完整列表移至 /ops/alerts） -->
         <section class="card">
           <div class="card-head">
@@ -136,28 +88,6 @@
 
           <div class="card-foot">
             <RouterLink to="/ops/alerts" class="foot-link">查看全部告警 →</RouterLink>
-          </div>
-        </section>
-
-        <!-- 情绪投递：只保留徽标（已投递/缺失/不合格 三元判断）+ 详情链接 -->
-        <section class="card">
-          <div class="card-head">
-            <h3 class="card-title">情绪投递</h3>
-            <!-- 三元判断：exists/parsed/all_ok → 已投递(绿) / 缺失(黄) / 不合格(红) / 接口异常(红) -->
-            <el-tag :type="signalOverall.tag" size="small" effect="dark">
-              {{ signalOverall.text }}
-            </el-tag>
-          </div>
-
-          <!-- 加载态：骨架 -->
-          <el-skeleton v-if="signalLoading && !signal" animated :rows="2" />
-          <!-- 接口异常：错误文案（不崩页面） -->
-          <p v-else-if="signalError && !signal" class="muted">信号体检接口不可用</p>
-          <!-- 正常/缺失/不合格：一行弱化说明（错误原因或交易日） -->
-          <p v-else class="muted signal-note">{{ signalNote }}</p>
-
-          <div class="card-foot">
-            <RouterLink to="/paper/signal" class="foot-link">信号体检详情 →</RouterLink>
           </div>
         </section>
 
@@ -228,11 +158,11 @@
 
 <script setup>
 // ============================================================
-// Overview.vue — 总览驾驶舱（Phase 5.1 瘦身版）。
+// Overview.vue — 总览驾驶舱（Phase 5.1 瘦身版 → 0.8.0 收敛版）。
 // 学习点：
 // 1) 页面的"总览数据"全部读全局 store（App 层已做 30s 轮询），页面自身不为它重复轮询；
-//    只有"情绪投递"与"版本"是两个独立数据源（/api/paper/signal-status、/api/version），
-//    由本页用一个 30s 定时器共同轮询，onUnmounted 必须清理。
+//    只有"版本"是独立数据源（/api/version），由本页用一个 30s 定时器轮询，
+//    onUnmounted 必须清理（0.8.0 已移除模拟盘/情绪投递两个数据源）。
 // 2) 所有展示字段都做防御（?. 与 || 兜底），后端某块降级为 null 时页面不崩、显示 '—'。
 // ============================================================
 import { ref, computed, onMounted, onUnmounted } from 'vue'
@@ -242,19 +172,18 @@ import { Refresh } from '@element-plus/icons-vue'
 import StatCard from '../components/StatCard.vue'
 import EmptyState from '../components/EmptyState.vue'
 import { fmtYMD } from '../utils/format.js'
-import { getSignalStatus } from '../api/paper.js'
 import { getVersion } from '../api/ops.js'
 import { useGlobalStore } from '../stores/global.js'
 
 const store = useGlobalStore()
 
-/* ═══════════════ 手动刷新（总览 + 信号 + 版本一起刷） ═══════════════ */
+/* ═══════════════ 手动刷新（总览 + 版本一起刷） ═══════════════ */
 const refreshing = ref(false)
 const onRefresh = async () => {
   refreshing.value = true
   // store.refresh() 内部已把异常写进 store.error，不会 throw；Promise.allSettled 保证
-  // 信号/版本刷新失败也不影响总览刷新。最后用 ElMessage 给"点按钮没反应"一个明确反馈。
-  await Promise.allSettled([store.refresh(), loadSignal(), loadVersion()])
+  // 版本刷新失败也不影响总览刷新。最后用 ElMessage 给"点按钮没反应"一个明确反馈。
+  await Promise.allSettled([store.refresh(), loadVersion()])
   refreshing.value = false
   if (store.error) ElMessage.warning(store.error)
 }
@@ -265,7 +194,7 @@ const hhmmss = (d) => {
   return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
 }
 
-/* ═══════════════ ① 第一行 5 张指标卡（数据均来自 store getters） ═══════════════ */
+/* ═══════════════ ① 第一行 4 张指标卡（数据均来自 store getters） ═══════════════ */
 // 数据最新：值 = 最新数据日期；tone 按滞后天数：≤1 ok / =2 warn / >2 err / 未知默认
 const dataLatestValue = computed(() => (store.health?.latest ? fmtYMD(store.health.latest) : '—'))
 const dataLatestTone = computed(() => {
@@ -286,30 +215,6 @@ const alertCountValue = computed(() => String(store.alertCount))
 const alertCountTone = computed(() => (store.alertCount > 0 ? 'err' : 'ok'))
 const alertCountSub = computed(() => (store.alertCount > 0 ? '有待处理告警' : '一切正常'))
 
-// 模拟盘：状态文案与顶栏同口径（交易开启=ok / 观察期=brand / 暂停=warn / 引擎缺失=err）
-const paperStateText = computed(() => {
-  const p = store.paper
-  if (!p || !p.modules_ok) return '不可用'
-  if (p.paused) return '已暂停'
-  if (p.trading_enabled) return '交易开启'
-  if (p.engine_available) return '观察期'
-  return '引擎缺失'
-})
-const paperStateTone = computed(() => {
-  const p = store.paper
-  if (!p || !p.modules_ok) return 'err'
-  if (p.paused) return 'warn'
-  if (p.trading_enabled) return 'ok'
-  if (p.engine_available) return 'brand'
-  return 'err'
-})
-const paperStateSub = computed(() => {
-  const p = store.paper
-  if (!p) return '状态未知'
-  if (!p.modules_ok) return p.reason || '模拟盘模块缺失'
-  return p.paused ? '暂停中，调度不会触发' : p.trading_enabled ? '调度已开启' : '观察期：只决策不下单'
-})
-
 // MCP 成功率：ok_rate 是 0~1 小数（如 0.9）→ ×100 转百分比；空窗口为 null → '—'
 const mcpRateValue = computed(() => {
   const ok = store.mcp?.ok_rate
@@ -329,33 +234,7 @@ const versionSub = computed(() => {
   return v.upstream?.tag_name ? '已是最新' : '上游暂不可用'
 })
 
-/* ═══════════════ ② 模拟盘今日进度摘要 ═══════════════ */
-// timeline：store.paper.timeline（8 个时点：09:25 信号发布 + 7 个触发时点）
-const timeline = computed(() => store.paper?.timeline ?? [])
-// 完成计数：fired=true 的时点数 / 总数
-const firedCount = computed(() => timeline.value.filter((x) => x.fired).length)
-const totalCount = computed(() => timeline.value.length)
-const progressPct = computed(() =>
-  totalCount.value ? Math.round((firedCount.value / totalCount.value) * 100) : 0)
-
-// 下一触发：next_runs[0] 形如 '20260815 09:27'，日期部分套 fmtYMD 展示
-const nextRunText = computed(() => {
-  const r = store.paper?.next_runs?.[0]
-  if (!r) return '今日无未来时点'
-  const [d, hm] = String(r).split(' ')
-  return hm ? `${fmtYMD(d)} ${hm}` : fmtYMD(String(r))
-})
-
-// 最后状态：取最后一个已触发的时点（label + 状态文案）
-const TIMELINE_TEXTS = { ok: '正常', warn: '告警', err: '异常', run: '已触发', wait: '待触发' }
-const lastFired = computed(() => [...timeline.value].reverse().find((x) => x.fired))
-const lastFiredText = computed(() => {
-  const x = lastFired.value
-  if (!x) return '今日尚未触发'
-  return `最后 ${x.label} · ${TIMELINE_TEXTS[x.state] || '已触发'}`
-})
-
-/* ═══════════════ ③ 告警摘要（count + 最近 3 条极简） ═══════════════ */
+/* ═══════════════ ② 告警摘要（count + 最近 3 条极简） ═══════════════ */
 // 后端告警字段是 {ts, level, source, message}；overview.alerts.recent 最多 8 条，这里只取 3
 const recent3 = computed(() => (store.overview?.alerts?.recent ?? []).slice(0, 3))
 const alertColor = (level) => {
@@ -368,54 +247,7 @@ const alertColor = (level) => {
 // ts 是 ISO 本地时间（如 2026-08-15T09:30:00），截取 HH:MM，完整值放 title 悬浮
 const fmtHm = (ts) => String(ts || '').slice(11, 16) || '--:--'
 
-/* ═══════════════ ④ 情绪投递（只留徽标 + 一行说明，独立 30s 轮询） ═══════════════ */
-const signal = ref(null) // 最近一次成功的体检载荷
-const signalLoading = ref(false)
-const signalError = ref('')
-
-// 拉取一次信号体检；失败只写文案，不抛（轮询场景下异常不能让页面崩）
-const loadSignal = async () => {
-  signalLoading.value = true
-  try {
-    signal.value = await getSignalStatus()
-    signalError.value = ''
-  } catch (e) {
-    signalError.value = e?.message || '信号体检接口不可用'
-  } finally {
-    signalLoading.value = false
-  }
-}
-
-// 徽标三元判断（任务约定）：已投递 / 缺失 / 不合格（exists/parsed/all_ok）
-const signalAllOk = computed(() => {
-  const checks = Object.values(signal.value?.checks ?? {}).filter(Boolean)
-  return checks.length > 0 && checks.every((c) => c.ok === true)
-})
-const signalOverall = computed(() => {
-  if (signalError.value) return { tag: 'danger', text: '接口异常' }
-  const s = signal.value
-  if (!s) return { tag: 'info', text: '加载中' }
-  if (!s.exists) return { tag: 'warning', text: '缺失' }
-  if (!s.parsed || !signalAllOk.value) return { tag: 'danger', text: '不合格' }
-  return { tag: 'success', text: '已投递' }
-})
-
-// 徽标下方的一行弱化说明：失败时给原因，成功时给最近交易日
-const signalNote = computed(() => {
-  const s = signal.value
-  if (!s) return '等待信号体检数据…'
-  if (!s.exists) return s.error || '信号文件尚未生成'
-  if (!s.parsed) return s.error || '信号文件解析失败'
-  if (!signalAllOk.value) {
-    const fail = Object.values(s.checks || {}).find((c) => c && c.ok === false)
-    return fail?.reason || '部分校验未通过'
-  }
-  // 从 path（…/emotion/20260804.json）提取交易日日期
-  const m = (s.path || '').match(/(\d{8})\.json$/)
-  return `最近交易日 ${m ? fmtYMD(m[1]) : '—'} 已就绪`
-})
-
-/* ═══════════════ ⑤ 版本卡（并入原 OpsVersion 页，独立 getVersion() 30s 轮询） ═══════════════ */
+/* ═══════════════ ③ 版本卡（并入原 OpsVersion 页，独立 getVersion() 30s 轮询） ═══════════════ */
 const ver = ref(null)
 const verLoading = ref(false)
 const verError = ref('')
@@ -432,15 +264,13 @@ const loadVersion = async () => {
   }
 }
 
-/* ═══════════════ 轮询：信号 + 版本共用一个 30s 定时器 ═══════════════ */
+/* ═══════════════ 轮询：版本数据用 30s 定时器 ═══════════════ */
 let timer = null
 onMounted(() => {
-  loadSignal() // 进页面先各拉一次
-  loadVersion()
+  loadVersion() // 进页面先拉一次
   timer = setInterval(() => {
-    loadSignal()
     loadVersion()
-  }, 30_000) // 之后每 30s 一起刷新
+  }, 30_000) // 之后每 30s 刷新一次
 })
 onUnmounted(() => {
   if (timer) clearInterval(timer) // 离开页面清定时器，防泄漏
@@ -545,7 +375,7 @@ onUnmounted(() => {
   align-items: start; /* 卡片高度各自内容自适应，不强制拉伸 */
 }
 
-/* —— 模拟盘进度卡 —— */
+/* —— 版本卡键值行 —— */
 .kv-row {
   display: flex;
   align-items: center;
@@ -563,25 +393,6 @@ onUnmounted(() => {
 }
 .warn-text {
   color: var(--warn);
-}
-.progress-row {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-}
-.progress-bar {
-  flex: 1;
-  min-width: 60px;
-}
-.progress-text {
-  font-size: 12px;
-  color: var(--text);
-  font-variant-numeric: tabular-nums; /* 等宽数字：计数变化宽度不抖 */
-  flex-shrink: 0;
-}
-.last-fired {
-  margin: 0;
-  font-size: 12px;
 }
 
 /* —— 告警摘要卡 —— */
@@ -621,14 +432,6 @@ onUnmounted(() => {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap; /* 超长文案截断，完整内容悬浮显示 */
-}
-
-/* —— 情绪投递卡 —— */
-.signal-note {
-  margin: 0;
-  font-size: 12px;
-  line-height: 1.5;
-  word-break: break-all;
 }
 
 /* —— 卡片底部链接（顶到卡片底部，卡片高度不一也整齐） —— */

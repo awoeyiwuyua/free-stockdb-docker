@@ -3,6 +3,13 @@
 本项目面板版本号 = `WEBUI_VERSION`（`docker/webui/app.py`），镜像 tag 跟随上游引擎版本。
 发布纪律见 `docs/webui-spa/release-policy.md`；部署记录见 `docs/DEPLOYMENTS.md`。
 
+## [0.8.0] — 2026-08-15（移除模拟盘：数据基座收敛）
+- 用户拍板砍掉整个模拟盘：模拟盘模块（paper_core / paper_db / mx_client / paper_engine）移出镜像
+  （Dockerfile 删除对应 COPY 行）；模拟盘 / 审计 / 信号验收文档标注「0.8.0 已移除」
+- 并入 0.7.1 打包修复：auction 三模块（auction_collect / auction_metrics / auction_list）COPY 保留，
+  打板竞价采集链路完整不受影响
+- 原因：数据基座收敛——执行 / 研究移出基座，基座只保留「可信数据接口」（HTTP + MCP 12 只读工具）
+
 ## [0.7.1] — 2026-08-15（打包修复）
 - 修复：Dockerfile 遗漏 COPY auction_collect/auction_metrics/auction_list → 镜像内 ModuleNotFoundError
 - CI 加固：verify-pybao job 在镜像内同时 import 三个采集模块（打包缺口从源头拦截）

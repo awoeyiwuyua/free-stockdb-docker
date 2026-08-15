@@ -13,16 +13,6 @@
       </span>
     </div>
 
-    <!-- 模拟盘状态 -->
-    <RouterLink class="sb-item link" to="/paper">
-      <span class="sb-label">模拟盘</span>
-      <el-tag
-        :type="paperTag.type"
-        size="small"
-        effect="dark"
-      >{{ paperTag.text }}</el-tag>
-    </RouterLink>
-
     <!-- 告警红点 -->
     <RouterLink class="sb-item link" to="/ops/alerts">
       <span class="sb-label">告警</span>
@@ -81,16 +71,6 @@ const lagClass = computed(() => {
   if (lag <= 1) return 'ok'
   if (lag <= 2) return 'warn'
   return 'err'
-})
-
-// 模拟盘徽标：交易开启=成功色；暂停=警告；观察期=品牌色；引擎缺失=错误
-const paperTag = computed(() => {
-  const p = store.paper
-  if (!p || !p.modules_ok) return { type: 'danger', text: '不可用' }
-  if (p.paused) return { type: 'warning', text: '已暂停' }
-  if (p.trading_enabled) return { type: 'success', text: '交易开启' }
-  if (p.engine_available) return { type: 'primary', text: '观察期' }
-  return { type: 'danger', text: '引擎缺失' }
 })
 </script>
 

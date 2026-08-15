@@ -12,9 +12,8 @@ import { useGlobalStore } from './global.js'
 const payload = {
   health: { latest: 20260814, lag_days: 0 },
   alerts: { count: 3, recent: [] },
-  paper: { trading_enabled: false, paused: false, engine_available: true, modules_ok: true },
   mcp: { total: 10, ok_rate: 90.0 },
-  version: { webui: { version: '0.6.0' }, stale: false },
+  version: { webui: { version: '0.8.0' }, stale: false },
 }
 
 // 造一个"长得很像 Response"的对象：http.js 只用到 ok / status / text 三个属性
