@@ -79,7 +79,7 @@ _last_verify_result: str | None = None  # 最近一次完整性验证结果（pa
 _scheduler_alive = False             # 定时线程心跳（每次循环更新时间戳）
 _scheduler_heartbeat = 0.0           # 定时线程最近一次心跳时间戳（unix）
 _webui_started = time.time()         # webui 进程启动时间戳
-WEBUI_VERSION = "0.8.9"
+WEBUI_VERSION = "0.8.10"
 
 HISTORY_FILE = DATA_DIR / "sync_history.json"
 SCHEDULE_FILE = DATA_DIR / "sync_schedule.json"
@@ -505,12 +505,47 @@ def _mydb_import():
     raise ImportError("pybao 写库不可用（PYTHONPATH 未注入或平台不兼容）")
 
 
+_rd_lock = threading.Lock()  # pybao rd 单连接非线程安全：全部 rd 读写持锁串行化（0.8.10）
+# 事故背景 2026-08-16：/api/data/* 与回填线程并发用同一 socket，协议帧交错 →
+# C 扩展阻塞持 GIL → 全进程冻结。锁保证同一时刻只有一条 rd 请求在线上。
+
+
+def _mydb_rd_reset():
+    """丢弃缓存的 rd 连接：调用失败后置空，下次调用重新 init（0.8.10 自愈楔死连接）。"""
+    _mydb_rd._rd = None
+
+
 def _mydb_rd():
     """获取连接 NAS stockdb 的 pybao 客户端（惰性、缓存）。"""
     if getattr(_mydb_rd, "_rd", None) is None:
         mod = _mydb_import()
         _mydb_rd._rd = mod.init(STOCKDB_HOST, int(STOCKDB_PORT), socket_timeout=5)
     return _mydb_rd._rd
+
+
+def _rd_to_py(v):
+    """pybao 返回值归一化（0.8.10 修复）：dict 原样；JSON 字符串解析；QueryResult 转 dict。
+
+    与 mcp._auction_value_to_dict 语义对齐：任何形态一律转 dict，失败按缺失处理——
+    旧实现转换失败原样返回 QueryResult，json.dumps 直接崩（"Object of type
+    QueryResult is not JSON serializable"，/api/data/read 实证）。
+    """
+    if v is None:
+        return None
+    if isinstance(v, dict):
+        return v
+    if isinstance(v, str):
+        try:
+            parsed = json.loads(v)
+        except ValueError:
+            return None
+        return parsed if isinstance(parsed, dict) else None
+    if hasattr(v, "keys") and hasattr(v, "all"):
+        try:  # pybao QueryResult：dict(value) 即原生数据
+            return dict(v)
+        except Exception:  # noqa: BLE001 - 转换失败按缺失处理
+            return None
+    return None
 
 
 def validate_custom_table(table: str) -> str:
@@ -531,61 +566,63 @@ def mydb_write(table: str, items: list[tuple], batch: bool = False) -> dict:
 
     注意：pybao 的 rd.set 返回 QueryResult，必须调用 .do() 才真正发送写入
     （否则只是客户端排队，读不到）。batch 参数保留兼容，统一逐条 .do()。
+    0.8.10：全程持 _rd_lock；任何 rd 异常 → 丢弃缓存连接（下次调用重连自愈）。
     """
     table = validate_custom_table(table)
     if not items:
         raise ValueError("没有可写入的数据")
-    rd = _mydb_rd()
-    result = []
-    for key, value in items:
-        result.append(rd.set(table, key, value).do())
-    # 回读校验（QueryResult 转原生）
-    readback = []
-    for key, _ in items:
+    with _rd_lock:
         try:
-            v = rd.get(table, key)
-            if hasattr(v, "keys") and hasattr(v, "all"):
-                v = dict(v)
-            readback.append(v)
+            rd = _mydb_rd()
+            result = []
+            for key, value in items:
+                result.append(rd.set(table, key, value).do())
+            # 回读校验（QueryResult 转原生）
+            readback = []
+            for key, _ in items:
+                try:
+                    readback.append(_rd_to_py(rd.get(table, key)))
+                except Exception:  # noqa: BLE001 - 单键回读失败按缺失
+                    readback.append(None)
+            return {"table": table, "written": len(items), "readback": readback, "result": result}
         except Exception:
-            readback.append(None)
-    return {"table": table, "written": len(items), "readback": readback, "result": result}
+            _mydb_rd_reset()
+            raise
 
 
 def mydb_read(table: str, key: str = "") -> dict:
-    """读取 mydb 自定义表。key 为空时列出表内全部键值。"""
+    """读取 mydb 自定义表。key 为空时列出表内全部键值。
+    0.8.10：持 _rd_lock；值统一 _rd_to_py 归一化；rd 异常 → 丢弃连接自愈。"""
     table = validate_custom_table(table)
-    rd = _mydb_rd()
-
-    def _to_py(v):
-        """pybao 返回值可能是 QueryResult，转原生 Python 对象。"""
-        if v is None:
-            return None
-        if hasattr(v, "keys") and hasattr(v, "all"):
-            try:
-                return dict(v)
-            except Exception:
-                pass
-        return v
-
-    if key:
-        val = _to_py(rd.get(table, key))
-        return {"table": table, "key": key, "value": val}
-    keys = rd.keys(table, "*") or []
-    values = {}
-    for k in keys:
-        date_str = str(k).split(":")[-1]
+    with _rd_lock:
         try:
-            values[str(k)] = _to_py(rd.get(table, date_str))
+            rd = _mydb_rd()
+            if key:
+                val = _rd_to_py(rd.get(table, key))
+                return {"table": table, "key": key, "value": val}
+            keys = rd.keys(table, "*") or []
+            values = {}
+            for k in keys:
+                date_str = str(k).split(":")[-1]
+                try:
+                    values[str(k)] = _rd_to_py(rd.get(table, date_str))
+                except Exception:  # noqa: BLE001 - 单键失败按缺失
+                    values[str(k)] = None
+            return {"table": table, "keys": keys, "values": values}
         except Exception:
-            values[str(k)] = None
-    return {"table": table, "keys": keys, "values": values}
+            _mydb_rd_reset()
+            raise
 
 
 def mydb_tables() -> list[str]:
-    """列出自定义表名（含保留表前缀过滤）。"""
-    rd = _mydb_rd()
-    keys = rd.keys("*")
+    """列出自定义表名（含保留表前缀过滤）。0.8.10：rd.keys 持锁 + 异常自愈。"""
+    with _rd_lock:
+        try:
+            rd = _mydb_rd()
+            keys = rd.keys("*") or []
+        except Exception:
+            _mydb_rd_reset()
+            raise
     tables = set()
     for k in keys:
         table = str(k).split(":")[0] if ":" in str(k) else str(k)
@@ -686,9 +723,14 @@ def hk_sync(codes: list[str], years: int = 2) -> dict:
                 if r["date"] >= cutoff:
                     items.append((str(r["date"]), val))
             items = items[-520 * years:]  # 兜底截断
-            rd = _mydb_rd()
-            for key, value in items:
-                rd.set(_HK_TABLE, code, key, value).do()  # .do() 真正发送写入
+            with _rd_lock:  # 0.8.10：rd 单连接串行化 + 失败自愈
+                try:
+                    rd = _mydb_rd()
+                    for key, value in items:
+                        rd.set(_HK_TABLE, code, key, value).do()  # .do() 真正发送写入
+                except Exception:
+                    _mydb_rd_reset()
+                    raise
             results[code] = {"ok": True, "bars": len(items),
                              "latest": max(r["date"] for r in rows)}
         except Exception as exc:
@@ -697,17 +739,19 @@ def hk_sync(codes: list[str], years: int = 2) -> dict:
 
 
 def hk_klines(code: str) -> list[dict]:
-    """读取 mydb hk日k: 表（升序）。value 内嵌 date，用 vals 全量读取。"""
+    """读取 mydb hk日k: 表（升序）。value 内嵌 date，用 vals 全量读取。
+    0.8.10：rd 读取持锁 + 失败自愈。"""
     code = _normalize_hk_code(code)
-    rd = _mydb_rd()
-    vals = rd.vals(_HK_TABLE, code, "*") or []
+    with _rd_lock:
+        try:
+            rd = _mydb_rd()
+            vals = rd.vals(_HK_TABLE, code, "*") or []
+        except Exception:
+            _mydb_rd_reset()
+            raise
     rows = []
     for v in vals:
-        if hasattr(v, "keys") and hasattr(v, "all"):
-            try:
-                v = dict(v)
-            except Exception:
-                v = None
+        v = _rd_to_py(v)
         if isinstance(v, dict) and v.get("date"):
             rows.append(v)
     rows.sort(key=lambda r: int(r["date"]))
@@ -1996,6 +2040,25 @@ def version_payload() -> dict:
     }
 
 
+def _process_rss_mb() -> int | None:
+    """进程常驻内存 MB（0.8.10 遥测：内存类事故可远程观察）。
+    Linux 读 /proc/self/statm；其他平台 resource 兜底。"""
+    try:
+        with open("/proc/self/statm", "r", encoding="ascii") as fh:
+            parts = fh.read().split()
+        if len(parts) >= 2:
+            page_kb = os.sysconf("SC_PAGE_SIZE") // 1024
+            return int(parts[1]) * page_kb // 1024
+    except Exception:  # noqa: BLE001 - 遥测失败降级 None
+        pass
+    try:
+        import resource
+        # Linux ru_maxrss 单位 KB；macOS 为字节。容器内恒走 /proc，此处仅兜底。
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1024
+    except Exception:  # noqa: BLE001
+        return None
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):  # 静默访问日志
         pass
@@ -2564,6 +2627,7 @@ class Handler(BaseHTTPRequestHandler):
             "uptime_seconds": int(time.time() - _webui_started),
             "data_dir": str(DATA_DIR),
             "data_latest": data_latest_date(),
+            "rss_mb": _process_rss_mb(),
         }
         self._send(200, json.dumps({
             "generated_at": datetime.now().isoformat(timespec="seconds"),

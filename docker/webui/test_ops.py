@@ -95,7 +95,172 @@ class _OpsTestCase(unittest.TestCase):
         app._mcp_loaded = False
         app._mcp_file_lines = 0
         app._RELEASE_CACHE.update(at=0.0, val=None)
+        app._mydb_rd._rd = None  # 0.8.10：rd 连接缓存复位（防用例间串扰）
         shutil.rmtree(self.tmp, ignore_errors=True)
+
+
+# =====================================================================
+# 0) mydb 读写链路（真实函数 + 假 rd）：归一化 / 串行化 / 失败自愈
+# =====================================================================
+class _FakeRd:
+    """最小 rd 替身：get/keys/set/do 计数 + 内存数据，可注入失败。"""
+
+    def __init__(self):
+        self.data = {}      # {(table, key): value}
+        self.calls = []     # [("get"|"keys"|"set", table, key_or_pattern)]
+
+    def get(self, table, key):
+        self.calls.append(("get", table, key))
+        v = self.data.get((table, key))
+        return v() if callable(v) else v
+
+    def keys(self, table, pattern="*"):
+        self.calls.append(("keys", table, pattern))
+        if table == "*":
+            return [f"{t}:{k}" for (t, k) in self.data]
+        return [f"{t}:{k}" for (t, k) in self.data if t == table]
+
+    def set(self, table, key, value):
+        self.calls.append(("set", table, key))
+        self.data[(table, key)] = value
+        return self  # 链式 .do()
+
+    def do(self):
+        return self
+
+
+class _QueryResultLike:
+    """pybao QueryResult 形态替身：带 keys/all 属性，dict(v) 可转换。"""
+
+    def __init__(self, d):
+        self._d = d
+
+    def keys(self):
+        return self._d.keys()
+
+    def all(self):
+        return None
+
+    def __getitem__(self, k):
+        return self._d[k]
+
+    def __iter__(self):
+        return iter(self._d.items())
+
+
+class _MydbRdTests(_OpsTestCase):
+    """mydb 读写：QueryResult/JSON 串归一化、并发串行化、失败丢弃连接自愈。"""
+
+    def test_read_queryresult_normalized(self):
+        """rd.get 返回 QueryResult 形态 → 读出原生 dict（不再序列化崩）。"""
+        rd = _FakeRd()
+        rd.data[("t", "k")] = _QueryResultLike({"metrics": {"a": 1}, "n": 2})
+        app._mydb_rd._rd = rd
+        self.addCleanup(app._mydb_rd_reset)
+        r = app.mydb_read("t", "k")
+        self.assertEqual(r["value"], {"metrics": {"a": 1}, "n": 2})
+
+    def test_read_json_string_parsed(self):
+        """rd.get 返回 JSON 字符串 → 解析为 dict（0.8.6 历史形态兼容）。"""
+        rd = _FakeRd()
+        rd.data[("t", "k")] = json.dumps({"v": [1, 2]})
+        app._mydb_rd._rd = rd
+        self.addCleanup(app._mydb_rd_reset)
+        self.assertEqual(app.mydb_read("t", "k")["value"], {"v": [1, 2]})
+
+    def test_read_nonjson_string_returns_none(self):
+        """非 JSON 字符串 → value None（不抛序列化错误，不返回裸对象）。"""
+        rd = _FakeRd()
+        rd.data[("t", "k")] = "not-json"
+        app._mydb_rd._rd = rd
+        self.addCleanup(app._mydb_rd_reset)
+        self.assertIsNone(app.mydb_read("t", "k")["value"])
+
+    def test_read_list_all_keys(self):
+        """key 缺省：列出表内全部键值，值为归一化 dict。"""
+        rd = _FakeRd()
+        rd.data[("t", "20260814")] = {"a": 1}
+        rd.data[("t", "20260815")] = _QueryResultLike({"b": 2})
+        rd.data[("t2", "x")] = {"c": 3}
+        app._mydb_rd._rd = rd
+        self.addCleanup(app._mydb_rd_reset)
+        r = app.mydb_read("t", "")
+        self.assertEqual(len(r["keys"]), 2)
+        self.assertEqual(r["values"], {"t:20260814": {"a": 1}, "t:20260815": {"b": 2}})
+
+    def test_write_readback_normalized(self):
+        """写入原生 dict → 回读校验逐键一致（0.8.6 存值类型契约）。"""
+        rd = _FakeRd()
+        app._mydb_rd._rd = rd
+        self.addCleanup(app._mydb_rd_reset)
+        r = app.mydb_write("t", [("k1", {"v": 1}), ("k2", {"v": 2})])
+        self.assertEqual(r["written"], 2)
+        self.assertEqual(r["readback"], [{"v": 1}, {"v": 2}])
+        self.assertEqual(rd.data[("t", "k1")], {"v": 1})
+
+    def test_concurrent_reads_serialized(self):
+        """多线程并发读 → 锁保证同一时刻至多一条 rd 请求（单连接防交错）。"""
+        active, max_active = [], [0]
+        guard = threading.Lock()
+        rd = _FakeRd()
+        rd.data[("t", "k")] = {"v": 1}
+
+        def slow_get(table, key):
+            with guard:
+                active.append(1)
+                max_active[0] = max(max_active[0], len(active))
+            time.sleep(0.02)
+            with guard:
+                active.pop()
+            return rd.data.get((table, key))
+
+        rd.get = slow_get
+        app._mydb_rd._rd = rd
+        self.addCleanup(app._mydb_rd_reset)
+        results = []
+
+        def worker():
+            results.append(app.mydb_read("t", "k")["value"])
+
+        threads = [threading.Thread(target=worker) for _ in range(4)]
+        for th in threads:
+            th.start()
+        for th in threads:
+            th.join()
+        self.assertEqual(max_active[0], 1)  # 全程串行
+        self.assertEqual(results, [{"v": 1}] * 4)
+
+    def test_failure_drops_connection_and_recovers(self):
+        """rd 调用异常 → 丢弃缓存连接；下一次调用重新 init 后恢复正常。"""
+        good = _FakeRd()
+        good.data[("t", "k")] = {"a": 1}
+        bad = _FakeRd()
+
+        def boom(table, key):
+            raise RuntimeError("socket wedged")
+
+        bad.get = boom
+        app._mydb_rd._rd = bad
+        with self.assertRaises(RuntimeError):
+            app.mydb_read("t", "k")
+        self.assertIsNone(app._mydb_rd._rd)  # 缓存已丢弃（自愈前提）
+        fake_mod = mock.Mock()
+        fake_mod.init.return_value = good
+        with mock.patch.object(app, "_mydb_import", return_value=fake_mod):
+            r = app.mydb_read("t", "k")
+        self.assertEqual(r["value"], {"a": 1})
+        self.addCleanup(app._mydb_rd_reset)
+
+    def test_hk_klines_serialized_and_normalized(self):
+        """hk_klines：vals 读取持锁 + QueryResult 归一化（0.8.10 纳入锁面）。"""
+        rd = _FakeRd()
+        rd.data[("hk日k", "00700")] = _QueryResultLike({"date": "20260814", "close": 1.5})
+        app._mydb_rd._rd = rd
+        self.addCleanup(app._mydb_rd_reset)
+        # _FakeRd 缺 vals：补一个返回列表的 vals
+        rd.vals = lambda table, code, pattern: [rd.data.get((table, code))]
+        rows = app.hk_klines("00700")
+        self.assertEqual(rows, [{"date": "20260814", "close": 1.5}])
 
 
 # =====================================================================
