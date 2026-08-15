@@ -13,6 +13,8 @@
 
 name: Build & Push stockdb images
 
+# 发布纪律（docs/webui-spa/release-policy.md）：镜像构建低频、仅手动触发。
+# 发布检查单通过后手动 Run workflow；tag v* 只作发布历史标记，不自动触发构建。
 on:
   workflow_dispatch:
     inputs:
@@ -20,11 +22,6 @@ on:
         description: '镜像版本号（必须与 docker/Dockerfile 的 ARG VERSION 一致）'
         required: false
         default: '0.3.1'
-  push:
-    tags:
-      - 'v*'
-    paths:
-      - 'docker/**'
 
 env:
   REGISTRY: ghcr.io
