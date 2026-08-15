@@ -1097,6 +1097,7 @@ class _DataLatestDateTests(_OpsTestCase):
     def setUp(self):
         super().setUp()
         app._latest_date_cache.update(at=0.0, val=None)
+        app._stockdb_breaker.update(fails=0, open_until=0.0)  # 熔断器全局态复位，防用例串扰
 
     def test_failure_result_is_cached(self):
         """探测失败（None）也缓存：8s 内不重复打 stockdb（此前失败不缓存会风暴重探）。"""
@@ -1147,6 +1148,67 @@ class _DataLatestDateTests(_OpsTestCase):
             second = app.data_latest_date()
         self.assertEqual(first, "20260814")
         self.assertEqual(second, "20260814")
+
+
+class _StockdbGateTests(_OpsTestCase):
+    """Phase 5.1 并发卫生：熔断器 + 信号量（stockdb 上游访问闸口）。"""
+
+    def setUp(self):
+        super().setUp()
+        app._stockdb_breaker.update(fails=0, open_until=0.0)
+        app._latest_date_cache.update(at=0.0, val=None)
+
+    def test_breaker_opens_after_failures(self):
+        """连续 threshold 次失败 → 熔断打开：后续探针快速降级、零 urlopen。"""
+        app._stockdb_breaker.update(threshold=2, cooldown=300.0)
+        with mock.patch("urllib.request.urlopen", side_effect=OSError("down")):
+            for _ in range(2):
+                with self.assertRaises(OSError):
+                    app.stockdb_fetch("/?cmd=get&t=x", timeout=1, breaker=True)
+        self.assertTrue(app._stockdb_breaker_open())
+        with mock.patch("urllib.request.urlopen") as m:
+            app.data_latest_date()  # 熔断中 → 直接返回缓存 None，不打网络
+        self.assertEqual(m.call_count, 0)
+
+    def test_breaker_recovers_after_cooldown(self):
+        """冷却期后熔断关闭：恢复探测。"""
+        app._stockdb_breaker.update(fails=3, open_until=time.time() + 300.0)
+        self.assertTrue(app._stockdb_breaker_open())
+        with mock.patch.object(app.time, "time", return_value=time.time() + 301.0):
+            self.assertFalse(app._stockdb_breaker_open())
+
+    def test_breaker_success_resets(self):
+        """探测成功 → 失败计数复位。"""
+        app._stockdb_breaker.update(fails=2, open_until=0.0)
+        resp = mock.MagicMock()
+        resp.__enter__ = mock.MagicMock(return_value=resp)
+        resp.__exit__ = mock.MagicMock(return_value=False)
+        resp.read.return_value = b"[]"
+        with mock.patch("urllib.request.urlopen", return_value=resp):
+            app.stockdb_fetch("/?cmd=vals&t=x", timeout=1, breaker=True)
+        self.assertEqual(app._stockdb_breaker["fails"], 0)
+        self.assertFalse(app._stockdb_breaker_open())
+
+    def test_semaphore_limits_concurrency(self):
+        """信号量满 → 立即 RuntimeError（不阻塞等待堆积线程）。"""
+        with mock.patch.object(app, "_stockdb_gate", threading.Semaphore(1)):
+            gate = app._stockdb_gate
+            gate.acquire()
+            try:
+                with self.assertRaises(RuntimeError):
+                    app.stockdb_fetch("/?cmd=get&t=x", timeout=1)
+            finally:
+                gate.release()
+
+    def test_diag_note_shows_gate_state(self):
+        """诊断的 stockdb_service 项注明闸口状态。"""
+        with mock.patch.object(app, "fetch_upstream_release", return_value=None), \
+             mock.patch.object(app, "paper_gate", return_value=(None, False, "offline")):
+            status, _, body = _do_get("/api/diag")
+        self.assertEqual(status, 200)
+        note = next(c["note"] for c in json.loads(body.decode())["checks"]
+                    if c["name"] == "stockdb_service")
+        self.assertIn("上游闸口", note)
 
 
 if __name__ == "__main__":

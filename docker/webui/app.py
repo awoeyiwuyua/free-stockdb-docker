@@ -79,7 +79,7 @@ _last_verify_result: str | None = None  # 最近一次完整性验证结果（pa
 _scheduler_alive = False             # 定时线程心跳（每次循环更新时间戳）
 _scheduler_heartbeat = 0.0           # 定时线程最近一次心跳时间戳（unix）
 _webui_started = time.time()         # webui 进程启动时间戳
-WEBUI_VERSION = "0.6.3"
+WEBUI_VERSION = "0.6.4"
 
 HISTORY_FILE = DATA_DIR / "sync_history.json"
 SCHEDULE_FILE = DATA_DIR / "sync_schedule.json"
@@ -412,12 +412,14 @@ def data_latest_date(force: bool = False) -> str | None:
     now = time.time()
     if not force and now - _latest_date_cache["at"] < 8:
         return _latest_date_cache["val"]  # 失败结果（None）同样缓存：stockdb 忙/挂时不重复打探
+    if _stockdb_breaker_open():
+        return _latest_date_cache["val"]  # 熔断中快速降级（冷却期后自动恢复探测）
     if not _latest_date_probe_lock.acquire(blocking=False):
         # 已有并发探测在跑（单飞）：立即返回缓存旧值（可能为 None），
         # 下一轮轮询自然拿到新值——避免多标签切换时 N 路同时打 4 个 10s 慢请求
         return _latest_date_cache["val"]
     try:
-        import urllib.request, urllib.parse
+        import urllib.parse
         from datetime import datetime as dt, timedelta
         today = dt.now()
         start = (today - timedelta(days=95)).strftime("%Y%m%d")
@@ -425,9 +427,8 @@ def data_latest_date(force: bool = False) -> str | None:
         dates = []
         for prefix in _month_prefixes(start, end):
             try:
-                url = f"http://{STOCKDB_HOST}:{STOCKDB_PORT}/?cmd=vals&t={urllib.parse.quote(f'日k:000001:{prefix}*')}"
-                with urllib.request.urlopen(url, timeout=10) as resp:
-                    rows = json.loads(resp.read().decode("utf-8", "replace"))
+                path = f"/?cmd=vals&t={urllib.parse.quote(f'日k:000001:{prefix}*')}"
+                rows = json.loads(stockdb_fetch(path, timeout=10, breaker=True))
                 for row in rows if isinstance(rows, list) else []:
                     if isinstance(row, dict) and row.get("date"):
                         dates.append(str(row["date"]))
@@ -722,12 +723,13 @@ def code_stats() -> dict:
     now = time.time()
     if _code_stats_cache["val"] is not None and now - _code_stats_cache["at"] < 15:
         return _code_stats_cache["val"]
-    import urllib.request, urllib.parse
+    if _stockdb_breaker_open():
+        return {"stock": None, "etf": None, "other": None, "latency_ms": None}  # 熔断快速降级
+    import urllib.parse
     t0 = time.time()
     try:
-        url = f"http://{STOCKDB_HOST}:{STOCKDB_PORT}/?cmd=get&t={urllib.parse.quote('股票代码')}"
-        with urllib.request.urlopen(url, timeout=15) as resp:
-            data = json.loads(resp.read().decode("utf-8", "replace"))
+        path = f"/?cmd=get&t={urllib.parse.quote('股票代码')}"
+        data = json.loads(stockdb_fetch(path, timeout=15, breaker=True))
         latency_ms = round((time.time() - t0) * 1000)
         codes: list[str] = []
         if isinstance(data, dict):
@@ -750,6 +752,50 @@ _latest_date_probe_lock = threading.Lock()  # 单飞锁：并发缓存失效时�
 _code_stats_cache: dict = {"at": 0.0, "val": None}   # 15 秒缓存：全市场代码列表 GET 较贵
 _container_state_cache: dict = {"at": 0.0, "val": None}  # 5 秒缓存：stockdb 进程探测
 
+# ==================== stockdb 上游访问治理（并发卫生三件套之二：熔断 + 信号量） ====================
+# 事故复盘（0.6.x 多标签切页打瘫后端）：stockdb 是全部路径的共享依赖，慢/挂时
+# 每次探针都等满超时（扇出 3~4 路 × 10s），并发线程无界堆积。
+# 治理原则：探针路径（breaker=True）记仇快败；全部路径过信号量限并发；
+# 控制路径（启动等待/同步校验）只过信号量、不受熔断牵连。
+_stockdb_gate = threading.Semaphore(int(os.environ.get("STOCKDB_MAX_CONCURRENCY", "8")))
+_stockdb_breaker: dict = {"fails": 0, "open_until": 0.0,
+                          "threshold": 3, "cooldown": 300.0}
+
+
+def _stockdb_breaker_open() -> bool:
+    return time.time() < _stockdb_breaker["open_until"]
+
+
+def stockdb_fetch(path: str, timeout: float = 10.0, breaker: bool = False) -> str:
+    """打 stockdb HTTP 的统一闸口。
+
+    - 信号量（全路径）：并发最多 STOCKDB_MAX_CONCURRENCY（默认 8），超出立即抛
+      RuntimeError 由调用方降级（不阻塞等待——等待会再次堆积线程）。
+    - 熔断器（breaker=True 的探针路径）：连续 threshold 次失败后 open_until 内
+      快速失败，调用方降级取缓存，避免 stockdb 挂/忙时每路都等满超时。
+    """
+    if breaker and _stockdb_breaker_open():
+        raise RuntimeError(
+            f"stockdb 熔断中（连续 {_stockdb_breaker['fails']} 次失败，"
+            f"降级至 {datetime.fromtimestamp(_stockdb_breaker['open_until']).strftime('%H:%M:%S')}）")
+    if not _stockdb_gate.acquire(blocking=False):
+        raise RuntimeError("stockdb 并发已满（信号量限流），本次降级")
+    try:
+        import urllib.request
+        with urllib.request.urlopen(
+                f"http://{STOCKDB_HOST}:{STOCKDB_PORT}{path}", timeout=timeout) as resp:
+            data = resp.read().decode("utf-8", "replace")
+        _stockdb_breaker["fails"] = 0  # 成功即复位
+        return data
+    except Exception:
+        if breaker:
+            _stockdb_breaker["fails"] += 1
+            if _stockdb_breaker["fails"] >= _stockdb_breaker["threshold"]:
+                _stockdb_breaker["open_until"] = time.time() + _stockdb_breaker["cooldown"]
+        raise
+    finally:
+        _stockdb_gate.release()
+
 
 def data_coverage() -> dict | None:
     """行情数据覆盖范围（最早 ~ 最新交易日），基于 000001 逐年前缀扫描。
@@ -760,15 +806,16 @@ def data_coverage() -> dict | None:
     now = time.time()
     if _coverage_cache["data"] is not None and now - _coverage_cache["at"] < 900:
         return _coverage_cache["data"]
-    import urllib.request, urllib.parse
+    if _stockdb_breaker_open():
+        return _coverage_cache["data"]  # 熔断快速降级（可能为 None）
+    import urllib.parse
     from datetime import datetime as _dt
     this_year = _dt.now().year
     earliest = latest = None
     for y in range(1990, this_year + 1):
         try:
-            url = f"http://{STOCKDB_HOST}:{STOCKDB_PORT}/?cmd=vals&t={urllib.parse.quote(f'日k:000001:{y}*')}"
-            with urllib.request.urlopen(url, timeout=8) as resp:
-                rows = json.loads(resp.read().decode("utf-8", "replace"))
+            path = f"/?cmd=vals&t={urllib.parse.quote(f'日k:000001:{y}*')}"
+            rows = json.loads(stockdb_fetch(path, timeout=8, breaker=True))
             ds = [int(r["date"]) for r in rows if isinstance(r, dict) and r.get("date")]
             if ds:
                 earliest = min(ds) if earliest is None else earliest
@@ -1030,13 +1077,11 @@ def _verify_data(expected_date: str | None = None) -> list[str]:
             (today - _td(days=95)).strftime("%Y%m%d"), today.strftime("%Y%m%d")
         )
         def q(table: str) -> str:
-            url = f"http://{STOCKDB_HOST}:{STOCKDB_PORT}/?cmd=get&t={urllib.parse.quote(table)}"
-            with urllib.request.urlopen(url, timeout=15) as resp:
-                return resp.read().decode("utf-8", "replace")
+            path = f"/?cmd=get&t={urllib.parse.quote(table)}"
+            return stockdb_fetch(path, timeout=15)  # 控制路径：只过信号量，不受熔断牵连
         def vals(table: str) -> list:
-            url = f"http://{STOCKDB_HOST}:{STOCKDB_PORT}/?cmd=vals&t={urllib.parse.quote(table)}"
-            with urllib.request.urlopen(url, timeout=15) as resp:
-                return json.loads(resp.read().decode("utf-8", "replace"))
+            path = f"/?cmd=vals&t={urllib.parse.quote(table)}"
+            return json.loads(stockdb_fetch(path, timeout=15))
         codes_raw = q("股票代码")
         try:
             codes = json.loads(codes_raw)
@@ -1436,10 +1481,7 @@ def _month_prefixes(start: str, end: str) -> list[str]:
 
 def stockdb_get(table: str) -> str:
     import urllib.parse
-    url = f"http://{STOCKDB_HOST}:{STOCKDB_PORT}/?cmd=get&t={urllib.parse.quote(table)}"
-    import urllib.request
-    with urllib.request.urlopen(url, timeout=15) as resp:
-        return resp.read().decode("utf-8", "replace")
+    return stockdb_fetch(f"/?cmd=get&t={urllib.parse.quote(table)}", timeout=15)
 
 
 # ==================== 模拟盘（任务E：paper_core / paper_db / mx_client / paper_engine 集成） ====================
@@ -1560,10 +1602,8 @@ def _paper_fetch_daily(code, start, end) -> dict:
     y, m = start.year, start.month
     while (y, m) <= (end.year, end.month):
         prefix = f"{y:04d}{m:02d}"
-        url = (f"http://{STOCKDB_HOST}:{STOCKDB_PORT}/?cmd=vals&t="
-               + urllib.parse.quote(f"日k:{code}:{prefix}*"))
-        with urllib.request.urlopen(url, timeout=15) as resp:
-            data = json.loads(resp.read().decode("utf-8", "replace"))
+        path = f"/?cmd=vals&t={urllib.parse.quote(f'日k:{code}:{prefix}*')}"
+        data = json.loads(stockdb_fetch(path, timeout=15))
         if isinstance(data, list):
             rows.extend(data)
         elif isinstance(data, dict):
@@ -3602,7 +3642,9 @@ class Handler(BaseHTTPRequestHandler):
                       else "不可达（网络受限时降级提示，不影响本机数据）")},
             {"name": "mx_api", "label": "妙想模拟盘 API", "ok": mx_ok, "note": mx_note},
             {"name": "stockdb_service", "label": "stockdb 服务", "ok": stockdb_ok,
-             "note": (f"{cs.get('status')}：{cs.get('note', '')}" if cs else "状态获取失败")},
+             "note": ((f"{cs.get('status')}：{cs.get('note', '')}；" if cs else "状态获取失败；")
+                      + (f"上游闸口：熔断开（{_stockdb_breaker['fails']} 次失败，降级中）"
+                         if _stockdb_breaker_open() else "上游闸口：正常"))},
             {"name": "pybao", "label": "pybao 计算模块", "ok": pybao_ok,
              "note": ("stockdb/zb_core/zhibiao 可导入" if pybao_ok
                       else "存在模块缺失（影响指标/板块/私有存储）")},
