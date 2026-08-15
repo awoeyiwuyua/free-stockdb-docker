@@ -3,6 +3,18 @@
 本项目面板版本号 = `WEBUI_VERSION`（`docker/webui/app.py`），镜像 tag 跟随上游引擎版本。
 发布纪律见 `docs/webui-spa/release-policy.md`；部署记录见 `docs/DEPLOYMENTS.md`。
 
+## [0.8.11] — 2026-08-16（分位口径改为用户公式 + 强弱标签）
+- 分位口径用户拍板：`rank = (此前 60 个有效观测中严格低于当日值的天数) / 60`
+  - 严格小于：等值不计入（旧 count_equal 折半计入废弃）；分母固定 60
+  - 不足 60 个有效观测 → rank=null（定义不适用，不硬算）；回填 60 天恰好构成
+    08-17 首个满分母日（历史回填日 rank=null 属预期，不重复回填历史）
+- 强弱标签：`strength_60d` per metric——strong（rank≥0.90，≥54 个历史观测低于当日）
+  / weak（rank≤0.10，≤6 个）/ neutral；rank=null → 标签 null
+- 载荷新增 strength_60d（打板指标:<日期>），MCP get_board_open_effect_history 透传；
+  HTTP 采集/收口/回填返回同步带出
+- 回填第二遍前值窗口 [-59:] → [-60:]（配合固定 60 分母）
+- 测试 +5（严格分位×4 / 强弱标签×2 / 载荷满窗标签），Python 193 全绿
+
 ## [0.8.10] — 2026-08-16（rd 单连接加固：锁 + 自愈重连 + 值归一化 + RSS 遥测）
 - 事故：0.8.9 部署后回填成功（60 天全绿），但 /api/data/read + /api/data/tables 并发探测
   触发全进程冻结（TCP 可连、零响应）+ NAS 内存暴增 3.8GB，需重启容器恢复

@@ -74,18 +74,35 @@ def compute_metrics(snapshots: list[dict]) -> dict:
 
 
 def percentile_rank(value: float, series: list[float]) -> float | None:
-    """value 在 series（近 N 日历史值）中的分位 ∈[0,1]。
+    """value 在滚动 60 日窗口中的排名 ∈[0,1]（用户口径 2026-08-16 拍板）。
 
-    定义：(count_less + 0.5 * count_equal) / len(series)；series 空 → None。
-    越小越弱（与 emotion-v1 语义一致）。
+    定义：排名 = 此前 60 个有效观测中严格低于当日值的天数 / 60。
+      - 严格小于：等值不计入（旧版 count_equal 折半计入已废弃）
+      - 分母固定 60：历史不足 60 个有效观测 → None（定义不适用，不硬算近似值）
+    语义：越小越弱（与 emotion-v1 一致）。
     """
-    if not series:
-        return None  # 冷启动：没有历史序列就没有分位可言
-    n = len(series)
-    count_less = sum(1 for x in series if x < value)
-    # 与历史值打平折半计入，避免相等样本全算"更强"导致分位跳变
-    count_equal = sum(1 for x in series if x == value)
-    return (count_less + 0.5 * count_equal) / n
+    if len(series) < WINDOW:
+        return None  # 不足 60 个有效观测：口径未定义（首个满分母分位在序列满 60 后出现）
+    series_60 = series[-WINDOW:]
+    count_less = sum(1 for x in series_60 if x < value)
+    return count_less / WINDOW
+
+
+def strength_label(rank: float | None) -> str | None:
+    """排名 → 强弱标签（用户口径 2026-08-16）：固定阈值比例，非固定数值阈值。
+
+    - strong（强）：rank ≥ 0.90，即至少 54 个历史观测低于当日
+    - weak（弱）：rank ≤ 0.10，即至多 6 个历史观测低于当日
+    - neutral（中性）：0.10 < rank < 0.90
+    - rank 为 None（观测不足）→ None
+    """
+    if rank is None:
+        return None
+    if rank >= 0.9:
+        return "strong"
+    if rank <= 0.1:
+        return "weak"
+    return "neutral"
 
 
 def load_series(read_fn, metric: str) -> list[float]:
@@ -171,16 +188,19 @@ def build_metrics_payload(snapshots: list[dict], series_by_metric: dict[str, lis
     """
     metrics = compute_metrics(snapshots)  # 当日业务值；竞价版与 K 线权威版共用同一口径函数
     rank_60d = {}
+    strength_60d = {}
     for m in METRICS:
         day_value = metrics[m]
         if day_value is None:
             rank_60d[m] = None  # 当日无值 → 无分位
         else:
-            # 当日值在历史序列中的分位；序列缺失/为空时 percentile_rank 自行返回 None
+            # 当日值在历史序列中的分位；序列不足 60 个观测时 percentile_rank 返回 None
             rank_60d[m] = percentile_rank(day_value, series_by_metric.get(m) or [])
+        strength_60d[m] = strength_label(rank_60d[m])  # strong/weak/neutral/None
     return {
         "metrics": metrics,
         "rank_60d": rank_60d,
+        "strength_60d": strength_60d,
         "window": WINDOW,
         "n_samples": metrics["n_samples"],
         "computed_at": computed_at,

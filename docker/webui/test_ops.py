@@ -1052,15 +1052,18 @@ class _AuctionBackfillTests(_OpsTestCase):
         self.assertAlmostEqual(vals[0], 0.10)
         self.assertAlmostEqual(vals[1], -0.05)
         self.assertAlmostEqual(vals[2], 0.06)
-        # 逐日指标（kline 口径）：首日分位 None（无前史）
+        # 逐日指标（kline 口径）：0.8.11 起分位口径 = 此前 60 有效观测严格低于天数/60，
+        # 3 天回填历史不足 → 全部 rank/strength 为 None（首个满分母分位在序列满 60 后）
         d0 = self._metrics("20260812")
         self.assertEqual(d0["value_source"], "kline")
         self.assertIsNone(d0["rank_60d"]["premium_mean"])
-        # 次日分位：-0.05 vs [0.10] → 0.0；末日分位：0.06 vs [0.10,-0.05] → 0.5
+        self.assertIsNone(d0["strength_60d"]["premium_mean"])
         d1 = self._metrics("20260813")
-        self.assertAlmostEqual(d1["rank_60d"]["premium_mean"], 0.0)
+        self.assertIsNone(d1["rank_60d"]["premium_mean"])
+        self.assertIsNone(d1["strength_60d"]["premium_mean"])
         d2 = self._metrics("20260814")
-        self.assertAlmostEqual(d2["rank_60d"]["premium_mean"], 0.5)
+        self.assertIsNone(d2["rank_60d"]["premium_mean"])
+        self.assertIsNone(d2["strength_60d"]["premium_mean"])
         # 成功率序列
         self.assertEqual(self._load_series("success_rate"), [1.0, 0.0, 1.0])
 
