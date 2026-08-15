@@ -3,6 +3,12 @@
 本项目面板版本号 = `WEBUI_VERSION`（`docker/webui/app.py`），镜像 tag 跟随上游引擎版本。
 发布纪律见 `docs/webui-spa/release-policy.md`；部署记录见 `docs/DEPLOYMENTS.md`。
 
+## [0.8.7] — 2026-08-15（回填算法提速：全市场批量 pipeline）
+- 全市场快照改用 pybao SDK pipeline 批量（1000 只/批，一次往返）：回填 45 分钟 → 秒级；
+  16:30 每日收口同受益（5200 次请求 → 6 批）
+- fq=None 取不复权原始价（涨停判定口径正确）；批内缺失代码补一轮重试
+- SDK 不可用自动回退逐只 HTTP（保留节流）；测试 +2（批量路径 fq/全量 + 回退节流），Python 179 全绿
+
 ## [0.8.6] — 2026-08-15（mydb 存值类型修复）
 - 修复：打板全链路 mydb_write 存了 JSON 字符串，pybao 只认原生对象 → 实际存成空
   （回填"成功"但序列/指标读出 {} 即此因）
