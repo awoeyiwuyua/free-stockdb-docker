@@ -79,7 +79,7 @@ _last_verify_result: str | None = None  # 最近一次完整性验证结果（pa
 _scheduler_alive = False             # 定时线程心跳（每次循环更新时间戳）
 _scheduler_heartbeat = 0.0           # 定时线程最近一次心跳时间戳（unix）
 _webui_started = time.time()         # webui 进程启动时间戳
-WEBUI_VERSION = "0.8.1"
+WEBUI_VERSION = "0.8.2"
 
 HISTORY_FILE = DATA_DIR / "sync_history.json"
 SCHEDULE_FILE = DATA_DIR / "sync_schedule.json"
@@ -2049,6 +2049,9 @@ class Handler(BaseHTTPRequestHandler):
             self._hk_sync()
         elif path == "/api/overview":
             self._overview()
+        elif path == "/api/auction/status":
+            self._send(200, json.dumps({"backfill": _auction_backfill_state,
+                                        "fired": _auction_fired}, ensure_ascii=False))
         elif path == "/api/diag":
             self._diag()
         elif path == "/api/alerts":
@@ -2458,7 +2461,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, json.dumps(auction_run_close(), ensure_ascii=False))
         elif task == "backfill":
             days = int(body.get("days") or 60)
-            self._send(200, json.dumps(auction_run_backfill(days=max(1, min(days, 500))),
+            self._send(200, json.dumps(auction_run_backfill_async(max(1, min(days, 500))),
                                        ensure_ascii=False))
         else:
             self._send(400, json.dumps(
@@ -2628,6 +2631,8 @@ def _auction_env_time(name: str, default: str) -> str:
 AUCTION_COLLECT_TIME = _auction_env_time("AUCTION_COLLECT_TIME", "09:26")  # 采集触发点
 AUCTION_CLOSE_TIME = _auction_env_time("AUCTION_CLOSE_TIME", "16:30")      # 收口触发点
 _auction_fired: dict = {}  # 日级防重触发守卫：{date: {"collect": bool, "close": bool}}
+_auction_backfill_state: dict = {"running": False, "started": None, "finished": None,
+                                 "result": None}  # 回填任务状态（0.8.2 异步化 + 单飞防重）
 
 # 惰性 import：任务A/B/C（auction_collect/auction_list/auction_metrics）与 MCP 快照
 # 任一缺失 → AUCTION_MODULES_AVAILABLE=False，采集/收口返回 {ok:False}（不拖垮 webui）。
@@ -2958,6 +2963,32 @@ def auction_run_backfill(days: int = 60) -> dict:
     except Exception as exc:  # noqa: BLE001 - 单块降级
         log(f"⚠️ 打板历史回填失败：{exc}")
         return {"ok": False, "reason": str(exc), "backfilled_days": 0, "series": {}}
+
+
+def auction_run_backfill_async(days: int = 60) -> dict:
+    """异步触发历史回填（0.8.2）：60 天全市场扫描是分钟级重活，不能占请求线程。
+
+    单飞防重：已在运行 → 返回 {ok:False, reason:"回填已在运行中"}，绝不并发第二份；
+    否则后台线程执行 auction_run_backfill，状态进 _auction_backfill_state
+    （GET /api/auction/status 查询），请求立即返回 {ok:True, async:True}。
+    幂等：重跑覆盖写，结果确定性。
+    """
+    if _auction_backfill_state["running"]:
+        return {"ok": False, "async": True, "reason": "回填已在运行中",
+                "started": _auction_backfill_state["started"]}
+
+    def _worker():
+        _auction_backfill_state.update(running=True, started=_now_iso(),
+                                       finished=None, result=None)
+        try:
+            result = auction_run_backfill(days)
+        except Exception as exc:  # noqa: BLE001 - 状态落库，绝不外抛
+            result = {"ok": False, "reason": str(exc), "backfilled_days": 0, "series": {}}
+        _auction_backfill_state.update(running=False, finished=_now_iso(), result=result)
+        log(f"📊 打板历史回填完成：{result}")
+
+    threading.Thread(target=_worker, daemon=True).start()
+    return {"ok": True, "async": True, "reason": "回填已启动（后台执行，GET /api/auction/status 查进度）"}
 
 
 def auction_scheduler_loop() -> None:

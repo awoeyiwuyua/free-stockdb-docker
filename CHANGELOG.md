@@ -3,6 +3,11 @@
 本项目面板版本号 = `WEBUI_VERSION`（`docker/webui/app.py`），镜像 tag 跟随上游引擎版本。
 发布纪律见 `docs/webui-spa/release-policy.md`；部署记录见 `docs/DEPLOYMENTS.md`。
 
+## [0.8.2] — 2026-08-15（回填异步化）
+- 修复：同步回填在请求线程内跑 60 天全市场扫描，连接中断即夭折且可并发叠加打满上游
+- auction_run_backfill_async：后台线程执行 + 单飞防重（进行中再触发→拒绝）
+- GET /api/auction/status 查询回填状态与日级守卫；Python 177 全绿
+
 ## [0.8.1] — 2026-08-15（打板序列冷启动修复）
 - 新增 auction_run_backfill：历史 K 线重算过去 N 个交易日业务指标，初始化 打板序列（60 日分母）
   与逐日 打板指标（kline 口径 + 当日可得滚动分位，无未来函数）

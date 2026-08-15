@@ -835,6 +835,8 @@ class _AuctionBackfillTests(_OpsTestCase):
     def setUp(self):
         super().setUp()
         self.store = {}
+        app._auction_backfill_state.update(running=False, started=None,
+                                           finished=None, result=None)
 
         def fake_snapshot(args):
             return {"points": self.POINTS.get(args.get("date"), [])}
@@ -890,7 +892,7 @@ class _AuctionBackfillTests(_OpsTestCase):
         self.assertEqual(self._load_series("premium_mean"), first)
 
     def test_route_backfill(self):
-        """POST /api/auction/run {"task":"backfill","days":3} → 200 结构正确。"""
+        """POST /api/auction/run {"task":"backfill","days":3} → 200 异步启动，后台完成后状态落库。"""
         # 注意：BaseRequestHandler.__init__ 会自动跑一次 handle()（把空 rfile 当请求行）。
         # 构造后再换入带 body 的新 rfile 与干净 wfile，避免 body 被 parse_request 吃掉。
         conn = _FakeConn()
@@ -912,7 +914,28 @@ class _AuctionBackfillTests(_OpsTestCase):
         payload = json.loads(resp_body.decode())
         self.assertEqual(status, 200)
         self.assertTrue(payload["ok"])
-        self.assertEqual(payload["backfilled_days"], 3)
+        self.assertTrue(payload.get("async"))
+        # 等待后台 worker 完成（patched 依赖下毫秒级）
+        deadline = time.time() + 5
+        while app._auction_backfill_state["running"] and time.time() < deadline:
+            time.sleep(0.05)
+        self.assertFalse(app._auction_backfill_state["running"])
+        self.assertEqual(app._auction_backfill_state["result"]["backfilled_days"], 3)
+
+    def test_backfill_guard_single_flight(self):
+        """回填进行中再触发 → 拒绝并返回进行中提示（防并发两份重扫描）。"""
+        app._auction_backfill_state.update(running=True, started="2026-08-15T00:00:00")
+        r = app.auction_run_backfill_async(3)
+        self.assertFalse(r["ok"])
+        self.assertIn("已在运行中", r["reason"])
+
+    def test_status_endpoint(self):
+        """GET /api/auction/status 返回回填状态与日级守卫。"""
+        status, _, body = _do_get("/api/auction/status")
+        self.assertEqual(status, 200)
+        payload = json.loads(body.decode())
+        self.assertIn("backfill", payload)
+        self.assertIn("running", payload["backfill"])
 
 
 if __name__ == "__main__":
