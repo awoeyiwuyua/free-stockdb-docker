@@ -121,10 +121,10 @@
 
         <!-- ========== 文件缺失降级态：exists=false → EmptyState + 后端 error 文案 ========== -->
         <EmptyState
-          v-if="!signal.exists"
+          v-if="!signal?.exists"
           icon="WarningFilled"
           title="信号文件缺失"
-          :description="signal.error || '最近交易日没有可用的信号文件'"
+          :description="signal?.error || '最近交易日没有可用的信号文件'"
         />
       </template>
     </template>

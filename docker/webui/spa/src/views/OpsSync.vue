@@ -96,16 +96,16 @@
         <!-- 容器 / 数据源 / 同步能力 描述块（el-descriptions 一键出表格排版） -->
         <el-descriptions :column="2" border size="small" class="desc">
           <el-descriptions-item label="stockdb 进程">
-            <el-tag :type="status.container?.ok ? 'success' : 'danger'" size="small">
-              {{ status.container?.ok ? '运行中' : '已停止' }}
+            <el-tag :type="status?.container?.ok ? 'success' : 'danger'" size="small">
+              {{ status?.container?.ok ? '运行中' : '已停止' }}
             </el-tag>
-            <span class="hint" style="margin-left: 6px">{{ status.container?.note || '' }}</span>
+            <span class="hint" style="margin-left: 6px">{{ status?.container?.note || '' }}</span>
           </el-descriptions-item>
           <el-descriptions-item label="运行时长">
-            {{ fmtUptime(status.container?.started) }}
+            {{ fmtUptime(status?.container?.started) }}
           </el-descriptions-item>
           <el-descriptions-item label="镜像" :span="1">
-            {{ status.container?.image || '—' }}
+            {{ status?.container?.image || '—' }}
           </el-descriptions-item>
           <el-descriptions-item label="数据源" :span="1">
             {{ status?.source || '—' }}
@@ -123,14 +123,14 @@
             :tone="freshTone"
           />
           <!-- 全市场标的数量：code_stats{stock,etf,other} 由后端 15s 缓存兜底 -->
-          <StatCard label="股票数" :value="status.code_stats?.stock ?? '—'" sub="code_stats.stock" />
-          <StatCard label="ETF 数" :value="status.code_stats?.etf ?? '—'" sub="code_stats.etf" />
-          <StatCard label="其他标的" :value="status.code_stats?.other ?? '—'" sub="code_stats.other" />
+          <StatCard label="股票数" :value="status?.code_stats?.stock ?? '—'" sub="code_stats.stock" />
+          <StatCard label="ETF 数" :value="status?.code_stats?.etf ?? '—'" sub="code_stats.etf" />
+          <StatCard label="其他标的" :value="status?.code_stats?.other ?? '—'" sub="code_stats.other" />
           <!-- 行情服务延迟：null 说明查询失败 → 标红（与旧页 hcSvc 同判据） -->
           <StatCard
             label="行情响应"
-            :value="status.code_stats?.latency_ms != null ? `${status.code_stats.latency_ms} ms` : '不可用'"
-            :tone="status.code_stats?.latency_ms != null ? 'ok' : 'err'"
+            :value="status?.code_stats?.latency_ms != null ? `${status?.code_stats?.latency_ms} ms` : '不可用'"
+            :tone="status?.code_stats?.latency_ms != null ? 'ok' : 'err'"
             sub="code_stats.latency_ms"
           />
           <!-- 覆盖范围：coverage{earliest,latest} 是 8 位数字，只取年份展示 -->
@@ -176,12 +176,12 @@
         <div class="cap-block">
           <div class="cap-title">
             同步能力检查
-            <el-tag :type="status.sync_cap?.ok ? 'success' : 'danger'" size="small">
-              {{ status.sync_cap?.ok ? '可用' : '不可用' }}
+            <el-tag :type="status?.sync_cap?.ok ? 'success' : 'danger'" size="small">
+              {{ status?.sync_cap?.ok ? '可用' : '不可用' }}
             </el-tag>
           </div>
           <ul class="cap-list">
-            <li v-for="(check, name) in status.sync_cap?.checks || {}" :key="name">
+            <li v-for="(check, name) in status?.sync_cap?.checks || {}" :key="name">
               <el-icon :color="check.ok === false ? 'var(--err)' : check.warn ? 'var(--warn)' : 'var(--ok)'">
                 <component :is="check.ok === false ? 'CircleCloseFilled' : check.warn ? 'WarningFilled' : 'CircleCheckFilled'" />
               </el-icon>
