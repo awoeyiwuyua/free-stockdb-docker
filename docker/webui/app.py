@@ -79,7 +79,7 @@ _last_verify_result: str | None = None  # 最近一次完整性验证结果（pa
 _scheduler_alive = False             # 定时线程心跳（每次循环更新时间戳）
 _scheduler_heartbeat = 0.0           # 定时线程最近一次心跳时间戳（unix）
 _webui_started = time.time()         # webui 进程启动时间戳
-WEBUI_VERSION = "0.8.2"
+WEBUI_VERSION = "0.8.3"
 
 HISTORY_FILE = DATA_DIR / "sync_history.json"
 SCHEDULE_FILE = DATA_DIR / "sync_schedule.json"
@@ -2731,7 +2731,7 @@ def auction_run_collect() -> dict:
         codes = _auction_load_codes(today)
         if not codes:
             prev = _auction_prev_trade_date(today)
-            snaps = _auction_query_snapshot({"date": prev})
+            snaps = _auction_query_snapshot({"date": prev, "limit": 0})
             listing = _auction_compute_limitup_list(snaps.get("points") or [])
             codes = listing.get("codes") or []
             log(f"📊 打板清单缺失，已兜底现算（{prev}）→ {len(codes)} 只")
@@ -2802,7 +2802,7 @@ def auction_run_close() -> dict:
                     "latest_date": latest or None}
 
         # 全市场今日时点快照（K线权威源，②③④ 共用）
-        points = (_auction_query_snapshot({"date": today}) or {}).get("points") or []
+        points = (_auction_query_snapshot({"date": today, "limit": 0}) or {}).get("points") or []
         points_by_code = {str(p.get("code")): p for p in points}
 
         # ② 明日清单：今日非一字板涨停（compute_limitup_list 内部已剔除一字板）
@@ -2914,11 +2914,11 @@ def auction_run_backfill(days: int = 60) -> dict:
         t = latest
         for _ in range(days):
             t1 = _auction_prev_trade_date(t)          # T-1 交易日
-            pts1 = (_auction_query_snapshot({"date": t1}) or {}).get("points") or []
+            pts1 = (_auction_query_snapshot({"date": t1, "limit": 0}) or {}).get("points") or []
             codes = _auction_compute_limitup_list(pts1).get("codes") or []
             snaps = []
             if codes:
-                pts_t = (_auction_query_snapshot({"date": t}) or {}).get("points") or []
+                pts_t = (_auction_query_snapshot({"date": t, "limit": 0}) or {}).get("points") or []
                 by_code = {str(p.get("code")): p for p in pts_t}
                 for c in codes:
                     p = by_code.get(c)
