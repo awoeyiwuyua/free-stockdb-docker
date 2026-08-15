@@ -1,10 +1,15 @@
 # free-stockdb-docker
 
-[free-stockdb](https://github.com/hello245m/free-stockdb) 的 Docker 容器化封装，定位为**本地量化数据基座**：把上游引擎稳定跑在 NAS 上，供研究侧与 AI 取数。本仓库不改上游 C++ 源码，Sync fork 与上游保持同步。
+[free-stockdb](https://github.com/hello245m/free-stockdb) 的 Docker 容器化封装。
+
+**定位（2026-08 定稿）**：本地量化数据基座。核心产品是 **HTTP + MCP 数据接口**（只读、
+可信契约、可审计），研究/回测/画图在用户本地 Mac 进行；webui 面板是辅助驾驶舱（冻结）。
+定位与路线图见 [`docs/ROADMAP.md`](docs/ROADMAP.md)。
 
 ## 架构（单镜像，一容器两端口）
 
 - `stockdb` 服务端（7899 行情 HTTP API）+ `数据更新` 同步器 + pybao + webui 运维面板（8080）
+- **MCP 数据接口**（webui `/mcp` 路由，12 个只读工具：行情/复权/快照/指标/板块/选股/私有库/交易日历/状态/时点快照，统一契约信封 + 8 错误码）
 - 进程级控制（pidfile + SIGTERM），**不挂载 docker.sock**；webui 崩溃自动重启不影响数据服务
 - 镜像 `ghcr.io/awoeyiwuyua/free-stockdb:latest`
 
