@@ -21,7 +21,25 @@ export function buildQuery(params = {}) {
   return parts.length ? `?${parts.join('&')}` : ''
 }
 
-export async function request(path, { method = 'GET', body, timeoutMs = 20000, signal } = {}) {
+// 在途请求表（key → Promise）：同请求并发共享，防切页风暴
+const _inflight = new Map()
+
+export async function request(path, { method = 'GET', body, timeoutMs = 20000, signal, dedup = true } = {}) {
+  // 在途去重：相同 method+URL+body 的并发请求共享同一个 Promise。
+  // 多标签/快速切页会短时间重复发起同一批接口，去重后后端只收到一路，
+  // 其余等待同一结果——避免请求风暴把 ThreadingHTTPServer 拖死。
+  const dedupKey = dedup ? `${method} ${path} ${body !== undefined ? JSON.stringify(body) : ''}` : null
+  if (dedupKey && _inflight.has(dedupKey)) {
+    return _inflight.get(dedupKey)
+  }
+  const p = _doRequest(path, { method, body, timeoutMs, signal }).finally(() => {
+    if (dedupKey) _inflight.delete(dedupKey)
+  })
+  if (dedupKey) _inflight.set(dedupKey, p)
+  return p
+}
+
+async function _doRequest(path, { method, body, timeoutMs, signal }) {
   const ctrl = new AbortController()
   const timer = setTimeout(() => ctrl.abort(new Error('timeout')), timeoutMs)
   try {
