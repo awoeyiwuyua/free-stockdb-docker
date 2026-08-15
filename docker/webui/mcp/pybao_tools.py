@@ -230,12 +230,30 @@ def get_sdk_client() -> object | None:
         return None
 
 
+def is_fq_event_date(code: str, date: str) -> bool:
+    """当日是否为该股除权除息事件日（复权因子表当日有记录）。
+
+    0.8.15：涨停判定参考价 = 普通日上一实际成交日未复权收盘；**除权日例外**——
+    当日 pre_close 即交易所法定除权参考价（可信），须原样使用。SDK 不可用 → False
+    （调用方按普通日处理）。
+    """
+    try:
+        client = get_sdk_client()
+        if client is None:
+            return False
+        dates = getattr(client, "_fq_dates", {}).get(code)
+        if not dates:
+            return False
+        return str(date) in dates
+    except Exception:  # noqa: BLE001 - 因子查询失败按普通日降级
+        return False
+
+
 def get_fq_cum(code: str, date: str) -> tuple[float, float] | None:
     """返回 (cum_at_date, cum_latest)：股票在判定日 date 的累计复权因子与最新因子。
 
-    用于重建"当日法定涨跌停参考价"（0.8.14 污染修复，见 board_metrics.
-    rebuild_limit_reference_price）：引擎历史 pre_close 被最新因子回溯重算，
-    需按 cum_D/cum_latest 反推。SDK 客户端 __init__ 已预加载全市场因子表
+    0.8.14 遗留（0.8.15 起涨停判定改用 lag-close 方案，本函数仅保留兼容）：
+    用于重建"当日法定涨跌停参考价"。SDK 客户端 __init__ 已预加载全市场因子表
     （_fq_dates/_fq_cums 平行数组，LevelDB 有序）；不可用/无因子事件 → None
     （调用方按未污染原样降级）。
     """
