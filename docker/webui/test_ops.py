@@ -148,6 +148,58 @@ class _QueryResultLike:
         return iter(self._d.items())
 
 
+class _LimitReferenceTests(_OpsTestCase):
+    """0.8.14：pre_close 被未来除权因子回溯污染 → 重建法定涨跌停参考价。"""
+
+    def test_rebuild_pure(self):
+        """反推公式：ref = pre_close × cum_latest / cum_D（000100 实测数字）。"""
+        from mcp.board_metrics import rebuild_limit_reference_price as r
+        # 000100：pre_close=4.207（污染后），cum_D=3.019，cum_latest=3.079
+        # → 4.207×3.079/3.019 = 4.289 ≈ 真实昨收 4.29
+        self.assertAlmostEqual(r(4.207, 3.019, 3.079), 4.207 * 3.079 / 3.019, places=3)
+        # 无因子事件/等因子：原样返回（未污染）
+        self.assertEqual(r(10.0, 1.0, 1.0), 10.0)
+        self.assertEqual(r(10.0, 3.019, 3.019), 10.0)
+        # 非法输入防御
+        self.assertEqual(r(10.0, None, 3.0), 10.0)
+        self.assertEqual(r(10.0, 0, 3.0), 10.0)
+
+    def test_get_fq_cum(self):
+        """因子表查询：cum_at_date（二分）+ cum_latest；无事件/未知代码 → None。"""
+        import mcp.pybao_tools as pt
+        fake = mock.Mock()
+        fake._fq_dates = {"000100": ["20040614", "20260611"], "600000": []}
+        fake._fq_cums = {"000100": [1.012, 3.079], "600000": []}
+        with mock.patch.object(pt, "get_sdk_client", return_value=fake):
+            self.assertEqual(pt.get_fq_cum("000100", "20260507"), (1.012, 3.079))
+            self.assertEqual(pt.get_fq_cum("000100", "20260611"), (3.079, 3.079))
+            self.assertEqual(pt.get_fq_cum("000100", "20040101"), (1.0, 3.079))  # 早于首事件 → 1.0
+            self.assertIsNone(pt.get_fq_cum("600000", "20260507"))  # 无因子事件
+            self.assertIsNone(pt.get_fq_cum("999999", "20260507"))
+        with mock.patch.object(pt, "get_sdk_client", return_value=None):
+            self.assertIsNone(pt.get_fq_cum("000100", "20260507"))  # SDK 不可用
+
+    def test_fix_limit_reference_applied(self):
+        """重建后涨停判定修正：污染 pre_close 漏判 → 重建后命中。"""
+        pts = [{"code": "600000", "name": "X", "open": 4.6, "close": 4.72,
+                "prev_close": 4.207, "high": 4.72, "low": 4.6,
+                "is_st": False, "status": "TRADED"}]
+        with mock.patch("mcp.pybao_tools.get_fq_cum", return_value=(3.019, 3.079)):
+            fixed = app._auction_fix_limit_reference(pts, "20260507")
+        self.assertAlmostEqual(fixed[0]["prev_close"], 4.207 * 3.079 / 3.019, places=3)
+        from auction_list import compute_limitup_list
+        # 重建后：真实昨收 4.289 → 涨停价 round(4.289×1.1,2)=4.72 == close → 命中
+        self.assertEqual(compute_limitup_list(fixed)["count"], 1)
+        # 未重建：污染昨收 4.207 → 涨停价 4.63 ≠ close 4.72 → 漏判（污染现场）
+        self.assertEqual(compute_limitup_list(pts)["count"], 0)
+
+    def test_fix_limit_reference_fallback(self):
+        """因子表不可用 → 原样返回（未除权股票无影响）。"""
+        pts = [{"code": "600000", "prev_close": 10.0, "close": 11.0}]
+        with mock.patch("mcp.pybao_tools.get_fq_cum", return_value=None):
+            self.assertEqual(app._auction_fix_limit_reference(pts, "20260507"), pts)
+
+
 class _MydbRdTests(_OpsTestCase):
     """mydb 读写：QueryResult/JSON 串归一化、并发串行化、失败丢弃连接自愈。"""
 

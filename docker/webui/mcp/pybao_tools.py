@@ -230,6 +230,32 @@ def get_sdk_client() -> object | None:
         return None
 
 
+def get_fq_cum(code: str, date: str) -> tuple[float, float] | None:
+    """返回 (cum_at_date, cum_latest)：股票在判定日 date 的累计复权因子与最新因子。
+
+    用于重建"当日法定涨跌停参考价"（0.8.14 污染修复，见 board_metrics.
+    rebuild_limit_reference_price）：引擎历史 pre_close 被最新因子回溯重算，
+    需按 cum_D/cum_latest 反推。SDK 客户端 __init__ 已预加载全市场因子表
+    （_fq_dates/_fq_cums 平行数组，LevelDB 有序）；不可用/无因子事件 → None
+    （调用方按未污染原样降级）。
+    """
+    try:
+        import bisect
+        client = get_sdk_client()
+        if client is None:
+            return None
+        dates = getattr(client, "_fq_dates", {}).get(code)
+        cums = getattr(client, "_fq_cums", {}).get(code)
+        if not dates or not cums or len(dates) != len(cums):
+            return None  # 无因子事件（未除权）或数据异常
+        idx = bisect.bisect_right(dates, str(date)) - 1
+        if idx < 0:
+            return 1.0, float(cums[-1])  # 判定日早于首条因子事件：当时因子 = 1.0
+        return float(cums[idx]), float(cums[-1])
+    except Exception:  # noqa: BLE001 - 因子查询失败按未污染降级
+        return None
+
+
 # === 通用加工 ===
 
 
