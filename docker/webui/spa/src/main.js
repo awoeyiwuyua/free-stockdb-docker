@@ -3,6 +3,7 @@
 import { createApp } from 'vue'
 import { createPinia } from 'pinia'
 import ElementPlus from 'element-plus'
+import { ElMessage } from 'element-plus'
 import zhCn from 'element-plus/es/locale/lang/zh-cn'
 import * as ElementPlusIconsVue from '@element-plus/icons-vue' // 全量图标包（命名导出）
 import 'element-plus/dist/index.css'
@@ -27,6 +28,14 @@ app.use(ElementPlus, { locale: zhCn })
 // 用 <el-icon><component :is="'图标名'" /></el-icon> 直接写图标名。
 for (const [key, component] of Object.entries(ElementPlusIconsVue)) {
   app.component(key, component)
+}
+
+// —— 全局错误兜底（Phase 5.1 稳定性补丁）——
+// 任何未捕获的组件/渲染异常不再白屏：记录到控制台 + 右下角弹提示，
+// 提示里带错误文案，方便用户反馈、快速定位根因。
+app.config.errorHandler = (err, _instance, info) => {
+  console.error('[webui] 未捕获异常', info, err)
+  ElMessage.error(`界面异常：${err?.message || err}（${info || '未知位置'}）`)
 }
 
 app.mount('#app')

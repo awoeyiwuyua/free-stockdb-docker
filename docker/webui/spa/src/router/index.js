@@ -41,4 +41,9 @@ router.afterEach((to) => {
   document.title = `${to.meta.title || ''} · stockdb 控制台`
 })
 
+// 路由级错误兜底：懒加载失败/重定向异常时记录，不让导航静默失败
+router.onError((err) => {
+  console.error('[webui] 路由异常', err)
+})
+
 export default router
