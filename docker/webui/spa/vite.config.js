@@ -16,6 +16,16 @@ export default defineConfig({
     outDir: 'dist',
     assetsDir: 'assets',
     sourcemap: false,
+    // 手动分包：三大件独立成 chunk，index 主包保持轻量、vendor 可长缓存
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          'vendor-vue': ['vue', 'vue-router', 'pinia'],
+          'vendor-element': ['element-plus', '@element-plus/icons-vue'],
+          'vendor-echarts': ['echarts/core', 'echarts/charts', 'echarts/components', 'echarts/renderers'],
+        },
+      },
+    },
   },
   test: {
     environment: 'node',

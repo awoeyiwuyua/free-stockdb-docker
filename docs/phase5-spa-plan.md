@@ -265,3 +265,9 @@ COPY webui/static/legacy/ /opt/webui/static/legacy/
       Pinia 全局 store（/api/overview 单一数据源）、深色/浅色主题（localStorage 持久化）、
       StatCard/EmptyState/ThemeToggle 组件、nav.js 路由与侧边栏同源、
       前端测试 18 例全绿 + Python 229 全绿 + 端到端冒烟通过。导读见 `docs/webui-spa/guide-m1.md`。
+- [x] M2+M3：十页搬迁（总览/数据同步/私有存储/模拟盘/审计报告*/信号体检*/系统/通知/MCP 观测/版本，
+      *为旧面板缺失 UI 的补位页）+ api 四域封装 + EChart 按需封装 + 三态/危险确认/响应式打磨 +
+      路由懒加载与 vendor 分包（index 主包 16KB）+ 功能清单回归表 +
+      前端 56 例全绿 + Python 229 全绿 + 10 深链冒烟通过。导读见 `docs/webui-spa/guide-m2.md`。
+- [x] 镜像低频策略：新增 `.github/workflows/test.yml` 轻量门禁（push/PR 只跑测试不建镜像）；
+      镜像构建仅在 Phase 5 收口时手动触发一次。

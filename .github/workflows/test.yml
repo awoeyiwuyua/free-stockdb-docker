@@ -1,0 +1,58 @@
+# 轻量测试门禁：每次 push main / PR 都跑（不构建镜像）。
+# 镜像构建只在 Phase 收口时手动触发 build-image.yml（低频策略）。
+name: Tests (Python + SPA)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - 'docker/**'
+      - '.github/workflows/test.yml'
+
+jobs:
+  python-tests:
+    name: Python 单测（离线）
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+
+      - name: Run MCP unit tests
+        working-directory: docker/webui
+        run: python -m unittest mcp.test_stockdb_mcp_server -v
+
+      - name: Run ops/paper unit tests
+        working-directory: docker/webui
+        run: python -m unittest test_ops test_paper -v
+
+  spa-tests:
+    name: SPA 前端（构建 + Vitest）
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: docker/webui/spa/package-lock.json
+
+      - name: npm ci
+        working-directory: docker/webui/spa
+        run: npm ci --no-audit --no-fund
+
+      - name: Vitest 单测
+        working-directory: docker/webui/spa
+        run: npm run test
+
+      - name: Vite 构建
+        working-directory: docker/webui/spa
+        run: npm run build
