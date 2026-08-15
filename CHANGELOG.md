@@ -3,6 +3,12 @@
 本项目面板版本号 = `WEBUI_VERSION`（`docker/webui/app.py`），镜像 tag 跟随上游引擎版本。
 发布纪律见 `docs/webui-spa/release-policy.md`；部署记录见 `docs/DEPLOYMENTS.md`。
 
+## [0.8.4] — 2026-08-15（全扫连接卫生）
+- 修复：全市场快照 16 并发无节流 → NAS 临时端口耗尽（Errno 99 Cannot assign requested address）
+- 全扫改 8 并发 + 每请求 50ms 节流（约 160 req/s，TIME_WAIT 存量远低于端口池）
+- 回填溢价日只查清单股（显式小清单）：120 次全扫 → 60 全扫 + 60 小扫
+- Python 177 全绿
+
 ## [0.8.3] — 2026-08-15（全市场快照修复）
 - 修复：内部 query_point_snapshot 默认截断 50 条（上限 200）→ 打板清单/回填/对账全部
   只在 50 只子集上计算（回填仅 31 天有效样本即此因）
