@@ -977,23 +977,24 @@ class _AuctionBackfillTests(_OpsTestCase):
     """
 
     POINTS = {
-        # 0813：Z 当日涨停（供 0814 清单）+ Y 溢价点（open 9.5 → -5%）
+        # 0813：Z 当日涨停（供 0814 清单）+ Y 溢价点（open 9.5；prev_close=999 毒值——
+        # 0.8.13 起分母改用 T-1 收盘 11.0，毒值用于证明未回退到 pre_close 字段）
         "20260813": [
             {"code": "600004", "open": 10.5, "close": 11.0, "prev_close": 10.0, "is_st": False, "status": "TRADED"},
-            {"code": "600003", "open": 9.5, "prev_close": 10.0},
+            {"code": "600003", "open": 9.5, "prev_close": 999.0},
         ],
-        # 0812：Y 当日涨停（供 0813 清单）+ X 溢价点（open 11.0 → +10%）
+        # 0812：Y 当日涨停（供 0813 清单）+ X 溢价点（open 12.1 → 12.1/11.0-1=+10%）
         "20260812": [
             {"code": "600003", "open": 10.5, "close": 11.0, "prev_close": 10.0, "is_st": False, "status": "TRADED"},
-            {"code": "600002", "open": 11.0, "prev_close": 10.0},
+            {"code": "600002", "open": 12.1, "prev_close": 999.0},
         ],
         # 0811：X 当日涨停（供 0812 清单）
         "20260811": [
             {"code": "600002", "open": 10.5, "close": 11.0, "prev_close": 10.0, "is_st": False, "status": "TRADED"},
         ],
-        # 0814：Z 溢价点（open 10.6 → +6%）
+        # 0814：Z 溢价点（open 11.0 → 11.0/11.0-1=0%）
         "20260814": [
-            {"code": "600004", "open": 10.6, "prev_close": 10.0},
+            {"code": "600004", "open": 11.0, "prev_close": 999.0},
         ],
     }
 
@@ -1046,12 +1047,13 @@ class _AuctionBackfillTests(_OpsTestCase):
         r = app.auction_run_backfill(days=3)
         self.assertTrue(r["ok"], r)
         self.assertEqual(r["backfilled_days"], 3)
-        # 序列时间正序：0812(+10%) → 0813(-5%) → 0814(+6%)
+        # 序列时间正序（0.8.13：分母 = T-1 收盘 11.0，毒值 999 未生效即证明）：
+        # 0812: 12.1/11.0-1=+10% → 0813: 9.5/11.0-1=-13.64% → 0814: 11.0/11.0-1=0%
         vals = self._load_series("premium_mean")
         self.assertEqual(len(vals), 3)
         self.assertAlmostEqual(vals[0], 0.10)
-        self.assertAlmostEqual(vals[1], -0.05)
-        self.assertAlmostEqual(vals[2], 0.06)
+        self.assertAlmostEqual(vals[1], 9.5 / 11.0 - 1.0)
+        self.assertAlmostEqual(vals[2], 0.0)
         # 逐日指标（kline 口径）：0.8.11 起分位口径 = 此前 60 有效观测严格低于天数/60，
         # 3 天回填历史不足 → 全部 rank/strength 为 None（首个满分母分位在序列满 60 后）
         d0 = self._metrics("20260812")
@@ -1064,8 +1066,8 @@ class _AuctionBackfillTests(_OpsTestCase):
         d2 = self._metrics("20260814")
         self.assertIsNone(d2["rank_60d"]["premium_mean"])
         self.assertIsNone(d2["strength_60d"]["premium_mean"])
-        # 成功率序列
-        self.assertEqual(self._load_series("success_rate"), [1.0, 0.0, 1.0])
+        # 成功率序列（0.8.13 口径）：+10% → 1.0；-13.64% → 0.0；0% → 0.0
+        self.assertEqual(self._load_series("success_rate"), [1.0, 0.0, 0.0])
 
     def _metrics(self, d8):
         # round-trip：走 mydb_read 契约替身（与真实读取语义一致）
