@@ -804,5 +804,116 @@ class _StockdbGateTests(_OpsTestCase):
         self.assertIn("上游闸口", note)
 
 
+class _AuctionBackfillTests(_OpsTestCase):
+    """0.8.1 历史序列回填：冷启动修复（首跑前序列为空 → 分位无分母）。
+
+    夹具设计：每个交易日 D 的点集 = 当日非一字涨停股（全字段，供 D+1 清单）
+    + 昨日清单股的溢价点（open/prev_close，供 D 日溢价）。三对股票 X/Y/Z 串起三天。
+    """
+
+    POINTS = {
+        # 0813：Z 当日涨停（供 0814 清单）+ Y 溢价点（open 9.5 → -5%）
+        "20260813": [
+            {"code": "600004", "open": 10.5, "close": 11.0, "prev_close": 10.0, "is_st": False, "status": "TRADED"},
+            {"code": "600003", "open": 9.5, "prev_close": 10.0},
+        ],
+        # 0812：Y 当日涨停（供 0813 清单）+ X 溢价点（open 11.0 → +10%）
+        "20260812": [
+            {"code": "600003", "open": 10.5, "close": 11.0, "prev_close": 10.0, "is_st": False, "status": "TRADED"},
+            {"code": "600002", "open": 11.0, "prev_close": 10.0},
+        ],
+        # 0811：X 当日涨停（供 0812 清单）
+        "20260811": [
+            {"code": "600002", "open": 10.5, "close": 11.0, "prev_close": 10.0, "is_st": False, "status": "TRADED"},
+        ],
+        # 0814：Z 溢价点（open 10.6 → +6%）
+        "20260814": [
+            {"code": "600004", "open": 10.6, "prev_close": 10.0},
+        ],
+    }
+
+    def setUp(self):
+        super().setUp()
+        self.store = {}
+
+        def fake_snapshot(args):
+            return {"points": self.POINTS.get(args.get("date"), [])}
+
+        def fake_write(table, items):
+            self.store.setdefault(table, {})
+            for k, v in items:
+                self.store[table][str(k)] = v
+
+        self._patch_snap = mock.patch.object(app, "_auction_query_snapshot", side_effect=fake_snapshot)
+        self._patch_write = mock.patch.object(app, "mydb_write", side_effect=fake_write)
+        self._patch_latest = mock.patch.object(app, "data_latest_date", return_value="20260814")
+        self._patch_prev = mock.patch.object(app, "_auction_prev_trade_date", side_effect={
+            "20260814": "20260813", "20260813": "20260812",
+            "20260812": "20260811", "20260811": "20260810",
+        }.get)
+        for p in (self._patch_snap, self._patch_write, self._patch_latest, self._patch_prev):
+            p.start()
+        self.addCleanup(lambda: [p.stop() for p in (self._patch_snap, self._patch_write,
+                                                    self._patch_latest, self._patch_prev)])
+
+    def _load_series(self, metric):
+        table = self.store.get(f"打板序列:{metric}", {})
+        raw = table.get("series")
+        return json.loads(raw)["values"] if raw else None
+
+    def test_backfill_builds_series_and_daily_metrics(self):
+        r = app.auction_run_backfill(days=3)
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(r["backfilled_days"], 3)
+        # 序列时间正序：0812(+10%) → 0813(-5%) → 0814(+6%)
+        vals = self._load_series("premium_mean")
+        self.assertEqual(len(vals), 3)
+        self.assertAlmostEqual(vals[0], 0.10)
+        self.assertAlmostEqual(vals[1], -0.05)
+        self.assertAlmostEqual(vals[2], 0.06)
+        # 逐日指标（kline 口径）：首日分位 None（无前史）
+        d0 = json.loads(self.store["打板指标:20260812"]["metrics"])
+        self.assertEqual(d0["value_source"], "kline")
+        self.assertIsNone(d0["rank_60d"]["premium_mean"])
+        # 次日分位：-0.05 vs [0.10] → 0.0；末日分位：0.06 vs [0.10,-0.05] → 0.5
+        d1 = json.loads(self.store["打板指标:20260813"]["metrics"])
+        self.assertAlmostEqual(d1["rank_60d"]["premium_mean"], 0.0)
+        d2 = json.loads(self.store["打板指标:20260814"]["metrics"])
+        self.assertAlmostEqual(d2["rank_60d"]["premium_mean"], 0.5)
+        # 成功率序列
+        self.assertEqual(self._load_series("success_rate"), [1.0, 0.0, 1.0])
+
+    def test_backfill_idempotent(self):
+        app.auction_run_backfill(days=3)
+        first = self._load_series("premium_mean")
+        app.auction_run_backfill(days=3)
+        self.assertEqual(self._load_series("premium_mean"), first)
+
+    def test_route_backfill(self):
+        """POST /api/auction/run {"task":"backfill","days":3} → 200 结构正确。"""
+        # 注意：BaseRequestHandler.__init__ 会自动跑一次 handle()（把空 rfile 当请求行）。
+        # 构造后再换入带 body 的新 rfile 与干净 wfile，避免 body 被 parse_request 吃掉。
+        conn = _FakeConn()
+        handler = app.Handler(conn, ("127.0.0.1", 1), None)
+        body = json.dumps({"task": "backfill", "days": 3}).encode()
+        conn.wfile = io.BytesIO()
+        handler.wfile = conn.wfile
+        handler.rfile = io.BytesIO(body)
+        handler.command = "POST"
+        handler.request_version = "HTTP/1.1"
+        handler.protocol_version = "HTTP/1.1"
+        handler.requestline = "POST /api/auction/run HTTP/1.1"
+        handler.path = "/api/auction/run"
+        handler.headers = {"Content-Length": str(len(body))}
+        handler.do_POST()
+        raw = conn.wfile.getvalue()
+        head, _, resp_body = raw.partition(b"\r\n\r\n")
+        status = int(head.split(b" ", 2)[1])
+        payload = json.loads(resp_body.decode())
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["backfilled_days"], 3)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
