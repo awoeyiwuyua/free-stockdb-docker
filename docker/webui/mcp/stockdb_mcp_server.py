@@ -1425,9 +1425,12 @@ def query_point_snapshot(args: dict) -> dict:
         )
     except (TypeError, ValueError):
         raise ValueError("get_point_snapshot: limit 必须是整数") from None
-    if limit < 1:
+    if limit < 0:
         raise ValueError("get_point_snapshot: limit 必须是正整数")
-    limit = min(limit, _POINT_SNAPSHOT_LIMIT_MAX)
+    if limit == 0:
+        limit = None  # 内部全量语义（打板任务用）：不截断；工具 schema 仍限 1..200
+    elif limit > _POINT_SNAPSHOT_LIMIT_MAX:
+        limit = _POINT_SNAPSHOT_LIMIT_MAX
 
     universe_set = _a_share_universe_set()
     latest = _latest_trade_date()
@@ -1482,7 +1485,7 @@ def query_point_snapshot(args: dict) -> dict:
                 "message": "交易日无 bar（停牌/未上市/退市，单日 bar 无法进一步区分）",
             })
 
-    truncated = len(points) > limit
+    truncated = (limit is not None) and (len(points) > limit)
     kept = points[:limit] if truncated else points
 
     partial_reasons: list[str] = []
