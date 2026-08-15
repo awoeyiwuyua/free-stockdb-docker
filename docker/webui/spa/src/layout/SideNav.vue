@@ -11,27 +11,51 @@
       router
       class="side-menu"
     >
-      <el-menu-item-group v-for="g in NAV_GROUPS" :key="g.title" :title="collapsed ? '' : g.title">
+      <!-- 总览：单页项（LuCI 的 Status→Overview 模式） -->
+      <el-menu-item v-for="it in TOP_ITEMS" :key="it.path" :index="it.path">
+        <el-icon><component :is="it.icon" /></el-icon>
+        <template #title>{{ it.title }}</template>
+      </el-menu-item>
+
+      <!-- 分组：系统运维 / 模拟盘（el-sub-menu 可折叠，子项一页一职责） -->
+      <el-sub-menu v-for="g in NAV_GROUPS" :key="g.title" :index="g.title">
+        <template #title>
+          <el-icon><component :is="g.icon" /></el-icon>
+          <span>{{ g.title }}</span>
+        </template>
         <el-menu-item v-for="it in g.items" :key="it.path" :index="it.path">
           <el-icon><component :is="it.icon" /></el-icon>
-          <template #title>{{ it.title }}</template>
+          <template #title>
+            <el-badge
+              v-if="it.badge"
+              :value="store[it.badge]"
+              :hidden="!store[it.badge]"
+              type="danger"
+              class="nav-badge"
+            >
+              <span>{{ it.title }}</span>
+            </el-badge>
+            <span v-else>{{ it.title }}</span>
+          </template>
         </el-menu-item>
-      </el-menu-item-group>
+      </el-sub-menu>
     </el-menu>
   </div>
 </template>
 
 <script setup>
-// 学习点：props 接收父组件状态（折叠开关）；el-menu 的 router 模式 =
-// 点菜单即跳路由，default-active 用当前路由路径高亮。
+// 学习点：el-sub-menu 分组菜单树（LuCI 风格）；props 折叠开关；
+// el-menu router 模式 = 点菜单即跳路由，default-active 用当前路由路径高亮。
 import { useRoute } from 'vue-router'
-import { NAV_GROUPS } from './nav.js'
+import { TOP_ITEMS, NAV_GROUPS } from './nav.js'
+import { useGlobalStore } from '../stores/global.js'
 
 defineProps({
   collapsed: { type: Boolean, default: false },
 })
 
 const route = useRoute()
+const store = useGlobalStore() // 通知中心红点徽标数据源
 </script>
 
 <style scoped>
@@ -60,10 +84,12 @@ const route = useRoute()
   border-right: none;
   padding: 8px 0;
 }
-.side-menu :deep(.el-menu-item-group__title) {
-  padding: 12px 18px 4px;
-  font-size: 11px;
-  color: var(--muted);
-  letter-spacing: 1px;
+.nav-badge {
+  width: 100%;
+}
+.nav-badge :deep(.el-badge__content) {
+  transform: none;
+  position: static;
+  margin-left: 6px;
 }
 </style>

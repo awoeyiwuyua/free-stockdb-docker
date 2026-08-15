@@ -79,7 +79,7 @@ _last_verify_result: str | None = None  # 最近一次完整性验证结果（pa
 _scheduler_alive = False             # 定时线程心跳（每次循环更新时间戳）
 _scheduler_heartbeat = 0.0           # 定时线程最近一次心跳时间戳（unix）
 _webui_started = time.time()         # webui 进程启动时间戳
-WEBUI_VERSION = "0.6.0"
+WEBUI_VERSION = "0.6.1"
 
 HISTORY_FILE = DATA_DIR / "sync_history.json"
 SCHEDULE_FILE = DATA_DIR / "sync_schedule.json"
@@ -2893,6 +2893,8 @@ class Handler(BaseHTTPRequestHandler):
             self._paper_signal_status()
         elif path == "/api/overview":
             self._overview()
+        elif path == "/api/diag":
+            self._diag()
         elif path == "/api/alerts":
             self._alerts()
         elif path == "/api/alerts/summary":
@@ -3540,6 +3542,83 @@ class Handler(BaseHTTPRequestHandler):
         td = _latest_trade_date()
         self._send(200, json.dumps(
             signal_status(str(DATA_DIR / "emotion"), td), ensure_ascii=False))
+
+    def _diag(self):
+        """GET /api/diag：一键诊断 + 环境信息（只读聚合；单块失败只降级该块，整体 200）。
+
+        六项检查：上游 GitHub / 妙想 API / stockdb 服务 / pybao 模块 / 磁盘 / 交易日历。
+        每项 {name,label,ok,note}；env 块含 python/架构/镜像 tag/启动时间/数据最新日。
+        诊断是"人点一下"的体检入口，允许真实网络探测（上游 TTL 缓存；
+        MX 仅当引擎可用且已配 key 时探一次 get_balance）。
+        """
+        import importlib.util as _ilu
+        import platform as _platform
+
+        upstream = None
+        try:
+            upstream = fetch_upstream_release()
+        except Exception:  # noqa: BLE001 - 上游探针自身已降级，双保险
+            upstream = None
+        upstream_ok = bool(upstream and upstream.get("tag_name"))
+
+        mx_ok, mx_note = False, "未配置 apikey 或引擎不可用（跳过网络探测）"
+        if PAPER_MODULES_AVAILABLE:
+            engine, _ok, _reason = paper_gate(require_trading=True)
+            if engine is not None and engine.mx.masked_key != "未配置":
+                try:
+                    engine.mx.get_balance()
+                    mx_ok = True
+                    mx_note = f"妙想 API 连通（{engine.mx.masked_key}）"
+                except Exception as exc:  # noqa: BLE001
+                    mx_note = f"妙想 API 探测失败：{exc}"
+
+        cs = None
+        try:
+            cs = container_state(force=True)
+        except Exception:  # noqa: BLE001
+            cs = None
+        stockdb_ok = bool(cs and cs.get("ok"))
+
+        pybao_ok = all(_ilu.find_spec(m) is not None
+                       for m in ("stockdb", "zb_core", "zhibiao"))
+
+        disk_ok, disk_note = True, ""
+        try:
+            disk_note = json.dumps(disk_usage(), ensure_ascii=False)
+        except Exception as exc:  # noqa: BLE001
+            disk_ok, disk_note = False, str(exc)
+
+        checks = [
+            {"name": "upstream_github", "label": "上游 GitHub", "ok": upstream_ok,
+             "note": (f"最新 release：{upstream['tag_name']}" if upstream_ok
+                      else "不可达（网络受限时降级提示，不影响本机数据）")},
+            {"name": "mx_api", "label": "妙想模拟盘 API", "ok": mx_ok, "note": mx_note},
+            {"name": "stockdb_service", "label": "stockdb 服务", "ok": stockdb_ok,
+             "note": (f"{cs.get('status')}：{cs.get('note', '')}" if cs else "状态获取失败")},
+            {"name": "pybao", "label": "pybao 计算模块", "ok": pybao_ok,
+             "note": ("stockdb/zb_core/zhibiao 可导入" if pybao_ok
+                      else "存在模块缺失（影响指标/板块/私有存储）")},
+            {"name": "disk", "label": "磁盘", "ok": disk_ok, "note": disk_note},
+            {"name": "calendar", "label": "交易日历", "ok": True,
+             "note": f"覆盖至 {XSHG_HOLIDAYS_THROUGH}；今日{'是' if is_trading_day() else '非'}交易日"},
+        ]
+        env = {
+            "python": sys.version.split()[0],
+            "arch": _platform.machine(),
+            "webui_version": WEBUI_VERSION,
+            "ui_mode": WEBUI_UI,
+            "image_tag": os.environ.get("IMAGE_TAG") or os.environ.get("STOCKDB_VERSION"),
+            "started": datetime.fromtimestamp(_webui_started).strftime("%Y-%m-%d %H:%M:%S"),
+            "uptime_seconds": int(time.time() - _webui_started),
+            "data_dir": str(DATA_DIR),
+            "data_latest": data_latest_date(),
+        }
+        self._send(200, json.dumps({
+            "generated_at": datetime.now().isoformat(timespec="seconds"),
+            "env": env,
+            "checks": checks,
+            "all_ok": all(c["ok"] for c in checks),
+        }, ensure_ascii=False))
 
     def _version(self):
         """GET /api/version：webui 版本 / 镜像引擎 tag / 上游最新 release / stale 提示 /

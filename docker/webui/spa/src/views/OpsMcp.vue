@@ -271,7 +271,7 @@ onUnmounted(() => {
   background: var(--panel);
   border: 1px solid var(--line);
   border-radius: 12px;
-  padding: 16px;
+  padding: 14px; /* LuCI 密度：卡片内边距 12-14px */
 }
 .panel-title {
   margin: 0 0 12px;

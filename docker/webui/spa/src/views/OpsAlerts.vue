@@ -52,7 +52,7 @@
         <div class="list-meta">共 {{ alerts.length }} 条（最新在前）</div>
         <!-- 告警行点击可收起/展开「来源」明细：直接用原生 table 更轻，
              el-table 在这里没有排序/分页需求，原生表格即可 -->
-        <el-table :data="alerts" size="default" class="alerts-table">
+        <el-table :data="alerts" size="small" class="alerts-table">
           <el-table-column label="时间" width="170">
             <template #default="{ row }">
               <span class="muted-cell">{{ fmtTs(row.ts) }}</span>
@@ -86,7 +86,7 @@
 </template>
 
 <script setup>
-// OpsAlerts — 通知中心：告警列表（最新在前）+ 清空（二次确认）+ 30s 轮询。
+// OpsAlerts — 通知中心（/ops/alerts）：告警列表（最新在前）+ 清空（二次确认）+ 30s 轮询。
 // 学习点：
 // 1) 顶栏红点数据来自全局 store（/api/overview 的 alerts.count），
 //    清空成功后手动调 store.refresh() 把红点立刻归零，不用等下一轮 30s；
@@ -208,7 +208,7 @@ onUnmounted(() => {
   background: var(--panel);
   border: 1px solid var(--line);
   border-radius: 12px;
-  padding: 16px;
+  padding: 14px; /* LuCI 密度：卡片内边距 12-14px */
 }
 .stale-alert {
   margin-bottom: 0;
