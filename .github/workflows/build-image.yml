@@ -156,6 +156,6 @@ jobs:
         working-directory: docker/webui
         run: python -m unittest mcp.test_stockdb_mcp_server -v
 
-      - name: Run ops/paper unit tests
+      - name: Run ops + auction unit tests
         working-directory: docker/webui
-        run: python -m unittest test_ops test_paper -v
+        run: python -m unittest test_ops test_auction_collect test_auction_metrics test_auction_list -v
