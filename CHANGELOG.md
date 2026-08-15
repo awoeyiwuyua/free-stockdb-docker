@@ -3,6 +3,11 @@
 本项目面板版本号 = `WEBUI_VERSION`（`docker/webui/app.py`），镜像 tag 跟随上游引擎版本。
 发布纪律见 `docs/webui-spa/release-policy.md`；部署记录见 `docs/DEPLOYMENTS.md`。
 
+## [0.8.5] — 2026-08-15（打板工具全扫路径补节流）
+- 修复同类问题：get_board_open_effect_history 的全市场拉取路径自带 16 线程无节流池
+  （与 query_point_snapshot 同因的端口耗尽风险）；统一 8 并发 + 50ms 节流
+- 全仓库线程池排查完毕：仅此三处全扫路径，均已治理
+
 ## [0.8.4] — 2026-08-15（全扫连接卫生）
 - 修复：全市场快照 16 并发无节流 → NAS 临时端口耗尽（Errno 99 Cannot assign requested address）
 - 全扫改 8 并发 + 每请求 50ms 节流（约 160 req/s，TIME_WAIT 存量远低于端口池）
