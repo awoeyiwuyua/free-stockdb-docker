@@ -55,6 +55,7 @@ from __future__ import annotations
 import datetime
 import io
 import json
+import time
 import os
 import shutil
 import sqlite3
@@ -1088,6 +1089,64 @@ class _DiagTests(_OpsTestCase):
         payload = json.loads(body.decode())
         py = next(c for c in payload["checks"] if c["name"] == "pybao")
         self.assertIsInstance(py["ok"], bool)
+
+
+class _DataLatestDateTests(_OpsTestCase):
+    """Phase 5.1 稳定性：data_latest_date 失败缓存 + 并发单飞（防多标签切换打瘫后端）。"""
+
+    def setUp(self):
+        super().setUp()
+        app._latest_date_cache.update(at=0.0, val=None)
+
+    def test_failure_result_is_cached(self):
+        """探测失败（None）也缓存：8s 内不重复打 stockdb（此前失败不缓存会风暴重探）。"""
+        with mock.patch("urllib.request.urlopen", side_effect=OSError("down")):
+            first = app.data_latest_date()
+            second = app.data_latest_date()
+        self.assertIsNone(first)
+        self.assertIsNone(second)
+        # 两次调用只打了一轮探测（缓存命中，未再 urlopen）
+        with mock.patch("urllib.request.urlopen") as m:
+            app.data_latest_date()
+            app.data_latest_date()
+        self.assertEqual(m.call_count, 0)
+
+    def test_single_flight_concurrent_probe(self):
+        """并发探测单飞：一路在跑时其余调用立即返回缓存，urlopen 只被调一轮。"""
+        def _slow_urlopen(*a, **k):
+            time.sleep(0.4)
+            resp = mock.MagicMock()
+            resp.__enter__ = mock.MagicMock(return_value=resp)
+            resp.__exit__ = mock.MagicMock(return_value=False)
+            resp.read.return_value = json.dumps([{"date": "20260814"}]).encode()
+            return resp
+
+        with mock.patch("urllib.request.urlopen", side_effect=_slow_urlopen) as m:
+            t = threading.Thread(target=app.data_latest_date, kwargs={"force": True})
+            t.start()
+            time.sleep(0.05)  # 确保线程已持有探测锁
+            second = app.data_latest_date(force=True)  # 锁被占 → 立即返回缓存（None）
+            t.join()
+            count_after_first_round = m.call_count
+            third = app.data_latest_date()  # 探测完成且写入缓存 → 命中，不再 urlopen
+            count_after_third = m.call_count
+        self.assertIsNone(second)  # 缓存尚未写入，合法（下一轮轮询拿到新值）
+        self.assertGreaterEqual(count_after_first_round, 3)  # 一轮探测 = 3~4 个月前缀
+        self.assertEqual(count_after_third, count_after_first_round)  # 缓存命中零新探测
+        self.assertEqual(third, "20260814")
+
+    def test_success_cache_hit(self):
+        """成功后 8s 内命中缓存，不再 urlopen。"""
+        with mock.patch("urllib.request.urlopen") as m:
+            resp = mock.MagicMock()
+            resp.__enter__ = mock.MagicMock(return_value=resp)
+            resp.__exit__ = mock.MagicMock(return_value=False)
+            resp.read.return_value = json.dumps([{"date": "20260814"}]).encode()
+            m.side_effect = lambda *a, **k: resp
+            first = app.data_latest_date()
+            second = app.data_latest_date()
+        self.assertEqual(first, "20260814")
+        self.assertEqual(second, "20260814")
 
 
 if __name__ == "__main__":

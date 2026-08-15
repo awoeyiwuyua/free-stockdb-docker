@@ -79,7 +79,7 @@ _last_verify_result: str | None = None  # 最近一次完整性验证结果（pa
 _scheduler_alive = False             # 定时线程心跳（每次循环更新时间戳）
 _scheduler_heartbeat = 0.0           # 定时线程最近一次心跳时间戳（unix）
 _webui_started = time.time()         # webui 进程启动时间戳
-WEBUI_VERSION = "0.6.2"
+WEBUI_VERSION = "0.6.3"
 
 HISTORY_FILE = DATA_DIR / "sync_history.json"
 SCHEDULE_FILE = DATA_DIR / "sync_schedule.json"
@@ -410,27 +410,34 @@ def data_latest_date(force: bool = False) -> str | None:
     同步验证/重启检测等需要实时的路径传 force=True 绕过缓存。
     """
     now = time.time()
-    if not force and _latest_date_cache["val"] is not None and now - _latest_date_cache["at"] < 8:
+    if not force and now - _latest_date_cache["at"] < 8:
+        return _latest_date_cache["val"]  # 失败结果（None）同样缓存：stockdb 忙/挂时不重复打探
+    if not _latest_date_probe_lock.acquire(blocking=False):
+        # 已有并发探测在跑（单飞）：立即返回缓存旧值（可能为 None），
+        # 下一轮轮询自然拿到新值——避免多标签切换时 N 路同时打 4 个 10s 慢请求
         return _latest_date_cache["val"]
-    import urllib.request, urllib.parse
-    from datetime import datetime as dt, timedelta
-    today = dt.now()
-    start = (today - timedelta(days=95)).strftime("%Y%m%d")
-    end = today.strftime("%Y%m%d")
-    dates = []
-    for prefix in _month_prefixes(start, end):
-        try:
-            url = f"http://{STOCKDB_HOST}:{STOCKDB_PORT}/?cmd=vals&t={urllib.parse.quote(f'日k:000001:{prefix}*')}"
-            with urllib.request.urlopen(url, timeout=10) as resp:
-                rows = json.loads(resp.read().decode("utf-8", "replace"))
-            for row in rows if isinstance(rows, list) else []:
-                if isinstance(row, dict) and row.get("date"):
-                    dates.append(str(row["date"]))
-        except Exception:
-            continue
-    result = max(dates) if dates else None
-    _latest_date_cache.update(at=now, val=result)
-    return result
+    try:
+        import urllib.request, urllib.parse
+        from datetime import datetime as dt, timedelta
+        today = dt.now()
+        start = (today - timedelta(days=95)).strftime("%Y%m%d")
+        end = today.strftime("%Y%m%d")
+        dates = []
+        for prefix in _month_prefixes(start, end):
+            try:
+                url = f"http://{STOCKDB_HOST}:{STOCKDB_PORT}/?cmd=vals&t={urllib.parse.quote(f'日k:000001:{prefix}*')}"
+                with urllib.request.urlopen(url, timeout=10) as resp:
+                    rows = json.loads(resp.read().decode("utf-8", "replace"))
+                for row in rows if isinstance(rows, list) else []:
+                    if isinstance(row, dict) and row.get("date"):
+                        dates.append(str(row["date"]))
+            except Exception:
+                continue
+        result = max(dates) if dates else None
+        _latest_date_cache.update(at=now, val=result)
+        return result
+    finally:
+        _latest_date_probe_lock.release()
 
 
 def _classify_code(code: str) -> str:
@@ -739,6 +746,7 @@ def code_stats() -> dict:
 
 _coverage_cache: dict = {"at": 0.0, "data": None}  # 15 分钟缓存，避免 4s 轮询重复全历史扫描
 _latest_date_cache: dict = {"at": 0.0, "val": None}  # 8 秒缓存：/api/status 4s 心跳不重复打 stockdb
+_latest_date_probe_lock = threading.Lock()  # 单飞锁：并发缓存失效时只跑一路探测（其余立即取缓存）
 _code_stats_cache: dict = {"at": 0.0, "val": None}   # 15 秒缓存：全市场代码列表 GET 较贵
 _container_state_cache: dict = {"at": 0.0, "val": None}  # 5 秒缓存：stockdb 进程探测
 
