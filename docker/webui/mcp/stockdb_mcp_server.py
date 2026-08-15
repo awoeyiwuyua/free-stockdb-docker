@@ -1036,10 +1036,12 @@ def _merge_auction_day_row(
             counts["excluded_one_word_count"] += 1
             continue
         counts["eligible_count"] += 1
-        # 溢价改用快照 open_price/prev_close（契约：None 剔除，即停牌/无竞价不计）
+        # 溢价 = 快照 open_price / T-1 收盘价 - 1（0.8.13：分母统一用 T-1 日收盘
+        # bar.close——快照 prev_close 为采集时交易所调整昨收，除权除息日会混入分红失真；
+        # 与历史段 board_metrics 口径一致）
         rec = snaps.get(bar.code)
         open_price = _auction_float(rec.get("open_price")) if rec else None
-        prev_close = _auction_float(rec.get("prev_close")) if rec else None
+        prev_close = _auction_float(bar.close)  # T-1 收盘（bar 即 T-1 日 K 线）
         if open_price is None or prev_close is None or open_price <= 0 or prev_close <= 0:
             counts["missing_open_count"] += 1  # 无可用开盘价：剔除并计数（同日K口径）
             continue

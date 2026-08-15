@@ -79,7 +79,7 @@ _last_verify_result: str | None = None  # 最近一次完整性验证结果（pa
 _scheduler_alive = False             # 定时线程心跳（每次循环更新时间戳）
 _scheduler_heartbeat = 0.0           # 定时线程最近一次心跳时间戳（unix）
 _webui_started = time.time()         # webui 进程启动时间戳
-WEBUI_VERSION = "0.8.12"
+WEBUI_VERSION = "0.8.13"
 
 HISTORY_FILE = DATA_DIR / "sync_history.json"
 SCHEDULE_FILE = DATA_DIR / "sync_schedule.json"
@@ -2917,15 +2917,23 @@ def auction_run_close() -> dict:
 
         # ④ K线权威指标：与 09:26 竞价版同一清单口径（保证两版可比）；
         #    清单缺失 → 当日快照代码 → 全市场（逐级兜底）
+        #    0.8.13：溢价分母 = T-1 收盘价（补拉 T-1 快照；T 日 bar 的 pre_close
+        #    在除权除息日为调整昨收，混入分红会失真）
         codes = _auction_load_codes(today) or [str(c) for c in (snap_res.get("values") or {})]
+        prev_day = _auction_prev_trade_date(today)
+        prev_points = (_auction_query_snapshot({"date": prev_day, "limit": 0}) or {}).get("points") or []
+        prev_close_by_code = {str(p.get("code")): p.get("close") for p in prev_points}
         if codes:
             code_set = set(codes)
             snapshots = [{"code": p["code"], "open_price": p.get("open"),
-                          "prev_close": p.get("prev_close")}
+                          "prev_close": prev_close_by_code.get(str(p.get("code")))}
                          for p in points if str(p.get("code")) in code_set]
         else:
             snapshots = [{"code": p["code"], "open_price": p.get("open"),
-                          "prev_close": p.get("prev_close")} for p in points]
+                          "prev_close": prev_close_by_code.get(str(p.get("code")))}
+                         for p in points]
+        # 防御：清单股在 T-1 无收盘（异常）→ 剔除，避免 None 分母进指标
+        snapshots = [s for s in snapshots if s["prev_close"] is not None]
         metrics = _auction_compute_metrics(snapshots)
         series_by = {}
         for m in AUCTION_METRICS:
@@ -2995,6 +3003,9 @@ def auction_run_backfill(days: int = 60) -> dict:
             t1 = _auction_prev_trade_date(t)          # T-1 交易日
             pts1 = (_auction_query_snapshot({"date": t1, "limit": 0}) or {}).get("points") or []
             codes = _auction_compute_limitup_list(pts1).get("codes") or []
+            # T-1 收盘价（0.8.13：溢价分母 = "t-1 日收盘价"——T 日 bar 的 pre_close
+            # 在除权除息日为交易所调整昨收，会混入分红使溢价失真，不可用作分母）
+            prev_close_by_code = {str(p.get("code")): p.get("close") for p in pts1}
             snaps = []
             if codes:
                 # 溢价日只查清单股（免全扫）；清单可能 >200 只 → 分块拉取（0.8.9）
@@ -3002,9 +3013,10 @@ def auction_run_backfill(days: int = 60) -> dict:
                 by_code = {str(p.get("code")): p for p in pts_t}
                 for c in codes:
                     p = by_code.get(c)
-                    if p and p.get("open") is not None and p.get("prev_close") is not None:
+                    prev_close = prev_close_by_code.get(c)
+                    if p and p.get("open") is not None and prev_close is not None:
                         snaps.append({"code": c, "open_price": p.get("open"),
-                                      "prev_close": p.get("prev_close")})
+                                      "prev_close": prev_close})
             m = _auction_compute_metrics(snaps)
             if m["n_samples"] > 0:
                 rows.append((t, m))
