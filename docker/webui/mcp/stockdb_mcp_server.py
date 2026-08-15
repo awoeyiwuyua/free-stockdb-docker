@@ -1435,7 +1435,14 @@ def query_point_snapshot(args: dict) -> dict:
     universe_set = _a_share_universe_set()
     latest = _latest_trade_date()
 
+    # 全市场扫描连接卫生（0.8.4）：5000+ 只/次、每只一个新 TCP 连接，无节流会
+    # 快速耗尽 NAS 临时端口（实测 Errno 99 Cannot assign requested address）。
+    # 8 并发 + 每请求 50ms 节流 ≈ 160 req/s，TIME_WAIT 存量远低于端口池上限。
+    _SNAPSHOT_PACING = 0.05
+
     def fetch_one(code: str) -> tuple[str, dict | None, str | None]:
+        if not explicit:
+            time.sleep(_SNAPSHOT_PACING)  # 仅全市场路径节流；显式小清单不需要
         try:
             return code, _bar_from_get(_http_get("get", f"日k:{code}:{date}")), None
         except Exception as exc:  # noqa: BLE001 - 单只失败保留诊断，不影响整体
@@ -1445,7 +1452,7 @@ def query_point_snapshot(args: dict) -> dict:
         outcomes = [fetch_one(code) for code in requested]
     else:
         outcomes = []
-        with ThreadPoolExecutor(max_workers=16) as pool:
+        with ThreadPoolExecutor(max_workers=8) as pool:
             futures = {pool.submit(fetch_one, code): code for code in requested}
             for future in as_completed(futures):
                 outcomes.append(future.result())

@@ -79,7 +79,7 @@ _last_verify_result: str | None = None  # 最近一次完整性验证结果（pa
 _scheduler_alive = False             # 定时线程心跳（每次循环更新时间戳）
 _scheduler_heartbeat = 0.0           # 定时线程最近一次心跳时间戳（unix）
 _webui_started = time.time()         # webui 进程启动时间戳
-WEBUI_VERSION = "0.8.3"
+WEBUI_VERSION = "0.8.4"
 
 HISTORY_FILE = DATA_DIR / "sync_history.json"
 SCHEDULE_FILE = DATA_DIR / "sync_schedule.json"
@@ -2918,7 +2918,9 @@ def auction_run_backfill(days: int = 60) -> dict:
             codes = _auction_compute_limitup_list(pts1).get("codes") or []
             snaps = []
             if codes:
-                pts_t = (_auction_query_snapshot({"date": t, "limit": 0}) or {}).get("points") or []
+                # 溢价日只查清单股（显式小清单，免一次 5000+ 全扫——0.8.4 连接卫生）
+                pts_t = (_auction_query_snapshot({"date": t, "codes": codes, "limit": 0})
+                         or {}).get("points") or []
                 by_code = {str(p.get("code")): p for p in pts_t}
                 for c in codes:
                     p = by_code.get(c)
