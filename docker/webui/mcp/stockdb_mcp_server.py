@@ -826,15 +826,17 @@ def query_fullmarket_daily_snapshot(
                         continue
                     close = float(row.get("close"))
                     raw_prev_close = row.get("pre_close")
-                    if raw_prev_close not in (None, "", 0, "0"):
-                        # 0.8.14：pre_close 被未来除权因子回溯污染 → 重建当日法定
-                        # 涨跌停参考价（因子表不可用/无事件 → 原值，未除权无影响）
-                        cum = pybao_tools.get_fq_cum(code, day) if pybao_tools else None
-                        if cum is not None:
-                            prev_close = rebuild_limit_reference_price(
-                                float(raw_prev_close), cum[0], cum[1])
-                        else:
-                            prev_close = float(raw_prev_close)
+                    # 0.8.15 法定涨跌停参考价（验收修正：污染不均匀，禁止统一反推）：
+                    #   - 普通日：上一实际成交日未复权收盘（history_close 逐日追踪）
+                    #   - 除权日（因子表当日有事件）：当日 pre_close = 法定除权参考价（可信）
+                    #   - 无历史（区间首行）/停牌跨日：pre_close 兜底
+                    is_fq_event = bool(pybao_tools) and pybao_tools.is_fq_event_date(code, day)
+                    if is_fq_event and raw_prev_close not in (None, "", 0, "0"):
+                        prev_close = float(raw_prev_close)  # 除权日法定参考价
+                    elif history_close is not None:
+                        prev_close = history_close  # 普通日：上一实际成交日未复权收盘
+                    elif raw_prev_close not in (None, "", 0, "0"):
+                        prev_close = float(raw_prev_close)  # 兜底：区间首行等
                     else:
                         prev_close = history_close
                     is_st = parse_is_st(row.get("is_st"))
