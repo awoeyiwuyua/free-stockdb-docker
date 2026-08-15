@@ -861,7 +861,10 @@ class _AuctionBackfillTests(_OpsTestCase):
     def _load_series(self, metric):
         table = self.store.get(f"打板序列:{metric}", {})
         raw = table.get("series")
-        return json.loads(raw)["values"] if raw else None
+        if not raw:
+            return None
+        data = raw if isinstance(raw, dict) else json.loads(raw)
+        return data.get("values")
 
     def test_backfill_builds_series_and_daily_metrics(self):
         r = app.auction_run_backfill(days=3)
@@ -874,16 +877,20 @@ class _AuctionBackfillTests(_OpsTestCase):
         self.assertAlmostEqual(vals[1], -0.05)
         self.assertAlmostEqual(vals[2], 0.06)
         # 逐日指标（kline 口径）：首日分位 None（无前史）
-        d0 = json.loads(self.store["打板指标:20260812"]["metrics"])
+        d0 = self._metrics("20260812")
         self.assertEqual(d0["value_source"], "kline")
         self.assertIsNone(d0["rank_60d"]["premium_mean"])
         # 次日分位：-0.05 vs [0.10] → 0.0；末日分位：0.06 vs [0.10,-0.05] → 0.5
-        d1 = json.loads(self.store["打板指标:20260813"]["metrics"])
+        d1 = self._metrics("20260813")
         self.assertAlmostEqual(d1["rank_60d"]["premium_mean"], 0.0)
-        d2 = json.loads(self.store["打板指标:20260814"]["metrics"])
+        d2 = self._metrics("20260814")
         self.assertAlmostEqual(d2["rank_60d"]["premium_mean"], 0.5)
         # 成功率序列
         self.assertEqual(self._load_series("success_rate"), [1.0, 0.0, 1.0])
+
+    def _metrics(self, d8):
+        raw = self.store.get(f"打板指标:{d8}", {}).get("metrics")
+        return raw if isinstance(raw, dict) else json.loads(raw)
 
     def test_backfill_idempotent(self):
         app.auction_run_backfill(days=3)
