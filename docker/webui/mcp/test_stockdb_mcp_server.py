@@ -2143,3 +2143,18 @@ class StockdbMcpServerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+# === 0.8.x 连接卫生回归（全市场快照节流：每请求 sleep + limit=0 全量） ===
+class _SnapshotPacingTests(unittest.TestCase):
+    def test_fullmarket_snapshot_pacing_and_no_truncation(self):
+        """全市场路径：每只一次节流 sleep；limit=0 返回全量且不截断。"""
+        codes = [f"6000{i:02d}" for i in range(20)]
+        bar = {"date": 20260814, "open": 10.0, "pre_close": 10.0, "close": 11.0,
+               "high": 11.0, "low": 9.9, "volume": 100, "amount": 1000, "is_st": False}
+        with mock.patch.object(server, "query_stock_list", return_value={"codes": codes}), \
+             mock.patch.object(server, "_http_get", return_value=bar), \
+             mock.patch.object(server.time, "sleep") as m_sleep:
+            result = server.query_point_snapshot({"date": "20260814", "limit": 0})
+        self.assertEqual(m_sleep.call_count, 20)      # 每只一次节流（0.8.4 契约）
+        self.assertEqual(len(result["points"]), 20)   # limit=0 全量（0.8.3 契约）
+        self.assertFalse(result["truncated"])
