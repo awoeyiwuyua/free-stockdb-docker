@@ -1,6 +1,6 @@
 <template>
   <!-- ============================================================
-       私有存储页（/data/mydb）——旧面板「私有存储」子页搬迁。
+       私有存储页（/ops/mydb）——旧面板「私有存储」子页搬迁。
        学习点：本页是"手动操作型"页面——表清单 30s 轮询保新鲜，
        读取/写入/查询都是用户点按触发；写入属数据改动，必须二次确认。
        ============================================================ -->
@@ -506,6 +506,7 @@ onUnmounted(() => {
 .page-title {
   margin: 0;
   font-size: 18px;
+  font-weight: 700;
   color: var(--text);
 }
 .page-alert {
@@ -531,11 +532,11 @@ onUnmounted(() => {
   background: var(--panel);
   border: 1px solid var(--line);
   border-radius: 12px;
-  padding: 16px;
+  padding: 14px; /* LuCI 密度：卡片内边距 12-14px */
 }
 .card-title {
   margin: 0 0 12px;
-  font-size: 15px;
+  font-size: 14px; /* 与全站 .panel-title 同口径 */
   font-weight: 600;
   color: var(--text);
 }

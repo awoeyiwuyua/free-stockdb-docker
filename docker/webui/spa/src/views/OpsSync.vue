@@ -1,9 +1,11 @@
 <template>
   <!-- ============================================================
-       数据同步页（/data/sync）——旧面板「数据同步」页签 source 子页搬迁。
+       数据同步页（/ops/sync）——旧面板「数据同步」页签 source 子页搬迁。
        学习点：本页几乎全是"状态展示 + 触发动作"，没有复杂业务逻辑——
        页面自管 30s 轮询（onMounted 首拉 + setInterval + onUnmounted 清理），
-       危险操作（重启容器）必须 ElMessageBox.confirm 二次确认。
+       危险操作（启动同步/保存定时/港股同步）必须 ElMessageBox.confirm 二次确认。
+       页顶趋势图直接复用同步历史数组（duration_sec/downloads），不额外请求接口；
+       容器日志与重启按钮已迁往 /ops/health，本页不再重复。
        ============================================================ -->
   <div class="page">
 
@@ -39,6 +41,31 @@
 
     <!-- ③ 正常态：数据齐了，逐块渲染 -->
     <template v-else>
+
+      <!-- ================= 同步耗时趋势（页顶新增） =================
+           直接复用 /api/history 的同一份数组做图，不额外请求接口：
+           x = 每次同步的 ts（时间），左轴 = 耗时 duration_sec（秒），右轴 = 下载文件数 downloads。
+           折线断点 = 那次同步没有数值（如 exit_code=null 的"运行中"记录，字段缺失）。
+           三态齐备：有图 / 无任何历史（EmptyState）/ 有历史但无数值（EmptyState）。 -->
+      <section class="card">
+        <h3 class="card-title">同步耗时趋势</h3>
+        <p class="card-hint">
+          最近 {{ history.length }} 次同步的耗时与下载量；断点表示该次同步未产生数值（运行中或异常中断）。
+        </p>
+        <EChart v-if="history.length && chartHasData" :option="chartOption" height="280px" />
+        <EmptyState
+          v-else-if="!history.length"
+          icon="TrendCharts"
+          title="暂无同步历史"
+          description="启动一次同步后，这里会展示每次任务的耗时与下载量趋势。"
+        />
+        <EmptyState
+          v-else
+          icon="DataLine"
+          title="暂无趋势数据"
+          description="历史记录暂缺耗时/下载数字段，等待一次完整同步后自动展示。"
+        />
+      </section>
 
       <!-- ================= 状态总览 ================= -->
       <section class="card">
@@ -290,22 +317,6 @@
         <pre v-else ref="logEl" class="log-pre">{{ syncLog }}</pre>
       </section>
 
-      <!-- ================= 容器区 ================= -->
-      <section class="card">
-        <h3 class="card-title">容器（stockdb 进程）</h3>
-        <div class="actions">
-          <el-button :icon="Document" @click="toggleContainerLog">
-            {{ containerLogOpen ? '收起容器日志' : '展开容器日志' }}
-          </el-button>
-          <el-button type="danger" :icon="RefreshRight" :loading="restarting" :disabled="status.sync_running" @click="doRestart">
-            重启 stockdb
-          </el-button>
-          <span class="hint">重启期间行情服务短暂中断；同步进行中禁止重启（后端同样拒绝）</span>
-        </div>
-        <!-- 容器日志：展开时才拉取（懒加载，省请求） -->
-        <pre v-if="containerLogOpen" class="log-pre">{{ containerLog || '（stockdb 日志为空）' }}</pre>
-      </section>
-
       <!-- ================= 港股同步 ================= -->
       <section class="card">
         <h3 class="card-title">港股日K 同步</h3>
@@ -351,16 +362,18 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 // 按钮上的图标：:icon 属性需要"真实的组件对象"（全局注册只对模板标签生效），
 // 所以和 EmptyState.vue 一样从图标包里显式 import（包已在 package.json 依赖里）
 import {
-  Refresh, VideoPlay, SwitchButton, Bottom, Document, RefreshRight, Download,
+  Refresh, VideoPlay, SwitchButton, Bottom, Download,
 } from '@element-plus/icons-vue'
-// 状态域 API：本页所有后端调用都从这一个模块来（接口变化只改 api/status.js）
+// 状态域 API：本页所有后端调用都从这一个模块来（接口变化只改 api/status.js）。
+// 注意：getContainerLogs / restartContainer 已随容器区块迁往 /ops/health，这里不再引入
 import {
   getStatus, getHistory, getSchedule, saveSchedule,
-  getLog, getContainerLogs, restartContainer, runSync, hkSync,
+  getLog, runSync, hkSync,
 } from '../api/status.js'
-// 现成资产：指标卡 / 空态 / 格式化工具
+// 现成资产：指标卡 / 空态 / 图表封装 / 格式化工具
 import StatCard from '../components/StatCard.vue'
 import EmptyState from '../components/EmptyState.vue'
+import EChart from '../components/EChart.vue'
 import { fmtYMD } from '../utils/format.js'
 // 全局 store：数据滞后天数等"总览相关"字段直接读 store，不重复轮询
 import { useGlobalStore } from '../stores/global.js'
@@ -395,12 +408,9 @@ const status = ref(null)      // /api/status 全量载荷（含 container/sync/d
 const history = ref([])       // /api/history 同步历史（后端按时间正序追加，末尾最新）
 const schedule = ref(null)    // /api/schedule 定时配置
 const syncLog = ref('')       // /api/log 同步日志尾部
-const containerLog = ref('')  // /api/container/logs 容器日志
-const containerLogOpen = ref(false) // 容器日志展开开关（懒加载）
 const loading = ref(false)    // 首拉/手动刷新中
 const error = ref(null)       // 最近一次失败文案（页面顶部 alert，不打断使用）
 const syncBusy = ref(false)   // 同步请求进行中（按钮 loading）
-const restarting = ref(false) // 重启请求进行中
 const logEl = ref(null)       // 日志 pre 的 DOM 引用（自动滚动用）
 
 // 定时计划表单（与后端 schedule 对象双向同步；schDirty 防轮询吞掉未保存草稿）
@@ -467,6 +477,100 @@ const diskText = computed(() => {
 const schTodayNote = computed(() => {
   if (!schEnabled.value || !schTrading.value || !status.value) return ''
   return status.value.trading_today ? '' : '今日非交易日，定时将跳过'
+})
+
+// ================= 趋势图（页顶卡片） =================
+// 是否有可画的数值（耗时/下载数至少出现一次）：决定画折线图还是空态
+const chartHasData = computed(() =>
+  history.value.some((r) => r.duration_sec != null || r.downloads != null)
+)
+
+// ECharts 折线 option：x=时间（ts），左轴=耗时（秒），右轴=下载文件数（个）。
+// 表格里 history 是"新→旧"（loadHistory 时 reverse 过），画图前翻回"旧→新"让时间轴自然从左往右。
+// duration_sec 是 app.py append_history 写入的秒数（后端真实字段），downloads 是下载文件数。
+const chartOption = computed(() => {
+  const rows = [...history.value].reverse()
+  if (!rows.length) return null
+  const okColor = cssVar('--ok', '#22c55e')
+  const brandColor = cssVar('--brand', '#3b82f6')
+  const mutedColor = cssVar('--muted', '#8fa2bc')
+  const lineColor = cssVar('--line', '#1e2c45')
+  return {
+    grid: { left: 8, right: 8, top: 34, bottom: 8, containLabel: true },
+    tooltip: {
+      trigger: 'axis',
+      // 自定义悬浮窗：完整时间 + 各轴数值 + 结果标签（复用历史表格的 resultText 四态判定）
+      formatter: (params) => {
+        const i = params[0]?.dataIndex ?? 0
+        const r = rows[i] || {}
+        const lines = [`<b>${r.ts || '—'}</b>`]
+        for (const p of params) lines.push(`${p.marker}${p.seriesName}：${p.value ?? '—'}`)
+        lines.push(`结果：${resultText(r)}`)
+        return lines.join('<br/>')
+      },
+    },
+    legend: {
+      top: 0, right: 0,
+      textStyle: { color: mutedColor, fontSize: 12 },
+      itemWidth: 14, itemHeight: 8,
+    },
+    xAxis: {
+      type: 'category',
+      data: rows.map((r) => fmtTsShort(r.ts)),
+      boundaryGap: false, // 折线贴边，时间轴连贯
+      axisLine: { lineStyle: { color: lineColor } },
+      axisLabel: { color: mutedColor, fontSize: 11 },
+    },
+    yAxis: [
+      {
+        type: 'value',
+        name: '耗时(秒)',
+        scale: true, // 只显示有值的区间，耗时波动小也看得清
+        nameTextStyle: { color: mutedColor, fontSize: 11 },
+        axisLabel: { color: mutedColor, fontSize: 11 },
+        splitLine: { lineStyle: { color: lineColor } },
+      },
+      {
+        type: 'value',
+        name: '下载(个)',
+        scale: true,
+        nameTextStyle: { color: mutedColor, fontSize: 11 },
+        axisLabel: { color: mutedColor, fontSize: 11 },
+        splitLine: { show: false }, // 右轴不画网格线，避免和左轴重叠
+      },
+    ],
+    series: [
+      {
+        name: '耗时',
+        type: 'line',
+        data: rows.map((r) => (r.duration_sec != null ? Number(r.duration_sec) : null)),
+        smooth: true,
+        symbolSize: 5,
+        lineStyle: { width: 2, color: brandColor },
+        itemStyle: { color: brandColor },
+        // 渐变面积：hex 颜色拼透明度后缀（00=全透明 → 33=浅色）
+        areaStyle: {
+          color: {
+            type: 'linear', x: 0, y: 0, x2: 0, y2: 1,
+            colorStops: [
+              { offset: 0, color: brandColor + '33' },
+              { offset: 1, color: brandColor + '00' },
+            ],
+          },
+        },
+      },
+      {
+        name: '下载文件数',
+        type: 'line',
+        yAxisIndex: 1,
+        data: rows.map((r) => (r.downloads != null ? Number(r.downloads) : null)),
+        smooth: true,
+        symbolSize: 5,
+        lineStyle: { width: 2, color: okColor },
+        itemStyle: { color: okColor },
+      },
+    ],
+  }
 })
 
 // ================= 数据加载 =================
@@ -568,29 +672,6 @@ async function doSync(hot) {
   }
 }
 
-// 重启 stockdb：危险操作，ElMessageBox.confirm 二次确认（用户取消直接 return）
-async function doRestart() {
-  try {
-    await ElMessageBox.confirm(
-      '确定重启 stockdb 进程？重启期间行情服务会短暂中断。',
-      '危险操作',
-      { type: 'warning', confirmButtonText: '重启', cancelButtonText: '取消' },
-    )
-  } catch {
-    return // 用户点了取消
-  }
-  restarting.value = true
-  try {
-    const r = await restartContainer()
-    ElMessage.success(r?.msg || '已发送重启')
-    await loadStatus() // 立即刷新进程状态（后端有 5s 缓存，随后轮询会继续更新）
-  } catch (e) {
-    ElMessage.error(e?.message || '重启失败')
-  } finally {
-    restarting.value = false
-  }
-}
-
 // 保存定时计划：先做客户端校验（空时间点），再二次确认（写入操作），最后调 saveSchedule
 async function saveSch() {
   if (!schTimes.value.length) {
@@ -622,20 +703,6 @@ async function saveSch() {
     ElMessage.error(e?.message || '保存失败')
   } finally {
     schSaving.value = false
-  }
-}
-
-// 容器日志：展开时才拉（懒加载）；收起时保留旧内容
-async function toggleContainerLog() {
-  containerLogOpen.value = !containerLogOpen.value
-  if (containerLogOpen.value && !containerLog.value) {
-    try {
-      const r = await getContainerLogs(150)
-      containerLog.value = r?.log || ''
-      if (r?.error) containerLog.value += `\n\n${r.error}`
-    } catch (e) {
-      ElMessage.error(e?.message || '读取容器日志失败')
-    }
   }
 }
 
@@ -690,6 +757,20 @@ function resultText(row) {
 }
 
 // ================= 工具函数 =================
+// '2026-02-14 08:30:15' → '02-14 08:30'（x 轴紧凑标签：月-日 时:分，信息密度优先）
+function fmtTsShort(ts) {
+  return ts ? String(ts).slice(5, 16) : ''
+}
+
+// 读主题 CSS 变量（ECharts canvas 无法直接用 var()，需要解析成具体颜色，跟随深/浅主题）
+function cssVar(name, fallback) {
+  try {
+    return getComputedStyle(document.documentElement).getPropertyValue(name).trim() || fallback
+  } catch {
+    return fallback
+  }
+}
+
 // epoch 秒 → 'x 天 x 小时 x 分钟'（进程启动时长，对应旧页 fmtUptime）
 function fmtUptime(started) {
   if (!started) return '—'
@@ -749,10 +830,10 @@ onUnmounted(() => {
   background: var(--panel);
   border: 1px solid var(--line);
   border-radius: 12px;
-  padding: 16px;
+  padding: 14px; /* LuCI 密度：卡片内边距收紧到 12-14px */
 }
 .card-title {
-  margin: 0 0 12px;
+  margin: 0 0 10px;
   font-size: 15px;
   font-weight: 600;
   color: var(--text);

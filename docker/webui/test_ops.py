@@ -1046,5 +1046,49 @@ class _StaticServingTests(_OpsTestCase):
         self.assertIn(payload["ui_mode"], ("spa", "legacy"))
 
 
+class _DiagTests(_OpsTestCase):
+    """Phase 5.1 /api/diag：一键诊断聚合（六检查 + 环境块，单块降级不 500）。"""
+
+    def test_diag_structure(self):
+        """六项检查齐全 + env 关键字段 + all_ok 汇总。"""
+        with mock.patch.object(app, "fetch_upstream_release", return_value=None), \
+             mock.patch.object(app, "paper_gate", return_value=(None, False, "offline")):
+            status, _, body = _do_get("/api/diag")
+        self.assertEqual(status, 200)
+        payload = json.loads(body.decode())
+        names = [c["name"] for c in payload["checks"]]
+        self.assertEqual(names, ["upstream_github", "mx_api", "stockdb_service",
+                                 "pybao", "disk", "calendar"])
+        for c in payload["checks"]:
+            self.assertIn("label", c)
+            self.assertIn("ok", c)
+            self.assertIn("note", c)
+        self.assertIsInstance(payload["all_ok"], bool)
+        for key in ("python", "arch", "webui_version", "ui_mode", "data_latest", "uptime_seconds"):
+            self.assertIn(key, payload["env"])
+        self.assertEqual(payload["env"]["webui_version"], app.WEBUI_VERSION)
+
+    def test_diag_upstream_degraded(self):
+        """上游不可达 → upstream_github ok=False 且整体仍 200（单块降级）。"""
+        with mock.patch.object(app, "fetch_upstream_release", return_value=None), \
+             mock.patch.object(app, "paper_gate", return_value=(None, False, "offline")):
+            status, _, body = _do_get("/api/diag")
+        self.assertEqual(status, 200)
+        payload = json.loads(body.decode())
+        up = next(c for c in payload["checks"] if c["name"] == "upstream_github")
+        self.assertFalse(up["ok"])
+        self.assertIn("降级", up["note"])
+
+    def test_diag_pybao_check(self):
+        """pybao 检查 = 三个模块 find_spec 全命中（无 pybao 时为 False 也合法）。"""
+        with mock.patch.object(app, "fetch_upstream_release", return_value=None), \
+             mock.patch.object(app, "paper_gate", return_value=(None, False, "offline")):
+            status, _, body = _do_get("/api/diag")
+        self.assertEqual(status, 200)
+        payload = json.loads(body.decode())
+        py = next(c for c in payload["checks"] if c["name"] == "pybao")
+        self.assertIsInstance(py["ok"], bool)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

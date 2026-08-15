@@ -1,21 +1,21 @@
 // router/index.js — 路由表从 nav.js 单一配置源生成，页面组件懒加载。
-// 学习点：() => import(...) 懒加载 = 每个页面单独打包成 chunk，
-// 首屏只下载当前页，切页时才按需下载（拆包后不再有 1MB 大文件警告）。
+// Phase 5.1（LuCI 经验版）：总览单页 + 系统运维 7 子页 + 模拟盘 3 子页，旧路径 redirect 兜底。
 import { createRouter, createWebHistory } from 'vue-router'
-import { NAV_ITEMS } from '../layout/nav.js'
+import { NAV_ITEMS, LEGACY_REDIRECTS } from '../layout/nav.js'
 
-// 路径 → 页面组件（懒加载函数）。新增页面：先在 nav.js 加导航项，再在这里登记映射。
+// 路径 → 页面组件（懒加载函数）
 const VIEWS = {
   '/overview': () => import('../views/Overview.vue'),
-  '/data/sync': () => import('../views/DataSync.vue'),
-  '/data/mydb': () => import('../views/MyDb.vue'),
+  '/ops/sync': () => import('../views/OpsSync.vue'),
+  '/ops/mydb': () => import('../views/OpsMydb.vue'),
+  '/ops/health': () => import('../views/OpsHealth.vue'),
+  '/ops/diag': () => import('../views/OpsDiag.vue'),
+  '/ops/logs': () => import('../views/OpsLogs.vue'),
+  '/ops/alerts': () => import('../views/OpsAlerts.vue'),
+  '/ops/mcp': () => import('../views/OpsMcp.vue'),
   '/paper': () => import('../views/Paper.vue'),
   '/paper/audit': () => import('../views/PaperAudit.vue'),
   '/paper/signal': () => import('../views/PaperSignal.vue'),
-  '/ops/system': () => import('../views/OpsSystem.vue'),
-  '/ops/alerts': () => import('../views/OpsAlerts.vue'),
-  '/ops/mcp': () => import('../views/OpsMcp.vue'),
-  '/ops/version': () => import('../views/OpsVersion.vue'),
 }
 
 const routes = [
@@ -24,6 +24,11 @@ const routes = [
     path: it.path,
     component: VIEWS[it.path],
     meta: { title: it.title, group: it.group, icon: it.icon },
+  })),
+  // 旧路径兜底：老书签/旧顶栏链接跳转到新地址
+  ...Object.entries(LEGACY_REDIRECTS).map(([from, to]) => ({
+    path: from,
+    redirect: to,
   })),
 ]
 

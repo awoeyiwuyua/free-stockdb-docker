@@ -219,141 +219,160 @@
           />
         </section>
 
-        <!-- ============ 5) 明细三个 tab ============ -->
-        <section class="panel-card">
-          <div class="card-head">
-            <div class="card-title">明细</div>
-          </div>
-          <el-tabs v-model="activeTab">
-            <!-- 决策列表：交易日 / 信号 prev→cur / 目标 prev→desired / 理由 / 状态 -->
-            <el-tab-pane :label="`决策（${state.decisions.length}）`" name="decisions">
-              <el-alert
-                v-if="state.errs.decisions"
-                :title="'决策加载失败：' + state.errs.decisions"
-                type="error"
-                :closable="false"
-                show-icon
-                class="sec-alert"
-              />
-              <EmptyState
-                v-else-if="!state.decisions.length"
-                icon="Document"
-                title="暂无决策"
-                description="运行 09:27 信号冻结+决策 时点后生成"
-              />
-              <el-table v-else :data="state.decisions" size="small" stripe>
-                <el-table-column label="交易日" width="110">
-                  <template #default="{ row }">{{ fmtYMD(row.trade_date) }}</template>
-                </el-table-column>
-                <el-table-column label="信号 prev→cur" min-width="150">
-                  <template #default="{ row }">
-                    {{ orDash(row.previous_rank) }} → {{ orDash(row.current_rank) }}
-                  </template>
-                </el-table-column>
-                <el-table-column label="目标 prev→desired" min-width="150">
-                  <template #default="{ row }">
-                    {{ orDash(row.previous_target) }} → {{ orDash(row.desired_target) }}
-                  </template>
-                </el-table-column>
-                <el-table-column label="理由" min-width="170">
-                  <template #default="{ row }">{{ orDash(row.reason_code) }}</template>
-                </el-table-column>
-                <el-table-column label="状态" min-width="150">
-                  <template #default="{ row }">
-                    <el-tag size="small" :type="statusTagType(row.status)">{{ row.status || '—' }}</el-tag>
-                  </template>
-                </el-table-column>
-              </el-table>
-            </el-tab-pane>
+        <!-- ============ 5) 明细：长页堆叠三段（决策 → 订单 → 事件） ============ -->
+        <!--
+          LuCI 长页风：明细不再用 el-tabs 分页切换，三块内容直接纵向铺开，
+          每段 = 紧凑标题行（小标题 + 条数 badge）+ 内容，一眼看全、少一次点击。
+          顺序固定：决策 → 订单 → 事件。
+        -->
+        <div class="detail-stack">
+          <!-- 5a) 决策段：交易日 / 信号 prev→cur / 目标 prev→desired / 理由 / 状态 -->
+          <section class="panel-card">
+            <div class="sec-head">
+              <h3 class="sec-title">决策</h3>
+              <!-- 条数 badge：替代旧 tab 标签「决策（N）」，行高更紧凑 -->
+              <el-tag size="small" :type="state.decisions.length ? 'primary' : 'info'">
+                {{ state.decisions.length }}
+              </el-tag>
+            </div>
+            <el-alert
+              v-if="state.errs.decisions"
+              :title="'决策加载失败：' + state.errs.decisions"
+              type="error"
+              :closable="false"
+              show-icon
+              class="sec-alert"
+            />
+            <EmptyState
+              v-else-if="!state.decisions.length"
+              icon="Document"
+              title="暂无决策"
+              description="运行 09:27 信号冻结+决策 时点后生成"
+            />
+            <el-table v-else :data="state.decisions" size="small" stripe>
+              <el-table-column label="交易日" width="110">
+                <template #default="{ row }">{{ fmtYMD(row.trade_date) }}</template>
+              </el-table-column>
+              <el-table-column label="信号 prev→cur" min-width="150">
+                <template #default="{ row }">
+                  {{ orDash(row.previous_rank) }} → {{ orDash(row.current_rank) }}
+                </template>
+              </el-table-column>
+              <el-table-column label="目标 prev→desired" min-width="150">
+                <template #default="{ row }">
+                  {{ orDash(row.previous_target) }} → {{ orDash(row.desired_target) }}
+                </template>
+              </el-table-column>
+              <el-table-column label="理由" min-width="170">
+                <template #default="{ row }">{{ orDash(row.reason_code) }}</template>
+              </el-table-column>
+              <el-table-column label="状态" min-width="150">
+                <template #default="{ row }">
+                  <el-tag size="small" :type="statusTagType(row.status)">{{ row.status || '—' }}</el-tag>
+                </template>
+              </el-table-column>
+            </el-table>
+          </section>
 
-            <!-- 订单列表：状态 / 数量 / 价格类型 / 时间 -->
-            <el-tab-pane :label="`订单（${state.orders.length}）`" name="orders">
-              <el-alert
-                v-if="state.errs.orders"
-                :title="'订单加载失败：' + state.errs.orders"
-                type="error"
-                :closable="false"
-                show-icon
-                class="sec-alert"
-              />
-              <EmptyState
-                v-else-if="!state.orders.length"
-                icon="List"
-                title="暂无订单"
-                description="运行 14:50 窗口下单 时点后生成订单意图"
-              />
-              <el-table v-else :data="state.orders" size="small" stripe>
-                <el-table-column label="交易日" width="110">
-                  <template #default="{ row }">{{ fmtYMD(row.trade_date) }}</template>
-                </el-table-column>
-                <el-table-column label="动作" width="110">
-                  <template #default="{ row }">
-                    <el-tag size="small" type="info">{{ row.action }}</el-tag>
-                  </template>
-                </el-table-column>
-                <el-table-column label="数量" min-width="140">
-                  <template #default="{ row }">
-                    {{ orDash(row.target_qty) }}（差额 {{ orDash(row.delta_qty) }}）
-                  </template>
-                </el-table-column>
-                <el-table-column label="价格类型" width="110">
-                  <template #default="{ row }">{{ orDash(row.price_type) }}</template>
-                </el-table-column>
-                <el-table-column label="状态" min-width="150">
-                  <template #default="{ row }">
-                    <el-tag size="small" :type="statusTagType(row.status)">{{ row.status || '—' }}</el-tag>
-                  </template>
-                </el-table-column>
-                <el-table-column label="时间" min-width="170">
-                  <template #default="{ row }">{{ orDash(row.created_at) }}</template>
-                </el-table-column>
-              </el-table>
-            </el-tab-pane>
+          <!-- 5b) 订单段：交易日 / 动作 / 数量 / 价格类型 / 状态 / 时间 -->
+          <section class="panel-card">
+            <div class="sec-head">
+              <h3 class="sec-title">订单</h3>
+              <el-tag size="small" :type="state.orders.length ? 'primary' : 'info'">
+                {{ state.orders.length }}
+              </el-tag>
+            </div>
+            <el-alert
+              v-if="state.errs.orders"
+              :title="'订单加载失败：' + state.errs.orders"
+              type="error"
+              :closable="false"
+              show-icon
+              class="sec-alert"
+            />
+            <EmptyState
+              v-else-if="!state.orders.length"
+              icon="List"
+              title="暂无订单"
+              description="运行 14:50 窗口下单 时点后生成订单意图"
+            />
+            <el-table v-else :data="state.orders" size="small" stripe>
+              <el-table-column label="交易日" width="110">
+                <template #default="{ row }">{{ fmtYMD(row.trade_date) }}</template>
+              </el-table-column>
+              <el-table-column label="动作" width="110">
+                <template #default="{ row }">
+                  <el-tag size="small" type="info">{{ row.action }}</el-tag>
+                </template>
+              </el-table-column>
+              <el-table-column label="数量" min-width="140">
+                <template #default="{ row }">
+                  {{ orDash(row.target_qty) }}（差额 {{ orDash(row.delta_qty) }}）
+                </template>
+              </el-table-column>
+              <el-table-column label="价格类型" width="110">
+                <template #default="{ row }">{{ orDash(row.price_type) }}</template>
+              </el-table-column>
+              <el-table-column label="状态" min-width="150">
+                <template #default="{ row }">
+                  <el-tag size="small" :type="statusTagType(row.status)">{{ row.status || '—' }}</el-tag>
+                </template>
+              </el-table-column>
+              <el-table-column label="时间" min-width="170">
+                <template #default="{ row }">{{ orDash(row.created_at) }}</template>
+              </el-table-column>
+            </el-table>
+          </section>
 
-            <!-- 事件时间轴：级别着色 + 时点过滤（对齐旧页「过滤/明细」行为） -->
-            <el-tab-pane :label="`事件（${state.events.length}）`" name="events">
-              <el-alert
-                v-if="state.errs.events"
-                :title="'事件加载失败：' + state.errs.events"
-                type="error"
-                :closable="false"
-                show-icon
-                class="sec-alert"
+          <!-- 5c) 事件段：级别着色 + 时点过滤（对齐旧页「过滤/明细」行为） -->
+          <section class="panel-card">
+            <div class="sec-head">
+              <h3 class="sec-title">事件</h3>
+              <el-tag size="small" :type="state.events.length ? 'primary' : 'info'">
+                {{ state.events.length }}
+              </el-tag>
+            </div>
+            <el-alert
+              v-if="state.errs.events"
+              :title="'事件加载失败：' + state.errs.events"
+              type="error"
+              :closable="false"
+              show-icon
+              class="sec-alert"
+            />
+            <template v-else>
+              <div class="ev-toolbar">
+                <el-select v-model="evTpFilter" size="small" style="width: 160px">
+                  <el-option label="全部时点" value="" />
+                  <el-option v-for="tp in evTimepoints" :key="tp" :label="tp" :value="tp" />
+                </el-select>
+                <span class="hint">共 {{ state.events.length }} 条 · 显示 {{ filteredEvents.length }} 条</span>
+              </div>
+              <el-timeline v-if="filteredEvents.length" class="ev-timeline">
+                <el-timeline-item
+                  v-for="e in filteredEvents"
+                  :key="e.id"
+                  :type="levelType(e.level)"
+                  :timestamp="e.ts"
+                  placement="top"
+                >
+                  <div class="ev-row">
+                    <el-tag size="small" :type="levelType(e.level)">{{ e.level }}</el-tag>
+                    <el-tag v-if="e.timepoint" size="small" type="info">{{ e.timepoint }}</el-tag>
+                    <b class="ev-name">{{ e.event }}</b>
+                    <span class="ev-detail">{{ e.detail }}</span>
+                  </div>
+                </el-timeline-item>
+              </el-timeline>
+              <EmptyState
+                v-else
+                icon="AlarmClock"
+                :title="evTpFilter ? '该时点暂无事件' : '暂无事件'"
+                description="模拟盘运行后生成系统事件记录"
               />
-              <template v-else>
-                <div class="ev-toolbar">
-                  <el-select v-model="evTpFilter" size="small" style="width: 160px">
-                    <el-option label="全部时点" value="" />
-                    <el-option v-for="tp in evTimepoints" :key="tp" :label="tp" :value="tp" />
-                  </el-select>
-                  <span class="hint">共 {{ state.events.length }} 条 · 显示 {{ filteredEvents.length }} 条</span>
-                </div>
-                <el-timeline v-if="filteredEvents.length" class="ev-timeline">
-                  <el-timeline-item
-                    v-for="e in filteredEvents"
-                    :key="e.id"
-                    :type="levelType(e.level)"
-                    :timestamp="e.ts"
-                    placement="top"
-                  >
-                    <div class="ev-row">
-                      <el-tag size="small" :type="levelType(e.level)">{{ e.level }}</el-tag>
-                      <el-tag v-if="e.timepoint" size="small" type="info">{{ e.timepoint }}</el-tag>
-                      <b class="ev-name">{{ e.event }}</b>
-                      <span class="ev-detail">{{ e.detail }}</span>
-                    </div>
-                  </el-timeline-item>
-                </el-timeline>
-                <EmptyState
-                  v-else
-                  icon="AlarmClock"
-                  :title="evTpFilter ? '该时点暂无事件' : '暂无事件'"
-                  description="模拟盘运行后生成系统事件记录"
-                />
-              </template>
-            </el-tab-pane>
-          </el-tabs>
-        </section>
+            </template>
+          </section>
+        </div>
       </template>
 
       <!-- ============ 6) apikey 卡（引擎不可用时也展示：配好 key 是恢复的第一步） ============ -->
@@ -445,7 +464,6 @@ const runResult = ref('') // run-now 结果文案
 const runOk = ref(false) // run-now 是否成功（决定结果 alert 颜色）
 const apiKeyInput = ref('') // apikey 输入框（password，仅提交不回显）
 const connResult = ref('（点击「连通自检」查看结果）')
-const activeTab = ref('decisions') // 明细当前 tab
 const evTpFilter = ref('') // 事件时点过滤
 
 // 轮询防串扰：每次请求自增序号，只采纳最后一次请求的结果，
@@ -831,11 +849,11 @@ onUnmounted(() => {
 </script>
 
 <style scoped>
-/* 页面纵向卡片流：间距 16px，卡片由 .panel-card 统一样式 */
+/* 页面纵向卡片流：间距 14px（LuCI 密度收紧），卡片由 .panel-card 统一样式 */
 .paper-page {
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: 14px;
 }
 
 /* 页头：标题左、操作右，窄屏自动换行 */
@@ -867,20 +885,20 @@ onUnmounted(() => {
   color: var(--muted);
 }
 
-/* 骨架屏：套一层卡片壳，视觉与真实卡片一致 */
+/* 骨架屏：套一层卡片壳，视觉与真实卡片一致（内边距对齐收紧后的卡片） */
 .page-skeleton {
-  padding: 20px;
+  padding: 14px;
   background: var(--panel);
   border: 1px solid var(--line);
   border-radius: 12px;
 }
 
-/* 通用卡片 */
+/* 通用卡片：内边距 14px（密度哲学 12-14px 上限，比默认 16px 更紧凑） */
 .panel-card {
   background: var(--panel);
   border: 1px solid var(--line);
   border-radius: 12px;
-  padding: 16px;
+  padding: 14px;
 }
 /* 卡片头：标题 + 右侧操作/说明 */
 .card-head {
@@ -889,7 +907,7 @@ onUnmounted(() => {
   justify-content: space-between;
   gap: 12px;
   flex-wrap: wrap;
-  margin-bottom: 14px;
+  margin-bottom: 10px;
 }
 .card-title {
   display: flex;
@@ -909,21 +927,22 @@ onUnmounted(() => {
   margin-top: 4px;
 }
 .reason-alert {
-  margin-top: 12px;
+  margin-top: 10px;
 }
 .sec-alert {
-  margin-bottom: 12px;
+  margin-bottom: 10px;
 }
 .hint {
   font-size: 12px;
   color: var(--muted);
 }
 
-/* 账户卡 StatCard 栅格：宽屏一排 4 个，窄屏自动换行 */
+/* 账户卡 StatCard 栅格：宽屏一排 4 个，窄屏自动换行；
+   列宽下限 180px（比 200px 更窄 → 小屏也能多放一列，密度更高） */
 .stat-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-  gap: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 10px;
 }
 
 /* 手动单步行 */
@@ -940,7 +959,7 @@ onUnmounted(() => {
   align-items: center;
   gap: 10px;
   flex-wrap: wrap;
-  margin-bottom: 12px;
+  margin-bottom: 10px;
 }
 .conn-pre {
   margin: 0;
@@ -956,16 +975,49 @@ onUnmounted(() => {
   word-break: break-all;
 }
 
+/* ============ 明细长页：三段卡片堆叠 + 段标题行 ============ */
+
+/* 三段卡片间距 10px：比页面级 14px 更紧，视觉上归属同一「明细」区 */
+.detail-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+/* 段标题行：小标题 + 条数 badge 一行排开，信息优先、无装饰性大字号 */
+.sec-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+.sec-title {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+}
+
 /* 事件时间轴工具栏 + 行内布局 */
 .ev-toolbar {
   display: flex;
   align-items: center;
   gap: 10px;
-  margin-bottom: 12px;
+  margin-bottom: 8px;
   flex-wrap: wrap;
 }
 .ev-timeline {
   padding-left: 4px;
+}
+/* 时间轴紧凑化：条目间距收窄、时间戳缩小，对齐 LuCI 密度哲学
+   （el-timeline-item 内部模板不在本组件作用域，需要 :deep 穿透） */
+.ev-timeline :deep(.el-timeline-item) {
+  padding-bottom: 6px;
+}
+.ev-timeline :deep(.el-timeline-item__timestamp) {
+  font-size: 12px;
+  color: var(--muted);
 }
 .ev-row {
   display: flex;

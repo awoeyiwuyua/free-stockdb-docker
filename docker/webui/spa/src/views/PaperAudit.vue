@@ -341,7 +341,7 @@ const fmtDT = (v) => (v ? new Date(v).toLocaleString('zh-CN', { hour12: false })
 }
 .page-title {
   margin: 0;
-  font-size: 20px;
+  font-size: 18px; /* 小标题，与全站 .page-title 口径一致（无装饰性大字号） */
   font-weight: 700;
   color: var(--text);
 }
@@ -372,7 +372,7 @@ const fmtDT = (v) => (v ? new Date(v).toLocaleString('zh-CN', { hour12: false })
   background: var(--panel);
   border: 1px solid var(--line);
   border-radius: 12px;
-  padding: 16px;
+  padding: 14px; /* LuCI 密度：卡片内边距 12-14px */
   display: flex;
   flex-direction: column;
   gap: 10px;

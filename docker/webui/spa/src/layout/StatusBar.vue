@@ -31,15 +31,6 @@
       </el-badge>
     </RouterLink>
 
-    <!-- MCP 健康 -->
-    <div class="sb-item">
-      <span class="sb-label">MCP</span>
-      <span class="sb-value">
-        {{ store.mcp?.total ? `${store.mcp.ok_rate ?? '—'}%` : '—' }}
-        <span v-if="store.mcp?.total" class="sb-sub">{{ store.mcp.total }} 次</span>
-      </span>
-    </div>
-
     <div class="sb-spacer" />
 
     <!-- 刷新状态 + 错误 -->
@@ -47,14 +38,6 @@
     <span class="sb-refresh" title="最近刷新时间">
       {{ store.lastRefresh ? `刷新 ${hhmm(store.lastRefresh)}` : '等待首次刷新' }}
     </span>
-
-    <!-- 版本 -->
-    <RouterLink class="sb-item link" to="/ops/version">
-      <span class="sb-label">版本</span>
-      <span class="sb-value" :class="{ stale: store.version?.stale }">
-        v{{ store.version?.webui?.version || '—' }}
-      </span>
-    </RouterLink>
 
     <ThemeToggle />
 

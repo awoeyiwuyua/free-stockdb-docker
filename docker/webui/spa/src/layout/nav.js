@@ -1,41 +1,47 @@
 // nav.js — 左侧导航唯一配置源（纯数据，可单测）。
-// 路由表与侧边栏都从这里生成：改导航 = 改这一个文件。
-// 学习点：单一数据源（single source of truth）——避免两处配置不同步。
+// Phase 5.1（LuCI 经验版）：菜单树 = 总览单页 + 两个分组（系统运维 / 模拟盘），
+// 每项一个职责、一条 URL；badge 字段挂全局 store 红点徽标。
+export const TOP_ITEMS = [
+  { path: '/overview', title: '总览', icon: 'Odometer' },
+]
 
 export const NAV_GROUPS = [
   {
-    title: '总览',
+    title: '系统运维',
+    icon: 'Setting',
     items: [
-      { path: '/overview', title: '总览', icon: 'Odometer' },
-    ],
-  },
-  {
-    title: '数据',
-    items: [
-      { path: '/data/sync', title: '数据同步', icon: 'Refresh' },
-      { path: '/data/mydb', title: '私有存储', icon: 'Coin' },
+      { path: '/ops/sync', title: '数据同步', icon: 'Refresh' },
+      { path: '/ops/mydb', title: '私有存储', icon: 'Coin' },
+      { path: '/ops/health', title: '系统健康', icon: 'Cpu' },
+      { path: '/ops/diag', title: '诊断中心', icon: 'Aim' },
+      { path: '/ops/logs', title: '日志中心', icon: 'Document' },
+      { path: '/ops/alerts', title: '通知中心', icon: 'Bell', badge: 'alertCount' },
+      { path: '/ops/mcp', title: 'MCP 观测', icon: 'Monitor' },
     ],
   },
   {
     title: '模拟盘',
+    icon: 'Wallet',
     items: [
       { path: '/paper', title: '模拟盘', icon: 'TrendCharts' },
       { path: '/paper/audit', title: '审计报告', icon: 'DocumentChecked' },
-      { path: '/paper/signal', title: '信号体检', icon: 'FirstAidKit' },
-    ],
-  },
-  {
-    title: '运维',
-    items: [
-      { path: '/ops/system', title: '系统', icon: 'Setting' },
-      { path: '/ops/alerts', title: '通知中心', icon: 'Bell' },
-      { path: '/ops/mcp', title: 'MCP 观测', icon: 'Monitor' },
-      { path: '/ops/version', title: '版本', icon: 'Promotion' },
+      { path: '/paper/signal', title: '信号体检', icon: 'DataAnalysis' },
     ],
   },
 ]
 
-// 展平：所有页面（path 唯一性由测试保证）
-export const NAV_ITEMS = NAV_GROUPS.flatMap((g) =>
-  g.items.map((it) => ({ ...it, group: g.title }))
-)
+// 展平：全部页面（含分组信息，测试保证 path 唯一）
+export const NAV_ITEMS = [
+  ...TOP_ITEMS,
+  ...NAV_GROUPS.flatMap((g) => g.items.map((it) => ({ ...it, group: g.title }))),
+]
+
+// 旧路径 → 新地址（路由 redirect 兜底，老书签不 404）
+export const LEGACY_REDIRECTS = {
+  '/data/sync': '/ops/sync',
+  '/data/mydb': '/ops/mydb',
+  '/ops/system': '/ops/health',
+  '/ops/version': '/overview',
+  '/data': '/ops/sync',
+  '/alerts': '/ops/alerts',
+}
