@@ -1053,8 +1053,9 @@ def _attach_auction_metrics(row: dict, rd: object, date_iso: str) -> None:
     """打板指标:<日期> 存在时，当日行附 metrics 字段（指标载荷平铺，原样透传）。
 
     载荷键契约（auction_metrics.build_metrics_payload）：metrics{premium_mean,
-    success_rate, n_samples} + rank_60d{premium_mean, success_rate} + window +
-    value_source；n_samples 兼容"顶层也冗余一份"的两种写库形态。
+    success_rate, n_samples} + rank_60d{premium_mean, success_rate} +
+    strength_60d{premium_mean, success_rate} + window + value_source；
+    n_samples 兼容"顶层也冗余一份"的两种写库形态。
     """
     try:
         value = rd.get(_AUCTION_METRICS_TABLE, date_iso.replace("-", ""))
@@ -1069,6 +1070,7 @@ def _attach_auction_metrics(row: dict, rd: object, date_iso: str) -> None:
         "success_rate": metrics.get("success_rate"),
         "n_samples": metrics.get("n_samples", payload.get("n_samples")),
         "rank_60d": payload.get("rank_60d"),
+        "strength_60d": payload.get("strength_60d"),
         "value_source": payload.get("value_source"),
         "window": payload.get("window"),
     }
@@ -1190,7 +1192,9 @@ def query_board_open_effect_history(
     - 当日段（mydb 存在 竞价快照:<日期>:*）：涨停判定仍用 T-1 日K，开盘溢价改用
       快照 open_price/prev_close（任一为 None/<=0 的样本剔除，计入 missing_open_count）；
     - 打板指标:<日期> 存在时，当日行附 metrics 字段（premium_mean/success_rate/
-      n_samples/rank_60d/value_source/window，取自指标库载荷）；
+      n_samples/rank_60d/strength_60d/value_source/window，取自指标库载荷；
+      strength_60d 为强弱标签 strong/weak/neutral，口径=此前 60 有效观测中
+      严格低于当日值天数/60，不足 60 观测为 null）；
     - 信封 known_at：当日段合并成功 → "<YYYYMMDD> <HH:MM> 竞价采集(source=<src>)"，
       否则保持现语义（None）；
     - 降级：当日（<= 今天的最近交易日，且落在查询区间内）无快照 → 结果与历史口径

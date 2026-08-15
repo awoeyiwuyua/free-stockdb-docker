@@ -79,7 +79,7 @@ _last_verify_result: str | None = None  # 最近一次完整性验证结果（pa
 _scheduler_alive = False             # 定时线程心跳（每次循环更新时间戳）
 _scheduler_heartbeat = 0.0           # 定时线程最近一次心跳时间戳（unix）
 _webui_started = time.time()         # webui 进程启动时间戳
-WEBUI_VERSION = "0.8.10"
+WEBUI_VERSION = "0.8.11"
 
 HISTORY_FILE = DATA_DIR / "sync_history.json"
 SCHEDULE_FILE = DATA_DIR / "sync_schedule.json"
@@ -2712,6 +2712,7 @@ try:
         list_key as _auction_list_key,
         metrics_key as _auction_metrics_key,
         percentile_rank as _auction_percentile_rank,
+        strength_label as _auction_strength_label,
         series_key as _auction_series_key,
     )
     from mcp.stockdb_mcp_server import query_point_snapshot as _auction_query_snapshot
@@ -2787,7 +2788,7 @@ def auction_run_collect() -> dict:
     """
     if not AUCTION_MODULES_AVAILABLE:
         return {"ok": False, "reason": f"打板模块未就绪：{AUCTION_IMPORT_ERROR}",
-                "collected": 0, "errors_count": 0, "metrics": None, "rank_60d": None}
+                "collected": 0, "errors_count": 0, "metrics": None, "rank_60d": None, "strength_60d": None}
     today = datetime.now().strftime("%Y%m%d")
     try:
         # ① 清单：昨日 16:30 已算好落库；缺失/为空 → 前一交易日快照兜底现算
@@ -2800,7 +2801,7 @@ def auction_run_collect() -> dict:
             log(f"📊 打板清单缺失，已兜底现算（{prev}）→ {len(codes)} 只")
         if not codes:
             return {"ok": False, "reason": "清单为空且兜底现算无结果",
-                    "collected": 0, "errors_count": 0, "metrics": None, "rank_60d": None}
+                    "collected": 0, "errors_count": 0, "metrics": None, "rank_60d": None, "strength_60d": None}
 
         # ② 采集竞价价（fetch_quotes 内部主源腾讯/备源东财降级）→ 逐条写快照
         quote = _auction_fetch_quotes(codes)
@@ -2829,7 +2830,7 @@ def auction_run_collect() -> dict:
         log(f"📊 打板竞价采集（{today}）: {len(ok_items)} 只快照（errors={len(errors)}），"
             f"premium_mean={metrics.get('premium_mean')}, n={metrics.get('n_samples')}")
         return {"ok": True, "collected": len(ok_items), "errors_count": len(errors),
-                "metrics": metrics, "rank_60d": payload.get("rank_60d")}
+                "metrics": metrics, "rank_60d": payload.get("rank_60d"), "strength_60d": payload.get("strength_60d")}
     except Exception as exc:  # noqa: BLE001 - 单块降级：采集异常不抛给调度线程/HTTP
         log(f"⚠️ 打板竞价采集失败（{today}）: {exc}")
         try:
@@ -2942,7 +2943,7 @@ def auction_run_close() -> dict:
             f"premium_mean={metrics.get('premium_mean')}")
         return {"ok": True, "list_count": len(listing.get("codes") or []),
                 "reconciled": reconciled, "diff_alerts": diff_alerts,
-                "metrics": metrics, "rank_60d": payload.get("rank_60d")}
+                "metrics": metrics, "rank_60d": payload.get("rank_60d"), "strength_60d": payload.get("strength_60d")}
     except Exception as exc:  # noqa: BLE001 - 单块降级：异常不抛给调度线程/HTTP
         log(f"⚠️ 打板收口对账失败（{today}）: {exc}")
         try:
@@ -3011,14 +3012,19 @@ def auction_run_backfill(days: int = 60) -> dict:
         rows.reverse()  # 最旧 → 最新
 
         # 第二遍：写逐日指标 + 用"当日之前"的值算滚动分位（无未来函数）
+        # 0.8.11：分位口径改为用户拍板定义——此前 60 个有效观测中严格低于当日值
+        # 的天数/60；不足 60 个观测 → None（历史回填日因此无分位，属预期）
         all_vals = {metric: [] for metric in AUCTION_METRICS}
         for (d, m) in rows:
             rank = {}
             for metric in AUCTION_METRICS:
                 if m.get(metric) is not None:
-                    rank[metric] = _auction_percentile_rank(m[metric], all_vals[metric][-59:])
+                    rank[metric] = _auction_percentile_rank(m[metric], all_vals[metric][-60:])
+            strength = {metric: _auction_strength_label(rank.get(metric))
+                        for metric in AUCTION_METRICS}
             payload = {"metrics": m,
                        "rank_60d": rank,
+                       "strength_60d": strength,
                        "window": 60, "n_samples": m["n_samples"],
                        "computed_at": _now_iso(), "value_source": "kline",
                        "contract": "auction-metric-v1"}
