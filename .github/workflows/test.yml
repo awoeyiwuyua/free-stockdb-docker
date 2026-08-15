@@ -31,6 +31,10 @@ jobs:
         working-directory: docker/webui
         run: python -m unittest test_ops test_paper -v
 
+      - name: Run auction collector tests
+        working-directory: docker/webui
+        run: python -m unittest test_auction_collect test_auction_metrics test_auction_list -v
+
   spa-tests:
     name: SPA 前端（构建 + Vitest）
     runs-on: ubuntu-latest

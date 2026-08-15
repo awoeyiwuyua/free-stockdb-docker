@@ -3,6 +3,16 @@
 本项目面板版本号 = `WEBUI_VERSION`（`docker/webui/app.py`），镜像 tag 跟随上游引擎版本。
 发布纪律见 `docs/webui-spa/release-policy.md`；部署记录见 `docs/DEPLOYMENTS.md`。
 
+## [0.7.0] — 2026-08-15（打板竞价采集：数据基座首个自取能力）
+- 新增打板竞价采集链路（设计：docs/design/auction-collector.md）：
+  - 采集器 auction_collect.py：腾讯主源批量（≤50/批、限流 1req/s）+ 东财备源降级，9:25 竞价价=当日开盘价口径
+  - auction_list.py：T-1 K线算"非一字板涨停"清单（5%/10%/20% 三档 + ST）
+  - auction_metrics.py：业务指标（溢价均值/成功率）+ 滚动 60 交易日分位（语义对齐 emotion-v1）
+  - 调度：09:26 采集（快照→业务值→分位落 mydb）；16:30 收口（同步校验→明日清单→对账回写→K线权威指标→序列追加）；POST /api/auction/run 手动触发
+  - MCP get_board_open_effect_history 双源合并：历史 K线 / 当日 mydb 竞价快照，known_at 标注来源
+  - mydb 保留前缀：竞价快照:/打板指标:/打板序列:/清单:（AI 勿写）
+- 测试：Python 260 全绿（+20 采集/指标/清单用例）；前端 77 全绿（未改动）
+
 ## [0.6.6] — 2026-08-15（稳定性收官）
 - 空载荷安全性全量加固：PaperSignal/OpsSync 等页在后端瞬时失败（载荷 null）时不再渲染崩溃
 - 新增回归防线：10 个页面「所有 API 拒绝」状态下的挂载测试（views-null-safety.test.js，10 例）
