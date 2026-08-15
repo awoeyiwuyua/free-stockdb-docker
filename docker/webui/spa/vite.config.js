@@ -28,7 +28,7 @@ export default defineConfig({
     },
   },
   test: {
-    environment: 'node',
-    include: ['src/**/*.test.js'],
+    environment: 'happy-dom', // 组件挂载测试需要 DOM 环境（views-null-safety）
+    include: ['src/**/*.test.js', 'tests/**/*.test.js'],
   },
 })
