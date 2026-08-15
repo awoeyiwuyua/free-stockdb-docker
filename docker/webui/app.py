@@ -79,7 +79,7 @@ _last_verify_result: str | None = None  # 最近一次完整性验证结果（pa
 _scheduler_alive = False             # 定时线程心跳（每次循环更新时间戳）
 _scheduler_heartbeat = 0.0           # 定时线程最近一次心跳时间戳（unix）
 _webui_started = time.time()         # webui 进程启动时间戳
-WEBUI_VERSION = "0.8.0"
+WEBUI_VERSION = "0.8.1"
 
 HISTORY_FILE = DATA_DIR / "sync_history.json"
 SCHEDULE_FILE = DATA_DIR / "sync_schedule.json"
@@ -2456,9 +2456,13 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, json.dumps(auction_run_collect(), ensure_ascii=False))
         elif task == "close":
             self._send(200, json.dumps(auction_run_close(), ensure_ascii=False))
+        elif task == "backfill":
+            days = int(body.get("days") or 60)
+            self._send(200, json.dumps(auction_run_backfill(days=max(1, min(days, 500))),
+                                       ensure_ascii=False))
         else:
             self._send(400, json.dumps(
-                {"error": f"非法 task {task!r}；合法值：collect / close"},
+                {"error": f"非法 task {task!r}；合法值：collect / close / backfill"},
                 ensure_ascii=False))
 
 
@@ -2638,6 +2642,8 @@ try:
         build_metrics_payload as _auction_build_payload,
         list_key as _auction_list_key,
         metrics_key as _auction_metrics_key,
+        percentile_rank as _auction_percentile_rank,
+        series_key as _auction_series_key,
     )
     from mcp.stockdb_mcp_server import query_point_snapshot as _auction_query_snapshot
     AUCTION_MODULES_AVAILABLE = True
@@ -2877,6 +2883,81 @@ def auction_run_close() -> dict:
             pass
         return {"ok": False, "reason": str(exc), "list_count": 0, "reconciled": 0,
                 "diff_alerts": 0, "metrics": None}
+
+
+def auction_run_backfill(days: int = 60) -> dict:
+    """历史序列回填任务（0.8.1 冷启动修复：首跑前序列为空 → 当日分位无分母）。
+
+    用历史 K 线把过去 `days` 个交易日的业务指标（溢价均值/成功率）逐日重算：
+      - 打板序列:<metric>：滚动序列（分位分母），按时间正序裁剪至 60
+      - 打板指标:<T>：逐日指标 + 当日可得的滚动分位（只用 T 之前的值，无未来函数），
+        value_source="kline"，供研究直接读历史
+    幂等：全量重算覆盖写（确定性，重跑结果一致）。
+
+    流程：以最新已同步交易日 L 为起点，逐日回推：T-1 K线算清单 → T K线算溢价指标。
+    """
+    if not AUCTION_MODULES_AVAILABLE:
+        return {"ok": False, "reason": f"打板模块未就绪：{AUCTION_IMPORT_ERROR}",
+                "backfilled_days": 0, "series": {}}
+    try:
+        latest = str(data_latest_date() or "").replace("-", "")
+        if not latest:
+            return {"ok": False, "reason": "无法确定最新交易日", "backfilled_days": 0, "series": {}}
+
+        # 第一遍：按时间正序收集 (date, metrics)，从最旧到最新
+        rows: list[tuple[str, dict]] = []
+        t = latest
+        for _ in range(days):
+            t1 = _auction_prev_trade_date(t)          # T-1 交易日
+            pts1 = (_auction_query_snapshot({"date": t1}) or {}).get("points") or []
+            codes = _auction_compute_limitup_list(pts1).get("codes") or []
+            snaps = []
+            if codes:
+                pts_t = (_auction_query_snapshot({"date": t}) or {}).get("points") or []
+                by_code = {str(p.get("code")): p for p in pts_t}
+                for c in codes:
+                    p = by_code.get(c)
+                    if p and p.get("open") is not None and p.get("prev_close") is not None:
+                        snaps.append({"code": c, "open_price": p.get("open"),
+                                      "prev_close": p.get("prev_close")})
+            m = _auction_compute_metrics(snaps)
+            if m["n_samples"] > 0:
+                rows.append((t, m))
+            t = t1
+        rows.reverse()  # 最旧 → 最新
+
+        # 第二遍：写逐日指标 + 用"当日之前"的值算滚动分位（无未来函数）
+        all_vals = {metric: [] for metric in AUCTION_METRICS}
+        for (d, m) in rows:
+            rank = {}
+            for metric in AUCTION_METRICS:
+                if m.get(metric) is not None:
+                    rank[metric] = _auction_percentile_rank(m[metric], all_vals[metric][-59:])
+            payload = {"metrics": m,
+                       "rank_60d": rank,
+                       "window": 60, "n_samples": m["n_samples"],
+                       "computed_at": _now_iso(), "value_source": "kline",
+                       "contract": "auction-metric-v1"}
+            mydb_write(_auction_metrics_key(d),
+                       [("metrics", json.dumps(payload, ensure_ascii=False))])
+            for metric in AUCTION_METRICS:
+                if m.get(metric) is not None:
+                    all_vals[metric].append(m[metric])
+
+        # 写序列（正序、裁剪 60）：周一 09:26 分位的分母
+        series_result = {}
+        for metric in AUCTION_METRICS:
+            vals = all_vals[metric][-60:]
+            seq = {"metric": metric, "values": vals,
+                   "window": 60, "contract": "auction-metric-v1",
+                   "updated_at": _now_iso(), "source": "backfill-kline"}
+            mydb_write(_auction_series_key(metric),
+                       [("series", json.dumps(seq, ensure_ascii=False))])
+            series_result[metric] = len(vals)
+        return {"ok": True, "backfilled_days": len(rows), "series": series_result}
+    except Exception as exc:  # noqa: BLE001 - 单块降级
+        log(f"⚠️ 打板历史回填失败：{exc}")
+        return {"ok": False, "reason": str(exc), "backfilled_days": 0, "series": {}}
 
 
 def auction_scheduler_loop() -> None:
