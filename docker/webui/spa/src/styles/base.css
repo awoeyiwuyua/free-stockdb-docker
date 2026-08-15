@@ -1,6 +1,40 @@
-/* base.css — 全局主题变量（沿用旧面板深色金融风色板，保持观感连贯）。 */
+/* base.css — 全局主题变量（双主题）。
+   学习点：
+   1) CSS 变量 = 一处定义、全局复用，组件里只写 var(--xxx) 就能自动跟随主题切换。
+   2) 主题切换方式 = html 根元素带不带 .dark class：
+      由 main.js 初始化、ThemeToggle 按钮切换，这里只负责定义两套变量值。
+   3) :root 放默认（浅色），html.dark 放深色（沿用旧面板色板，保持观感连贯）。 */
 
+/* —— 浅色主题（默认）—— */
 :root {
+  color-scheme: light; /* 让原生控件（滚动条/输入框）也用浅色渲染 */
+
+  --bg: #f5f7fa;     /* 页面底色 */
+  --panel: #ffffff;  /* 卡片/面板底色 */
+  --panel2: #f0f2f5; /* 次级面板底色 */
+  --line: #e4e7ed;   /* 分隔线/边框 */
+  --text: #1f2d3d;   /* 主文字 */
+  --muted: #8492a6;  /* 次要文字 */
+  --ok: #22c55e;     /* 成功/正常 */
+  --warn: #f59e0b;   /* 警告 */
+  --err: #ef4444;    /* 错误 */
+  --brand: #0ea5e9;  /* 品牌色 */
+
+  /* Element Plus 主色覆盖：品牌色 + 官方同款明暗色阶。
+     light-N = 往主色里混入 N 成白色（hover/浅底态用），dark-2 = 混入 2 成黑色（按下态用）。
+     顺序：主色 → 越浅 → 最深 */
+  --el-color-primary: #0ea5e9;
+  --el-color-primary-light-3: #56c0f0;
+  --el-color-primary-light-5: #87d2f4;
+  --el-color-primary-light-7: #b7e4f8;
+  --el-color-primary-light-9: #e7f6fd;
+  --el-color-primary-dark-2: #0b84ba;
+}
+
+/* —— 深色主题（旧面板同款色板）—— */
+html.dark {
+  color-scheme: dark; /* 原生控件跟随深色渲染 */
+
   --bg: #0b1120;
   --panel: #111c2e;
   --panel2: #162238;
@@ -11,16 +45,20 @@
   --warn: #f59e0b;
   --err: #ef4444;
   --brand: #38bdf8;
+
+  --el-color-primary: #38bdf8;
+  --el-color-primary-light-3: #74d1fa;
+  --el-color-primary-light-5: #9cdefc;
+  --el-color-primary-light-7: #c3ebfc;
+  --el-color-primary-light-9: #ebf8fd;
+  --el-color-primary-dark-2: #2d97c6;
 }
 
-html.dark {
-  color-scheme: dark;
-}
-
+/* —— 基础元素样式 —— */
 body {
-  margin: 0;
-  background: var(--bg);
-  color: var(--text);
+  margin: 0; /* 去掉浏览器默认外边距 */
+  background: var(--bg); /* 背景跟随主题变量 */
+  color: var(--text); /* 文字跟随主题变量 */
   font: 14px/1.6 -apple-system, 'PingFang SC', 'Microsoft YaHei', sans-serif;
 }
 
