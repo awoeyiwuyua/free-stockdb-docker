@@ -1,0 +1,30 @@
+/* base.css — 全局主题变量（沿用旧面板深色金融风色板，保持观感连贯）。 */
+
+:root {
+  --bg: #0b1120;
+  --panel: #111c2e;
+  --panel2: #162238;
+  --line: #1e2c45;
+  --text: #e5edf8;
+  --muted: #8fa2bc;
+  --ok: #22c55e;
+  --warn: #f59e0b;
+  --err: #ef4444;
+  --brand: #38bdf8;
+}
+
+html.dark {
+  color-scheme: dark;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.6 -apple-system, 'PingFang SC', 'Microsoft YaHei', sans-serif;
+}
+
+a {
+  color: var(--brand);
+  text-decoration: none;
+}

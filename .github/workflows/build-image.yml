@@ -117,6 +117,32 @@ jobs:
             ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:latest \
             -c "import stockdb, zb_core, zhibiao; print('arm64 pybao ok')"
 
+  test-spa:
+    name: SPA 前端构建 + 单测（Node，离线）
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: docker/webui/spa/package-lock.json
+
+      - name: npm ci
+        working-directory: docker/webui/spa
+        run: npm ci --no-audit --no-fund
+
+      - name: Vitest 单测
+        working-directory: docker/webui/spa
+        run: npm run test
+
+      - name: Vite 构建（验证可编译出 dist）
+        working-directory: docker/webui/spa
+        run: npm run build
+
   test-mcp:
     name: MCP 单测（离线，无 pybao 依赖）
     runs-on: ubuntu-latest
@@ -132,3 +158,7 @@ jobs:
       - name: Run MCP unit tests
         working-directory: docker/webui
         run: python -m unittest mcp.test_stockdb_mcp_server -v
+
+      - name: Run ops/paper unit tests
+        working-directory: docker/webui
+        run: python -m unittest test_ops test_paper -v
