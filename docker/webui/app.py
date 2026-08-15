@@ -79,7 +79,7 @@ _last_verify_result: str | None = None  # 最近一次完整性验证结果（pa
 _scheduler_alive = False             # 定时线程心跳（每次循环更新时间戳）
 _scheduler_heartbeat = 0.0           # 定时线程最近一次心跳时间戳（unix）
 _webui_started = time.time()         # webui 进程启动时间戳
-WEBUI_VERSION = "0.8.8"
+WEBUI_VERSION = "0.8.9"
 
 HISTORY_FILE = DATA_DIR / "sync_history.json"
 SCHEDULE_FILE = DATA_DIR / "sync_schedule.json"
@@ -2889,6 +2889,21 @@ def auction_run_close() -> dict:
                 "diff_alerts": 0, "metrics": None}
 
 
+def _auction_points_for_codes(date: str, codes: list[str]) -> list[dict]:
+    """按 200/批分块拉取指定代码单日点集并合并（MCP 显式清单硬上限 1-200，0.8.9）。
+
+    打板溢价日清单可达 200+ 只（全市场口径修复后实测 256），显式路径一次传超限
+    会 ValueError——分块后逐批拉取、合并去重（by_code dict 天然去重）。
+    """
+    points: list[dict] = []
+    for i in range(0, len(codes), 200):
+        chunk = codes[i:i + 200]
+        points.extend(
+            (_auction_query_snapshot({"date": date, "codes": chunk, "limit": 0}) or {})
+            .get("points") or [])
+    return points
+
+
 def auction_run_backfill(days: int = 60) -> dict:
     """历史序列回填任务（0.8.1 冷启动修复：首跑前序列为空 → 当日分位无分母）。
 
@@ -2917,9 +2932,8 @@ def auction_run_backfill(days: int = 60) -> dict:
             codes = _auction_compute_limitup_list(pts1).get("codes") or []
             snaps = []
             if codes:
-                # 溢价日只查清单股（显式小清单，免一次 5000+ 全扫——0.8.4 连接卫生）
-                pts_t = (_auction_query_snapshot({"date": t, "codes": codes, "limit": 0})
-                         or {}).get("points") or []
+                # 溢价日只查清单股（免全扫）；清单可能 >200 只 → 分块拉取（0.8.9）
+                pts_t = _auction_points_for_codes(t, codes)
                 by_code = {str(p.get("code")): p for p in pts_t}
                 for c in codes:
                     p = by_code.get(c)
