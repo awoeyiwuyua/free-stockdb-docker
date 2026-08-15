@@ -3,6 +3,12 @@
 本项目面板版本号 = `WEBUI_VERSION`（`docker/webui/app.py`），镜像 tag 跟随上游引擎版本。
 发布纪律见 `docs/webui-spa/release-policy.md`；部署记录见 `docs/DEPLOYMENTS.md`。
 
+## [0.8.1] — 2026-08-15（打板序列冷启动修复）
+- 新增 auction_run_backfill：历史 K 线重算过去 N 个交易日业务指标，初始化 打板序列（60 日分母）
+  与逐日 打板指标（kline 口径 + 当日可得滚动分位，无未来函数）
+- POST /api/auction/run {"task":"backfill","days":60} 手动触发，幂等可重跑
+- 部署后先跑一次回填 → 周一 09:26 首次采集的分位当场成立；Python 175 全绿
+
 ## [0.8.0] — 2026-08-15（移除模拟盘：数据基座收敛）
 - 用户拍板砍掉整个模拟盘：模拟盘模块（paper_core / paper_db / mx_client / paper_engine）移出镜像
   （Dockerfile 删除对应 COPY 行）；模拟盘 / 审计 / 信号验收文档标注「0.8.0 已移除」
