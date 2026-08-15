@@ -2,6 +2,7 @@
 // 背景：0.6.5/0.6.6 连续出现「Cannot read properties of null」——后端瞬时失败时
 // 页面载荷为 null，模板裸读字段 → 渲染异常。本测试把各页在"所有接口都失败"
 // （载荷保持 null/[]）状态下挂载一遍，断言不抛异常——以后谁再裸读，这里先红。
+// 0.8.0：模拟盘三页（Paper/PaperAudit/PaperSignal）已删除，用例同步移除。
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { mount } from '@vue/test-utils'
 import ElementPlus from 'element-plus'
@@ -25,7 +26,6 @@ const { rejectAll } = vi.hoisted(() => ({
   },
 }))
 vi.mock('./api/status.js', async (io) => rejectAll(await io()))
-vi.mock('./api/paper.js', async (io) => rejectAll(await io()))
 vi.mock('./api/ops.js', async (io) => rejectAll(await io()))
 vi.mock('./api/diag.js', async (io) => rejectAll(await io()))
 vi.mock('./api/data.js', async (io) => rejectAll(await io()))
@@ -34,9 +34,6 @@ import OpsSync from './views/OpsSync.vue'
 import OpsHealth from './views/OpsHealth.vue'
 import OpsDiag from './views/OpsDiag.vue'
 import OpsLogs from './views/OpsLogs.vue'
-import Paper from './views/Paper.vue'
-import PaperAudit from './views/PaperAudit.vue'
-import PaperSignal from './views/PaperSignal.vue'
 import OpsAlerts from './views/OpsAlerts.vue'
 import OpsMcp from './views/OpsMcp.vue'
 import OpsMydb from './views/OpsMydb.vue'
@@ -46,9 +43,6 @@ const CASES = [
   ['/ops/health', '系统健康', OpsHealth],
   ['/ops/diag', '诊断中心', OpsDiag],
   ['/ops/logs', '日志中心', OpsLogs],
-  ['/paper', '模拟盘', Paper],
-  ['/paper/audit', '审计报告', PaperAudit],
-  ['/paper/signal', '信号体检', PaperSignal],
   ['/ops/alerts', '通知中心', OpsAlerts],
   ['/ops/mcp', 'MCP 观测', OpsMcp],
   ['/ops/mydb', '私有存储', OpsMydb],

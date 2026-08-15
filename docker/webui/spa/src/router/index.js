@@ -1,5 +1,6 @@
 // router/index.js — 路由表从 nav.js 单一配置源生成，页面组件懒加载。
-// Phase 5.1（LuCI 经验版）：总览单页 + 系统运维 7 子页 + 模拟盘 3 子页，旧路径 redirect 兜底。
+// Phase 5.1（LuCI 经验版）→ 0.8.0 收敛：总览单页 + 系统运维 7 子页，模拟盘 3 页已移除，
+// 旧路径（含 /paper 系列）redirect 兜底。
 import { createRouter, createWebHistory } from 'vue-router'
 import { NAV_ITEMS, LEGACY_REDIRECTS } from '../layout/nav.js'
 
@@ -13,9 +14,6 @@ const VIEWS = {
   '/ops/logs': () => import('../views/OpsLogs.vue'),
   '/ops/alerts': () => import('../views/OpsAlerts.vue'),
   '/ops/mcp': () => import('../views/OpsMcp.vue'),
-  '/paper': () => import('../views/Paper.vue'),
-  '/paper/audit': () => import('../views/PaperAudit.vue'),
-  '/paper/signal': () => import('../views/PaperSignal.vue'),
 }
 
 const routes = [
