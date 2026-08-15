@@ -93,9 +93,9 @@
 
 ## 端到端验收（M2 全部勾选后）
 
-- [ ] 前端 Vitest 全绿（新增各页组件/逻辑测试）
-- [ ] `npm run build` 通过
-- [ ] Python 229 全绿
-- [ ] 本地双通道冒烟（app.py + dist；vite dev 代理）
+- [x] 前端 Vitest 全绿（7 文件 / 56 例）
+- [x] `npm run build` 通过（vendor 分包，index 主包 16KB）
+- [x] Python 229 全绿
+- [x] 本地冒烟（app.py 静态服务：10 深链 200 + vendor immutable 缓存；vite dev 通道此前已验证）
 - [ ] 新旧面板逐页并排核对（`/legacy` 对照）
 - [ ] NAS `pull && up -d` 后实测 + `/legacy` 回滚演练
