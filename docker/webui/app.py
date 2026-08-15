@@ -79,7 +79,7 @@ _last_verify_result: str | None = None  # 最近一次完整性验证结果（pa
 _scheduler_alive = False             # 定时线程心跳（每次循环更新时间戳）
 _scheduler_heartbeat = 0.0           # 定时线程最近一次心跳时间戳（unix）
 _webui_started = time.time()         # webui 进程启动时间戳
-WEBUI_VERSION = "0.6.6"
+WEBUI_VERSION = "0.7.0"
 
 HISTORY_FILE = DATA_DIR / "sync_history.json"
 SCHEDULE_FILE = DATA_DIR / "sync_schedule.json"
@@ -3003,6 +3003,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._paper_run_now()
             elif path == "/api/alerts/clear":
                 self._alerts_clear()
+            elif path == "/api/auction/run":
+                self._auction_run()
             elif path == "/mcp":
                 self._mcp()
             else:
@@ -3532,6 +3534,24 @@ class Handler(BaseHTTPRequestHandler):
             "ok": entry["ok"], "timepoint": tp, "detail": entry["detail"],
             "error": None if entry["ok"] else entry["detail"]}, ensure_ascii=False))
 
+    def _auction_run(self):
+        """POST /api/auction/run {"task":"collect"|"close"}：手动触发打板采集/收口。
+
+        同步执行对应任务函数并返回其结果 dict（任务函数内部单块 try/except 降级，
+        不会抛异常；模块未就绪 → {ok:False}）；非法 task → 400。手动触发不影响
+        日级防重触发守卫（守卫只约束调度线程，手动重跑用于补采/重试）。
+        """
+        body = self._read_json()
+        task = str(body.get("task") or "").strip()
+        if task == "collect":
+            self._send(200, json.dumps(auction_run_collect(), ensure_ascii=False))
+        elif task == "close":
+            self._send(200, json.dumps(auction_run_close(), ensure_ascii=False))
+        else:
+            self._send(400, json.dumps(
+                {"error": f"非法 task {task!r}；合法值：collect / close"},
+                ensure_ascii=False))
+
 
     # ==================== 运营支撑 API（Phase 4.5：通知中心 / MCP 观测 / 版本检查） ====================
     # 隐私：告警/MCP 记录不含 apikey；版本接口只回显版本号与 release 链接。
@@ -3706,6 +3726,325 @@ class Handler(BaseHTTPRequestHandler):
         }, ensure_ascii=False))
 
 
+# ==================== 打板竞价采集调度（0.7.0 任务D：调度接线） ====================
+# 数据流（设计文档 docs/design/auction-collector.md）：
+#   09:26 采集：读今日清单（昨日 16:30 算好；缺/空 → 前一交易日快照兜底现算）→
+#            fetch_quotes 批量拉竞价价 → 写竞价快照:<今日>:<代码>（state=captured）→
+#            算当日业务值 + 60 日分位 → 写打板指标:<今日>（value_source=auction）；
+#   16:30 收口：校验今日 K 线已同步 → 算明日清单（清单:<明日>:limitup_non_yizi）→
+#            对账回写（state=reconciled / diff_pct，|diff|>0.5% 告警）→
+#            K线权威指标 → 追加打板序列 → 覆盖写打板指标:<今日>（value_source=kline）。
+# 与现有调度并列：独立 2s 轮询线程 auction_scheduler_loop，不侵入 scheduler_loop。
+
+
+def _auction_env_time(name: str, default: str) -> str:
+    """环境变量 HH:MM 校验：非法格式回退默认（调度比较依赖字符串字典序）。"""
+    v = os.environ.get(name, default)
+    try:
+        datetime.strptime(v, "%H:%M")
+    except (TypeError, ValueError):
+        return default
+    return v
+
+
+AUCTION_COLLECT_TIME = _auction_env_time("AUCTION_COLLECT_TIME", "09:26")  # 采集触发点
+AUCTION_CLOSE_TIME = _auction_env_time("AUCTION_CLOSE_TIME", "16:30")      # 收口触发点
+_auction_fired: dict = {}  # 日级防重触发守卫：{date: {"collect": bool, "close": bool}}
+
+# 惰性 import：任务A/B/C（auction_collect/auction_list/auction_metrics）与 MCP 快照
+# 任一缺失 → AUCTION_MODULES_AVAILABLE=False，采集/收口返回 {ok:False}（不拖垮 webui）。
+try:
+    from auction_collect import fetch_quotes as _auction_fetch_quotes
+    from auction_list import compute_limitup_list as _auction_compute_limitup_list
+    from auction_metrics import (
+        METRICS as AUCTION_METRICS,
+        compute_metrics as _auction_compute_metrics,
+        load_series as _auction_load_series,
+        append_series as _auction_append_series,
+        build_metrics_payload as _auction_build_payload,
+        list_key as _auction_list_key,
+        metrics_key as _auction_metrics_key,
+    )
+    from mcp.stockdb_mcp_server import query_point_snapshot as _auction_query_snapshot
+    AUCTION_MODULES_AVAILABLE = True
+    AUCTION_IMPORT_ERROR = ""
+except Exception as _auction_import_exc:  # noqa: BLE001 - 任一模块缺失时优雅降级
+    AUCTION_MODULES_AVAILABLE = False
+    AUCTION_IMPORT_ERROR = f"{type(_auction_import_exc).__name__}: {_auction_import_exc}"
+
+
+def _auction_series_read(key: str):
+    """打板序列读取封装：read_fn(key) -> 原始存储值|None（JSON 解析交给 load_series）。
+
+    mydb 物理布局：表=打板序列:<metric>、子键="series"；mydb_read(key, "") 列出
+    {子键: 值}，取任一非 None 值返回。读取异常 → None（冷启动空序列，不阻塞采集）。
+    """
+    try:
+        res = mydb_read(key, "")
+        for v in (res.get("values") or {}).values():
+            if v is not None:
+                return v
+    except Exception:  # noqa: BLE001 - 序列缺失/损坏 → 调用方按空序列处理
+        return None
+    return None
+
+
+def _auction_series_write(key: str, value) -> None:
+    """打板序列写入封装：write_fn(key, value)；子键固定 "series"，覆盖写幂等。
+
+    value 可能是 dict（append_series 组装完整载荷）或 str，统一序列化后落库。
+    """
+    payload = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+    mydb_write(key, [("series", payload)])
+
+
+def _auction_load_codes(trade_date: str) -> list[str]:
+    """读 mydb 清单:<date>:limitup_non_yizi 的 codes；缺失/损坏/为空 → []。
+
+    返回 [] 时调用方走兜底现算路径（query_point_snapshot + compute_limitup_list）。
+    """
+    try:
+        res = mydb_read(_auction_list_key(trade_date), "")
+        for v in (res.get("values") or {}).values():
+            if v is None:
+                continue
+            data = json.loads(v) if isinstance(v, str) else v
+            if isinstance(data, dict) and isinstance(data.get("codes"), list):
+                return [str(c) for c in data["codes"]]
+    except Exception:  # noqa: BLE001 - 清单缺失/损坏 → 兜底现算
+        return []
+    return []
+
+
+def _auction_prev_trade_date(d8: str, n: int = 1) -> str:
+    """从 d8 往前找第 n 个交易日（YYYYMMDD），用于清单缺失时的兜底现算。"""
+    d = datetime.strptime(d8, "%Y%m%d").date()
+    found = 0
+    while found < n:
+        d -= timedelta(days=1)
+        if is_trading_day(d):
+            found += 1
+    return d.strftime("%Y%m%d")
+
+
+def auction_run_collect() -> dict:
+    """09:26 打板竞价采集任务（幂等，可手动重跑）。
+
+    步骤：① 读今日清单（缺/空 → query_point_snapshot 前一交易日兜底现算）；
+    ② fetch_quotes 批量采集 → 写竞价快照:<今日>:<代码>（state=captured，含
+       raw/contract/fetched_at/known_at=当日 09:25）；
+    ③ compute_metrics + load_series（读近 59 日序列）→ build_metrics_payload
+       （value_source=auction）→ 写打板指标:<今日>。
+    单块 try/except 降级：任何异常 → {ok:False} + log + 告警，绝不外抛。
+    """
+    if not AUCTION_MODULES_AVAILABLE:
+        return {"ok": False, "reason": f"打板模块未就绪：{AUCTION_IMPORT_ERROR}",
+                "collected": 0, "errors_count": 0, "metrics": None, "rank_60d": None}
+    today = datetime.now().strftime("%Y%m%d")
+    try:
+        # ① 清单：昨日 16:30 已算好落库；缺失/为空 → 前一交易日快照兜底现算
+        codes = _auction_load_codes(today)
+        if not codes:
+            prev = _auction_prev_trade_date(today)
+            snaps = _auction_query_snapshot({"date": prev})
+            listing = _auction_compute_limitup_list(snaps.get("points") or [])
+            codes = listing.get("codes") or []
+            log(f"📊 打板清单缺失，已兜底现算（{prev}）→ {len(codes)} 只")
+        if not codes:
+            return {"ok": False, "reason": "清单为空且兜底现算无结果",
+                    "collected": 0, "errors_count": 0, "metrics": None, "rank_60d": None}
+
+        # ② 采集竞价价（fetch_quotes 内部主源腾讯/备源东财降级）→ 逐条写快照
+        quote = _auction_fetch_quotes(codes)
+        ok_items = quote.get("ok") or []
+        errors = quote.get("errors") or []
+        items = []
+        for snap in ok_items:
+            row = dict(snap)
+            row["state"] = "captured"          # 生命周期中间态：captured → reconciled
+            row["contract"] = quote.get("contract")
+            row["fetched_at"] = quote.get("fetched_at")
+            row["known_at"] = f"{today[:4]}-{today[4:6]}-{today[6:8]}T09:25:00"  # 业务口径：9:25 竞价=开盘
+            row["diff_pct"] = None             # 对账后回填
+            row["reconciled_at"] = None
+            items.append((str(snap["code"]), json.dumps(row, ensure_ascii=False)))
+        if items:                              # 空 items 时 mydb_write 会抛 ValueError
+            mydb_write(f"竞价快照:{today}", items)
+
+        # ③ 当日业务值 + 60 日分位（竞价版；序列由 16:30 K线权威版追加，此处只读近 59 日）
+        metrics = _auction_compute_metrics(ok_items)
+        series_by = {m: _auction_load_series(_auction_series_read, m) for m in AUCTION_METRICS}
+        payload = _auction_build_payload(ok_items, series_by,
+                                         computed_at=_now_iso(), value_source="auction")
+        mydb_write(_auction_metrics_key(today),
+                   [("metrics", json.dumps(payload, ensure_ascii=False))])
+        log(f"📊 打板竞价采集（{today}）: {len(ok_items)} 只快照（errors={len(errors)}），"
+            f"premium_mean={metrics.get('premium_mean')}, n={metrics.get('n_samples')}")
+        return {"ok": True, "collected": len(ok_items), "errors_count": len(errors),
+                "metrics": metrics, "rank_60d": payload.get("rank_60d")}
+    except Exception as exc:  # noqa: BLE001 - 单块降级：采集异常不抛给调度线程/HTTP
+        log(f"⚠️ 打板竞价采集失败（{today}）: {exc}")
+        try:
+            notify_alert("error", "打板采集", f"竞价采集失败（{today}）: {exc}")
+        except Exception:  # noqa: BLE001 - 告警通道异常忽略
+            pass
+        return {"ok": False, "reason": str(exc), "collected": 0, "errors_count": 0,
+                "metrics": None, "rank_60d": None}
+
+
+def auction_run_close() -> dict:
+    """16:30 打板收口对账任务（幂等，可手动重跑）。
+
+    步骤：① data_latest_date(force=True) >= 今日（未就绪 → {ok:False,"当日数据未同步"}）；
+    ② 明日清单：今日 K 线快照 → compute_limitup_list → 写清单:<明日>:limitup_non_yizi；
+    ③ 对账：今日竞价快照 open_price vs K线 open → 逐条回写 state=reconciled /
+       diff_pct / reconciled_at，|diff|>0.5% → log + 告警（长期监测口径偏差）；
+    ④ K线权威指标：清单口径 points（close/open/prev_close）→ compute_metrics →
+       append_series（追加并裁剪 60 日）→ build_metrics_payload（value_source=kline）
+       → 覆盖写打板指标:<今日>。
+    单块 try/except 降级：任何异常 → {ok:False} + log + 告警，绝不外抛。
+    """
+    if not AUCTION_MODULES_AVAILABLE:
+        return {"ok": False, "reason": f"打板模块未就绪：{AUCTION_IMPORT_ERROR}",
+                "list_count": 0, "reconciled": 0, "diff_alerts": 0, "metrics": None}
+    today = datetime.now().strftime("%Y%m%d")
+    try:
+        # ① 当日 K 线已同步校验（force 绕过 8s 缓存，收口口径必须实时）
+        latest = str(data_latest_date(force=True) or "").replace("-", "")
+        if not latest or latest < today:
+            return {"ok": False, "reason": "当日数据未同步",
+                    "list_count": 0, "reconciled": 0, "diff_alerts": 0, "metrics": None,
+                    "latest_date": latest or None}
+
+        # 全市场今日时点快照（K线权威源，②③④ 共用）
+        points = (_auction_query_snapshot({"date": today}) or {}).get("points") or []
+        points_by_code = {str(p.get("code")): p for p in points}
+
+        # ② 明日清单：今日非一字板涨停（compute_limitup_list 内部已剔除一字板）
+        listing = _auction_compute_limitup_list(points)
+        tomorrow = (datetime.strptime(today, "%Y%m%d").date() + timedelta(days=1)).strftime("%Y%m%d")
+        list_payload = {"codes": listing.get("codes") or [],
+                        "computed_at": _now_iso(),
+                        "contract": "limitup-non-yizi-v1"}
+        mydb_write(_auction_list_key(tomorrow),
+                   [("list", json.dumps(list_payload, ensure_ascii=False))])
+
+        # ③ 对账：今日 09:26 竞价快照 vs 今日 K线开盘价（口径偏差长期监测）
+        snap_res = mydb_read(f"竞价快照:{today}", "")
+        reconcile_items: list[tuple] = []
+        reconciled, diff_alerts = 0, 0
+        for code, raw in (snap_res.get("values") or {}).items():
+            try:
+                row = json.loads(raw) if isinstance(raw, str) else raw
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(row, dict):
+                continue
+            pt = points_by_code.get(str(code))
+            kline_open = pt.get("open") if pt else None
+            auction_open = row.get("open_price")
+            diff_pct = None
+            try:
+                if auction_open is not None and kline_open:
+                    diff_pct = (float(auction_open) - float(kline_open)) / float(kline_open)
+            except (TypeError, ValueError, ZeroDivisionError):
+                diff_pct = None
+            row["state"] = "reconciled"            # 生命周期终态：对账结论 + 竞价证据
+            row["diff_pct"] = diff_pct
+            row["reconciled_at"] = _now_iso()
+            reconcile_items.append((str(code), json.dumps(row, ensure_ascii=False)))
+            reconciled += 1
+            if diff_pct is not None and abs(diff_pct) > 0.005:   # ±0.5% 口径偏差阈值
+                diff_alerts += 1
+                msg = (f"竞价/开盘口径偏差 {code}: 竞价 {auction_open} vs K线 {kline_open}"
+                       f"（{diff_pct:+.2%}）")
+                log(f"⚠️ 对账 {msg}")
+                try:
+                    notify_alert("warning", "打板对账", f"{today} {msg}")
+                except Exception:  # noqa: BLE001 - 告警通道异常不阻塞对账
+                    pass
+        if reconcile_items:
+            mydb_write(f"竞价快照:{today}", reconcile_items)  # 一次批量回写
+
+        # ④ K线权威指标：与 09:26 竞价版同一清单口径（保证两版可比）；
+        #    清单缺失 → 当日快照代码 → 全市场（逐级兜底）
+        codes = _auction_load_codes(today) or [str(c) for c in (snap_res.get("values") or {})]
+        if codes:
+            code_set = set(codes)
+            snapshots = [{"code": p["code"], "open_price": p.get("open"),
+                          "prev_close": p.get("prev_close")}
+                         for p in points if str(p.get("code")) in code_set]
+        else:
+            snapshots = [{"code": p["code"], "open_price": p.get("open"),
+                          "prev_close": p.get("prev_close")} for p in points]
+        metrics = _auction_compute_metrics(snapshots)
+        series_by = {}
+        for m in AUCTION_METRICS:
+            value = metrics.get(m)
+            if value is None:      # n_samples=0 时指标为 None：不入序列
+                continue
+            series_by[m] = _auction_append_series(
+                _auction_series_read, _auction_series_write, m, value, today)
+        payload = _auction_build_payload(snapshots, series_by,
+                                         computed_at=_now_iso(), value_source="kline")
+        mydb_write(_auction_metrics_key(today),
+                   [("metrics", json.dumps(payload, ensure_ascii=False))])
+        log(f"📊 打板收口对账（{today}）: 明日清单 {len(listing.get('codes') or [])} 只，"
+            f"对账 {reconciled} 条（偏差告警 {diff_alerts}），"
+            f"premium_mean={metrics.get('premium_mean')}")
+        return {"ok": True, "list_count": len(listing.get("codes") or []),
+                "reconciled": reconciled, "diff_alerts": diff_alerts,
+                "metrics": metrics, "rank_60d": payload.get("rank_60d")}
+    except Exception as exc:  # noqa: BLE001 - 单块降级：异常不抛给调度线程/HTTP
+        log(f"⚠️ 打板收口对账失败（{today}）: {exc}")
+        try:
+            notify_alert("error", "打板对账", f"收口任务失败（{today}）: {exc}")
+        except Exception:  # noqa: BLE001 - 告警通道异常忽略
+            pass
+        return {"ok": False, "reason": str(exc), "list_count": 0, "reconciled": 0,
+                "diff_alerts": 0, "metrics": None}
+
+
+def auction_scheduler_loop() -> None:
+    """打板竞价调度线程：每 2s 轮询，严格交易日触发采集/收口（独立线程，与现有调度并列）。
+
+    触发语义：now>=AUCTION_COLLECT_TIME（默认 09:26）且当日 collect 未触发 → 线程内
+    同步执行 auction_run_collect；now>=AUCTION_CLOSE_TIME（默认 16:30）且当日 close
+    未触发 → 同步执行 auction_run_close；任务完成后守卫置位（防重复触发）。
+    任务函数内部单块 try/except 降级不抛异常；即便硬异常也经 finally 置位守卫，
+    避免 2s 轮询空转重试。进程重启后内存守卫清空，同日可能再触发一次——采集/收口
+    均按 key 覆盖写/回写覆盖，天然幂等，不产生重复数据。
+    """
+    while True:
+        try:
+            dt_now = datetime.now()
+            if not is_trading_day(dt_now.date()):   # 严格交易日：休市/周末不触发
+                time.sleep(2)
+                continue
+            today = dt_now.strftime("%Y%m%d")
+            now_hm = dt_now.strftime("%H:%M")
+            guard = _auction_fired.setdefault(today, {"collect": False, "close": False})
+            if now_hm >= AUCTION_COLLECT_TIME and not guard["collect"]:
+                try:
+                    res = auction_run_collect()
+                    log(f"📊 打板竞价采集完成（{today}）: ok={res.get('ok')} "
+                        f"collected={res.get('collected')} errors={res.get('errors_count')} "
+                        f"reason={res.get('reason') or ''}")
+                finally:
+                    guard["collect"] = True  # 完成后置位：当日不重复触发
+            elif now_hm >= AUCTION_CLOSE_TIME and not guard["close"]:
+                try:
+                    res = auction_run_close()
+                    log(f"📊 打板收口对账完成（{today}）: ok={res.get('ok')} "
+                        f"list={res.get('list_count')} reconciled={res.get('reconciled')} "
+                        f"diff_alerts={res.get('diff_alerts')} reason={res.get('reason') or ''}")
+                finally:
+                    guard["close"] = True
+        except Exception as exc:  # noqa: BLE001 - 调度线程异常不退出（与 scheduler_loop 同级容错）
+            log(f"📈 打板调度线程异常: {exc}")
+        time.sleep(2)
+
+
 def main():
     print(f"webui listening on 0.0.0.0:{LISTEN_PORT}", file=sys.stderr)
     print(f"stockdb: {STOCKDB_HOST}:{STOCKDB_PORT}（同容器进程）| data: {DATA_DIR}", file=sys.stderr)
@@ -3717,6 +4056,7 @@ def main():
     threading.Thread(target=scheduler_loop, daemon=True).start()
     threading.Thread(target=paper_scheduler_loop, daemon=True).start()  # 模拟盘调度（2s 轮询，独立线程）
     threading.Thread(target=ops_watchdog_loop, daemon=True).start()     # 运营支撑看门狗（告警生产接线）
+    threading.Thread(target=auction_scheduler_loop, daemon=True).start()  # 打板竞价调度（2s 轮询，独立线程）
     ThreadingHTTPServer(("0.0.0.0", LISTEN_PORT), Handler).serve_forever()
 
 
