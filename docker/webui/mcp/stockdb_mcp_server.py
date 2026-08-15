@@ -82,6 +82,7 @@ from board_metrics import (  # noqa: E402  - 需先插入 sys.path 再导入同�
     _is_north_exchange,  # 北交所排除（当日段重组审计计数用）
     _price_equal,        # 分位价差比较（涨停价判定）
     _rounded_limit_price,
+    rebuild_limit_reference_price,  # 0.8.14：pre_close 污染重建（除权因子反推）
     BOARD_OPEN_COUNTER_FIELDS,  # 当日段重组审计计数键集合（与日K行同构）
 )
 
@@ -825,11 +826,17 @@ def query_fullmarket_daily_snapshot(
                         continue
                     close = float(row.get("close"))
                     raw_prev_close = row.get("pre_close")
-                    prev_close = (
-                        float(raw_prev_close)
-                        if raw_prev_close not in (None, "", 0, "0")
-                        else history_close
-                    )
+                    if raw_prev_close not in (None, "", 0, "0"):
+                        # 0.8.14：pre_close 被未来除权因子回溯污染 → 重建当日法定
+                        # 涨跌停参考价（因子表不可用/无事件 → 原值，未除权无影响）
+                        cum = pybao_tools.get_fq_cum(code, day) if pybao_tools else None
+                        if cum is not None:
+                            prev_close = rebuild_limit_reference_price(
+                                float(raw_prev_close), cum[0], cum[1])
+                        else:
+                            prev_close = float(raw_prev_close)
+                    else:
+                        prev_close = history_close
                     is_st = parse_is_st(row.get("is_st"))
                     if is_st is None:
                         point_in_time_state_unknown_codes.add(code)

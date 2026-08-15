@@ -84,6 +84,31 @@ def _rounded_limit_price(prev_close: float, rate: Decimal) -> float:
     )
 
 
+def rebuild_limit_reference_price(pre_close: float, cum_at_date: float, cum_latest: float) -> float:
+    """引擎历史 K 线 pre_close 被未来除权除息回溯污染 → 重建当日法定涨跌停参考价。
+
+    污染机制（2026-08-16 命理档案异源核验 + 引擎数据实测确认）：引擎按最新复权
+    因子统一重算全部历史行的 pre_close——
+        pre_close_engine(D) = 真实法定参考价(D) × cum_D / cum_latest
+    反推：
+        法定参考价(D) = pre_close_engine(D) × cum_latest / cum_D
+    - 未除权股票（无因子事件）：cum_D == cum_latest → 原样返回（未污染）
+    - 普通日：反推 = 上一实际成交日未复权收盘
+    - 除权除息日：反推 = 交易所法定除权参考价
+    禁止直接使用引擎 pre_close 或机械使用 lag(close) 参与历史涨停判定。
+    """
+    try:
+        c_d = float(cum_at_date)
+        c_l = float(cum_latest)
+    except (TypeError, ValueError):
+        return float(pre_close)
+    if c_d <= 0 or c_l <= 0:
+        return float(pre_close)
+    if abs(c_d - c_l) < 1e-12:
+        return float(pre_close)  # 无因子事件：未污染
+    return float(pre_close) * c_l / c_d
+
+
 def _nearest_rank(values: list[float], fraction: float) -> float | None:
     """Match the percentile convention used by the official board-open collector."""
     if not values:

@@ -79,7 +79,7 @@ _last_verify_result: str | None = None  # 最近一次完整性验证结果（pa
 _scheduler_alive = False             # 定时线程心跳（每次循环更新时间戳）
 _scheduler_heartbeat = 0.0           # 定时线程最近一次心跳时间戳（unix）
 _webui_started = time.time()         # webui 进程启动时间戳
-WEBUI_VERSION = "0.8.13"
+WEBUI_VERSION = "0.8.14"
 
 HISTORY_FILE = DATA_DIR / "sync_history.json"
 SCHEDULE_FILE = DATA_DIR / "sync_schedule.json"
@@ -2716,11 +2716,44 @@ try:
         series_key as _auction_series_key,
     )
     from mcp.stockdb_mcp_server import query_point_snapshot as _auction_query_snapshot
+    from mcp.board_metrics import rebuild_limit_reference_price as _auction_rebuild_ref
     AUCTION_MODULES_AVAILABLE = True
     AUCTION_IMPORT_ERROR = ""
 except Exception as _auction_import_exc:  # noqa: BLE001 - 任一模块缺失时优雅降级
     AUCTION_MODULES_AVAILABLE = False
     AUCTION_IMPORT_ERROR = f"{type(_auction_import_exc).__name__}: {_auction_import_exc}"
+
+
+def _auction_fix_limit_reference(points: list[dict], date: str) -> list[dict]:
+    """重建判定日 date 的法定涨跌停参考价（0.8.14 污染修复）。
+
+    引擎历史 K 线 pre_close 被未来除权除息按最新因子回溯重算（000100 实测
+    恒低 1.92%），直接用会漏判真涨停/误收。用复权因子表反推：
+        法定参考价(D) = pre_close(D) × cum_latest / cum_D
+    因子表不可用 → 原样返回（未除权股票无影响，降级路径与旧行为一致）。
+    """
+    if not points:
+        return points
+    try:
+        from mcp import pybao_tools as _pt
+        fixed = []
+        for p in points:
+            if not isinstance(p, dict):
+                fixed.append(p)
+                continue
+            code = str(p.get("code") or "")
+            pc = p.get("prev_close")
+            if not code or pc is None:
+                fixed.append(p)
+                continue
+            cum = _pt.get_fq_cum(code, date)
+            if cum is None:
+                fixed.append(p)
+                continue
+            fixed.append({**p, "prev_close": _auction_rebuild_ref(float(pc), cum[0], cum[1])})
+        return fixed
+    except Exception:  # noqa: BLE001 - 重建失败按未污染降级
+        return points
 
 
 def _auction_series_read(key: str):
@@ -2796,6 +2829,8 @@ def auction_run_collect() -> dict:
         if not codes:
             prev = _auction_prev_trade_date(today)
             snaps = _auction_query_snapshot({"date": prev, "limit": 0})
+            # 0.8.14：判定参考价重建（pre_close 被未来除权因子污染）
+            snaps["points"] = _auction_fix_limit_reference(snaps.get("points") or [], prev)
             listing = _auction_compute_limitup_list(snaps.get("points") or [])
             codes = listing.get("codes") or []
             log(f"📊 打板清单缺失，已兜底现算（{prev}）→ {len(codes)} 只")
@@ -2870,7 +2905,8 @@ def auction_run_close() -> dict:
         points_by_code = {str(p.get("code")): p for p in points}
 
         # ② 明日清单：今日非一字板涨停（compute_limitup_list 内部已剔除一字板）
-        listing = _auction_compute_limitup_list(points)
+        # 0.8.14：判定参考价重建（pre_close 被未来除权因子污染）
+        listing = _auction_compute_limitup_list(_auction_fix_limit_reference(points, today))
         tomorrow = (datetime.strptime(today, "%Y%m%d").date() + timedelta(days=1)).strftime("%Y%m%d")
         list_payload = {"codes": listing.get("codes") or [],
                         "computed_at": _now_iso(),
@@ -3002,6 +3038,8 @@ def auction_run_backfill(days: int = 60) -> dict:
         for _ in range(days):
             t1 = _auction_prev_trade_date(t)          # T-1 交易日
             pts1 = (_auction_query_snapshot({"date": t1, "limit": 0}) or {}).get("points") or []
+            # 0.8.14：涨停判定参考价重建（pre_close 被未来除权因子污染）
+            pts1 = _auction_fix_limit_reference(pts1, t1)
             codes = _auction_compute_limitup_list(pts1).get("codes") or []
             # T-1 收盘价（0.8.13：溢价分母 = "t-1 日收盘价"——T 日 bar 的 pre_close
             # 在除权除息日为交易所调整昨收，会混入分红使溢价失真，不可用作分母）
