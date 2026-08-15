@@ -53,6 +53,7 @@ from __future__ import annotations
 # 53 项测试语义与行为基线不变（全部打到 app.py 真实函数）。
 # =====================================================================
 import datetime
+import io
 import json
 import os
 import shutil
@@ -958,6 +959,91 @@ class SignalStatusTest(_OpsTestCase):
             app.signal_status(self.sig_dir, "2026-8-4")
         with self.assertRaises(ValueError):
             app.signal_status(self.sig_dir, "2026080X")
+
+
+# =====================================================================
+# Phase 5 M0：前端静态服务 / SPA 回退 / legacy 逃生通道 / overview 聚合
+# 直连 app.Handler.do_GET（FakeConn 提供 rfile/wfile），断言真实路由行为。
+# =====================================================================
+class _FakeConn:
+    """构造 BaseHTTPRequestHandler 所需的最小连接对象（rfile/wfile 均为内存）。"""
+
+    def __init__(self):
+        self.rfile = io.BytesIO()
+        self.wfile = io.BytesIO()
+
+    def makefile(self, mode, *args):
+        return self.rfile if mode == "rb" else self.wfile
+
+    def sendall(self, data):
+        self.wfile.write(data)
+
+
+def _do_get(path: str):
+    """直连 do_GET，返回 (status, headers_dict, body_bytes)。"""
+    conn = _FakeConn()
+    handler = app.Handler(conn, ("127.0.0.1", 1), None)
+    handler.command = "GET"
+    handler.request_version = "HTTP/1.1"
+    handler.protocol_version = "HTTP/1.1"
+    handler.requestline = f"GET {path} HTTP/1.1"
+    handler.headers = {}
+    handler.path = path
+    handler.do_GET()
+    raw = conn.wfile.getvalue()
+    head, _, body = raw.partition(b"\r\n\r\n")
+    status = int(head.split(b" ", 2)[1])
+    headers = {}
+    for line in head.split(b"\r\n")[1:]:
+        k, _, v = line.partition(b": ")
+        headers[k.decode().lower()] = v.decode()
+    return status, headers, body
+
+
+class _StaticServingTests(_OpsTestCase):
+    """M0 静态服务：根路径 HTML、legacy 逃生通道、路径穿越防护、overview 聚合。"""
+
+    def test_root_returns_html(self):
+        status, headers, body = _do_get("/")
+        self.assertEqual(status, 200)
+        self.assertIn("text/html", headers["content-type"])
+        self.assertIn(b"<html", body)
+
+    def test_legacy_escape_hatch(self):
+        """旧面板完整保留：/legacy 返回原 PAGE（标题不变）。"""
+        status, _, body = _do_get("/legacy")
+        self.assertEqual(status, 200)
+        self.assertIn("stockdb 控制台".encode(), body)
+
+    def test_path_traversal_blocked(self):
+        """路径穿越不吐真实文件：落入 SPA 回退（index.html），绝不泄露 /etc/passwd。"""
+        status, _, body = _do_get("/../../etc/passwd")
+        self.assertEqual(status, 200)
+        self.assertNotIn(b"root:", body)
+        self.assertIn(b"<html", body)
+
+    def test_unknown_api_404_unchanged(self):
+        status, _, _ = _do_get("/api/nonexistent")
+        self.assertEqual(status, 404)
+
+    def test_overview_aggregation(self):
+        """/api/overview 五块聚合齐全，version 块带 ui_mode。"""
+        with mock.patch.object(app, "fetch_upstream_release", return_value=None):
+            status, _, body = _do_get("/api/overview")
+        self.assertEqual(status, 200)
+        payload = json.loads(body.decode())
+        for key in ("health", "alerts", "paper", "mcp", "version"):
+            self.assertIn(key, payload)
+        self.assertIn("count", payload["alerts"])
+        self.assertEqual(payload["version"]["ui_mode"], app.WEBUI_UI)
+
+    def test_version_ui_mode(self):
+        with mock.patch.object(app, "fetch_upstream_release", return_value=None):
+            status, _, body = _do_get("/api/version")
+        self.assertEqual(status, 200)
+        payload = json.loads(body.decode())
+        self.assertIn("ui_mode", payload)
+        self.assertIn(payload["ui_mode"], ("spa", "legacy"))
 
 
 if __name__ == "__main__":

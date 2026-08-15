@@ -51,6 +51,17 @@ RUN set -eu; \
     test -x "/out/stockdb/数据更新" || { echo "sync binary missing" >&2; ls -la /out/stockdb; exit 1; }; \
     test -d "/out/stockdb/pybao" || { echo "pybao missing" >&2; ls -la /out/stockdb; exit 1; }
 
+# ================= SPA 前端构建（Node 仅构建期存在；产物为纯静态文件进最终镜像） =================
+# Vue 3 + Vite（Phase 5 M0）：编译 docker/webui/spa/ → dist/（index.html + assets/*，
+# 文件名带内容哈希可 immutable 缓存）。node:22-alpine 官方 manifest 覆盖 amd64+arm64。
+FROM node:22-alpine AS spa-build
+
+WORKDIR /build
+COPY webui/spa/package.json webui/spa/package-lock.json ./
+RUN npm ci --no-audit --no-fund
+COPY webui/spa/ ./
+RUN npm run test && npm run build && test -f dist/index.html
+
 # ================= 运行时：amd64 用 Debian(glibc)，匹配 manylinux-x64 的 pybao =================
 FROM python:3.14-slim AS runtime-amd64
 
@@ -89,6 +100,10 @@ COPY webui/app.py webui/entrypoint.sh /opt/webui/
 COPY webui/mcp/ /opt/webui/mcp/
 # ---- 模拟盘模块（任务E：paper_core/paper_db/mx_client/paper_engine，与 app.py 同目录分发） ----
 COPY webui/paper_core.py webui/paper_db.py webui/mx_client.py webui/paper_engine.py /opt/webui/
+# ---- 前端静态资源：SPA 构建产物（根路径 /）+ 旧面板逃生通道（/legacy） ----
+# app.py 按 WEBUI_STATIC_DIR（默认 <app.py>/static）服务；legacy 必须落在此目录下。
+COPY --from=spa-build /build/dist /opt/webui/static/
+COPY webui/static/legacy/ /opt/webui/static/legacy/
 
 # pybao 写库客户端路径注入（webui 的 mydb 私有存储 / 港股落盘）
 ENV PYTHONPATH=/opt/stockdb/pybao

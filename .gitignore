@@ -8,6 +8,7 @@ __pycache__/
 *.pyc
 .zcode/
 docker/webui/.dev-data/
+.npm-cache/
 .venv/
 
 .DS_Store

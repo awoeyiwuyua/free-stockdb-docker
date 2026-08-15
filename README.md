@@ -10,6 +10,8 @@
 
 ## webui 运维面板（`http://<NAS_IP>:8081`）
 
+- 前端已重构为 **Vue 3 SPA**（0.6.0 起：总览 / 数据 / 模拟盘 / 运维 四组导航，源码 `docker/webui/spa/`，构建产物随镜像分发，Node 仅构建期存在）
+- 旧面板完整保留在 `/legacy`（逃生通道）；环境变量 `WEBUI_UI=legacy` 可把根路径整体切回旧面板，`spa`（默认）为新面板
 - 数据同步：网页一键「立即热更新」（reload 零中断）/「停服同步」（故障兜底）+ 定时计划
 - 健康监控：数据最新日期 / stockdb 进程 / 存储 / 同步能力
 - mydb 私有存储：港股日K 拉取（东财/腾讯）、AI 写入接口
@@ -23,4 +25,6 @@
 ## 文档
 
 - 部署 / 日常更新 / 升级 / 回滚：[`docker/README.md`](docker/README.md)
+- 前端重构方案（Phase 5 架构与实施路径）：[`docs/phase5-spa-plan.md`](docs/phase5-spa-plan.md)
+- SPA 开发与学习导读（M0 起逐里程碑更新）：[`docs/webui-spa/guide-m0.md`](docs/webui-spa/guide-m0.md)
 - 上游引擎能力（本地量化引擎 / 39 指标 / 五种调用方式）：[hello245m/free-stockdb](https://github.com/hello245m/free-stockdb)

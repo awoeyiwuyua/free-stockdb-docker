@@ -79,7 +79,7 @@ _last_verify_result: str | None = None  # 最近一次完整性验证结果（pa
 _scheduler_alive = False             # 定时线程心跳（每次循环更新时间戳）
 _scheduler_heartbeat = 0.0           # 定时线程最近一次心跳时间戳（unix）
 _webui_started = time.time()         # webui 进程启动时间戳
-WEBUI_VERSION = "0.5.6"
+WEBUI_VERSION = "0.6.0"
 
 HISTORY_FILE = DATA_DIR / "sync_history.json"
 SCHEDULE_FILE = DATA_DIR / "sync_schedule.json"
@@ -2712,1311 +2712,116 @@ def _version_tuple(s) -> tuple | None:
 
 
 # ==================== HTTP 服务 ====================
-PAGE = r"""<!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>stockdb 控制台</title>
-<style>
-:root{--bg:#0B1120;--panel:#111C2E;--panel2:#162238;--line:#1E2C45;--text:#E5EDF8;--muted:#8FA2BC;
---ok:#22C55E;--warn:#F59E0B;--err:#EF4444;--brand:#38BDF8}
-*{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--text);
-font:14px/1.6 -apple-system,"PingFang SC","Microsoft YaHei",sans-serif}
-.wrap{max-width:1120px;margin:0 auto;padding:20px 20px 48px}
+# ==================== 前端静态服务（Phase 5 M0：SPA 外壳 + /legacy 逃生通道） ====================
+# 前端已重构为 Vue SPA（docker/webui/spa/，构建产物在镜像内 /opt/webui/static/）。
+# 旧面板（原 PAGE 字符串）完整保留在 static/legacy/index.html，路由 /legacy 原样渲染，
+# 作为逃生通道；WEBUI_UI=legacy 时根路径改用旧面板（默认 spa；SPA 未构建时自动兜底旧面板）。
+# 安全：静态文件定位一律 realpath 校验必须落在 STATIC_DIR 内，防路径穿越。
+STATIC_DIR = Path(os.environ.get(
+    "WEBUI_STATIC_DIR",
+    str(Path(__file__).resolve().parent / "static"),
+))
+WEBUI_UI = os.environ.get("WEBUI_UI", "spa").strip().lower()  # spa | legacy
 
-/* 顶部导航：吸顶 + tab 均匀排列 */
-.topbar{position:sticky;top:0;z-index:50;background:rgba(11,17,32,.94);backdrop-filter:blur(8px);
-border-bottom:1px solid var(--line)}
-.topbar-inner{max-width:1120px;margin:0 auto;padding:10px 20px}
-.tabs{display:flex;gap:2px;width:100%}
-.tab-btn{background:transparent;border:0;border-bottom:2px solid transparent;color:var(--muted);
-font-size:15px;padding:8px 0;cursor:pointer;white-space:nowrap;flex:1;text-align:center}
-.tab-btn.active{color:var(--brand);border-bottom-color:var(--brand);font-weight:700}
-.tab-panel{display:none;padding-top:16px}.tab-panel.active{display:block}
-
-/* 同步页子页签 */
-.sync-tabs{display:flex;gap:8px;border-bottom:1px solid var(--line);padding-bottom:10px;margin-bottom:16px}
-.sync-tab{background:transparent;border:1px solid var(--line);border-radius:8px;color:var(--muted);
-font-size:14px;padding:7px 18px;cursor:pointer}
-.sync-tab.active{background:rgba(56,189,248,.08);border-color:rgba(56,189,248,.4);color:var(--brand);font-weight:700}
-.sync-panel{display:none}.sync-panel.active{display:block}
-
-/* 卡片 */
-.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px;margin:14px 0}
-.card-title{font-size:14px;font-weight:600;margin-bottom:10px}
-.k{color:var(--muted);font-size:12px;margin-bottom:2px}
-.v{font-size:16px;font-weight:600}
-.row{display:flex;gap:16px;flex-wrap:wrap}
-.lbl{color:var(--muted);font-size:12px;margin-bottom:2px}
-.val{font-size:16px;font-weight:600}
-
-/* 按钮 */
-button{background:var(--brand);border:0;color:#082F49;font-weight:700;font-size:15px;
-padding:10px 22px;border-radius:8px;cursor:pointer;min-height:40px}
-button:disabled{background:var(--line);color:var(--muted);cursor:not-allowed}
-.btn-ghost{background:transparent;border:1px solid var(--line);color:var(--text);font-weight:500}
-.btn-ghost:hover{border-color:var(--muted)}
-.btn-danger{background:transparent;border:1px solid var(--err);color:var(--err);font-weight:600}
-.btn-danger:hover{background:rgba(239,68,68,.08)}
-.btn-sm{padding:6px 12px;font-size:13px;min-height:32px}
-
-/* 开关 */
-.switch{position:relative;display:inline-block;width:40px;height:22px;flex-shrink:0}
-.switch input{opacity:0;width:0;height:0}
-.switch .sl{position:absolute;inset:0;background:var(--panel2);border:1px solid var(--line);border-radius:20px;transition:.2s;cursor:pointer}
-.switch .sl:before{content:"";position:absolute;width:16px;height:16px;left:2px;top:2px;border-radius:50%;background:var(--muted);transition:.2s}
-.switch input:checked+.sl{background:rgba(56,189,248,.22);border-color:var(--brand)}
-.switch input:checked+.sl:before{transform:translateX(18px);background:var(--brand)}
-
-/* 主状态区 */
-.hero{background:linear-gradient(180deg,var(--panel) 0%,#0E1830 100%);border:1px solid var(--line);border-radius:12px;padding:20px;margin:14px 0}
-.hero-status{display:flex;align-items:center;gap:10px;font-size:20px;font-weight:700}
-.hero-sub{color:var(--muted);font-size:13px;margin-top:6px}
-.hero-actions{display:flex;align-items:center;gap:12px;margin-top:14px;flex-wrap:wrap}
-
-/* 两列布局 */
-.cols{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin:14px 0}
-@media(max-width:760px){.cols{grid-template-columns:1fr}}
-
-/* 进度 */
-.progress{display:flex;gap:10px;align-items:center;font-size:13px;color:var(--muted);margin-top:12px}
-.bar{flex:1;height:6px;border-radius:3px;background:var(--panel2);overflow:hidden}
-.bar i{display:block;height:100%;width:0;background:var(--brand);border-radius:3px;transition:width .4s}
-.spin{display:inline-block;width:14px;height:14px;border:2px solid var(--brand);border-top-color:transparent;border-radius:50%;animation:spin .8s linear infinite;vertical-align:-2px}
-@keyframes spin{to{transform:rotate(360deg)}}
-
-/* Toast：右下角统一（自动消失，级别左侧色条区分 success/warn/error） */
-#toast{position:fixed;right:20px;bottom:24px;left:auto;transform:translateY(12px);background:var(--panel2);
-border:1px solid var(--line);border-left:3px solid var(--brand);color:var(--text);padding:10px 16px;
-border-radius:10px;font-size:14px;opacity:0;pointer-events:none;transition:.25s;z-index:100;
-box-shadow:0 8px 24px rgba(0,0,0,.4);max-width:420px}
-#toast.show{opacity:1;transform:translateY(0)}
-#toast.success{border-left-color:var(--ok)}
-#toast.warn{border-left-color:var(--warn)}
-#toast.error{border-left-color:var(--err)}
-
-/* 历史 */
-table{width:100%;border-collapse:collapse;font-size:13px}
-th,td{text-align:left;padding:7px 8px;border-bottom:1px solid var(--line);white-space:nowrap}
-th{color:var(--muted);font-weight:600}
-tr.hr-row{cursor:pointer}
-tr.hr-row:hover{background:rgba(56,189,248,.04)}
-.hr-detail{background:var(--panel2);font-size:12px;color:var(--muted)}
-.dot-ok{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--ok);margin-right:6px}
-.dot-warn{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--warn);margin-right:6px}
-.dot-fail{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--err);margin-right:6px}
-.warn-text{color:var(--warn);font-size:12px;margin-top:4px}
-.hr-cards{display:none}
-@media(max-width:760px){table{display:none}.hr-cards{display:block}}
-.hr-card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:12px 14px;margin:10px 0}
-.hr-card .row1{display:flex;justify-content:space-between;align-items:center}
-.hr-card .row2{color:var(--muted);font-size:12px;margin-top:4px}
-.hr-card .row3{color:var(--muted);font-size:12px;margin-top:2px}
-
-/* 存储条 */
-.storage-bar{height:8px;border-radius:4px;background:var(--panel2);overflow:hidden;margin-top:8px}
-.storage-bar i{display:block;height:100%;border-radius:4px;background:var(--brand)}
-.storage-bar i.high{background:var(--warn)}
-
-/* 系统健康卡 */
-.hc-cards{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin:12px 0 4px}
-@media(max-width:760px){.hc-cards{grid-template-columns:1fr}}
-.hc{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px 16px}
-.hc .lbl{font-size:12px;color:var(--muted);margin-bottom:6px}
-.hc .st{font-weight:700;display:flex;align-items:center;gap:8px}
-.hc .st i{display:inline-block;width:9px;height:9px;border-radius:50%}
-.hc .sub{font-size:12px;color:var(--muted);margin-top:6px}
-
-/* 警告卡 */
-.warn-card{background:rgba(245,158,11,.07);border:1px solid rgba(245,158,11,.35);border-radius:12px;padding:14px 16px;margin:14px 0}
-.warn-card .t{color:var(--warn);font-weight:700}
-.warn-card .d{color:var(--muted);font-size:13px;margin-top:4px}
-
-.info-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px 24px}
-@media(max-width:760px){.info-grid{grid-template-columns:1fr}}
-.info-grid .it{display:flex;justify-content:space-between;gap:12px;font-size:13px}
-.info-grid .it .lk{color:var(--muted)}
-
-pre{background:#0A0F1C;border:1px solid var(--line);border-radius:10px;padding:12px;
-max-height:340px;overflow:auto;font:12px/1.5 ui-monospace,monospace;color:#A5D8F8}
-.actions{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
-.hint{color:var(--muted);font-size:12px}
-input[type=text],input[type=time],select{background:#0A0F1C;border:1px solid var(--line);
-color:var(--text);padding:8px 10px;border-radius:8px;width:220px}
-.setting-row{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 0;border-bottom:1px solid var(--line)}
-.setting-row:last-child{border-bottom:0}
-.setting-row .lbl{font-size:13px;color:var(--text)}
-.setting-row .dsc{font-size:12px;color:var(--muted)}
-.times-pill{display:inline-block;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:2px 10px;font-size:13px;margin:2px 4px 2px 0}
-
-/* ==================== Phase 4.5 运营面板 ==================== */
-/* 顶栏状态条（全局可见，15s 静默刷新） */
-.statusbar{display:flex;align-items:center;gap:22px;padding:8px 2px 2px;border-top:1px solid var(--line);
-margin-top:8px;font-size:12px;flex-wrap:wrap}
-.sb-item{display:flex;align-items:center;gap:6px;min-width:0}
-.sb-item.clickable{cursor:pointer}
-.sb-item.clickable:hover .sb-lbl{color:var(--text)}
-.sb-lbl{color:var(--muted);font-size:11px;flex-shrink:0}
-.sb-dot{display:inline-block;width:8px;height:8px;border-radius:50%;flex-shrink:0}
-.sb-badge{background:var(--err);color:#fff;border-radius:10px;font-size:11px;font-weight:700;
-line-height:16px;padding:0 7px;min-width:16px;text-align:center}
-.tabs{overflow-x:auto;scrollbar-width:none}
-.tabs::-webkit-scrollbar{display:none}
-.tab-btn{min-width:86px}
-/* 骨架屏（数据未回时占位） */
-.skel{background:linear-gradient(90deg,var(--panel2) 25%,#1B2A45 50%,var(--panel2) 75%);
-background-size:200% 100%;animation:shimmer 1.2s infinite;border-radius:6px}
-@keyframes shimmer{to{background-position:-200% 0}}
-.skel-line{height:14px;margin:8px 0}
-.skel-block{height:88px;margin:10px 0}
-/* 通知中心：级别着色 */
-.alv{display:inline-block;padding:1px 8px;border-radius:8px;font-size:11px;font-weight:700}
-.alv-info{background:rgba(56,189,248,.12);color:var(--brand)}
-.alv-warning{background:rgba(245,158,11,.12);color:var(--warn)}
-.alv-error{background:rgba(239,68,68,.12);color:var(--err)}
-/* MCP 统计卡 */
-.mcp-cards{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:4px 0 16px}
-@media(max-width:760px){.mcp-cards{grid-template-columns:repeat(2,1fr)}}
-.mcp{background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:12px 14px}
-.mcp .lbl{font-size:12px;color:var(--muted);margin-bottom:4px}
-.mcp .val{font-size:20px;font-weight:700}
-/* 过滤行（日期区间 / 状态下拉） */
-.frow{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:0 0 10px}
-.frow label{color:var(--muted);font-size:12px}
-input[type=date]{background:#0A0F1C;border:1px solid var(--line);color:var(--text);
-padding:7px 10px;border-radius:8px;width:auto}
-.frow select{width:auto}
-/* 时间轴卡片：可点击内联展开 */
-.tp-card{cursor:pointer;transition:border-color .15s,background .15s}
-.tp-card:hover{border-color:rgba(56,189,248,.45);background:#16283F}
-.tp-card.open{border-color:var(--brand);background:rgba(56,189,248,.07)}
-/* 版本检查 */
-.ver-stale{background:rgba(56,189,248,.07);border:1px solid rgba(56,189,248,.35);
-border-radius:12px;padding:12px 16px;margin:0 0 12px}
-.ver-stale .t{color:var(--brand);font-weight:700}
-.ver-stale .d{color:var(--muted);font-size:13px;margin-top:4px}
-/* 空态 / 降级文案 */
-.empty-hint{color:var(--muted);font-size:13px;padding:22px 0;text-align:center}
-.degraded{color:var(--warn);font-size:13px;padding:4px 0}
-</style></head><body>
-<div class="topbar"><div class="topbar-inner">
-  <nav class="tabs">
-    <button class="tab-btn active" data-tab="sync" onclick="showTab('sync',this)">数据同步</button>
-    <button class="tab-btn" data-tab="system" onclick="showTab('system',this)">系统</button>
-    <button class="tab-btn" data-tab="paper" onclick="showTab('paper',this)">模拟盘</button>
-    <button class="tab-btn" data-tab="alerts" onclick="showTab('alerts',this)">通知</button>
-    <button class="tab-btn" data-tab="mcp" onclick="showTab('mcp',this)">MCP 观测</button>
-  </nav>
-  <div class="statusbar" id="statusbar">
-    <div class="sb-item" title="行情数据最新日期与滞后天数">
-      <span class="sb-lbl">数据</span><span id="barFresh"><span class="sb-dot" style="background:var(--muted)"></span>…</span>
-    </div>
-    <div class="sb-item" title="stockdb 进程健康（/api/status container）">
-      <span class="sb-lbl">stockdb</span><span id="barSvc"><span class="sb-dot" style="background:var(--muted)"></span>…</span>
-    </div>
-    <div class="sb-item" title="模拟盘引擎 / apikey 配置 / 交易开关 / 暂停状态">
-      <span class="sb-lbl">模拟盘</span><span id="barPaper"><span class="sb-dot" style="background:var(--muted)"></span>…</span>
-    </div>
-    <div class="sb-item clickable" onclick="showTab('alerts')" title="告警中心（count&gt;0 显示红点数字，点击查看）">
-      <span class="sb-lbl">告警</span><span id="barAlerts" class="sb-badge" style="display:none">0</span>
-    </div>
-  </div>
-</div></div>
-<div class="wrap">
-<div id="toast"></div>
-
-<!-- 数据同步：数据源同步 + 私有存储同步（两个子页签） -->
-<div id="tab-sync" class="tab-panel">
-  <div class="sync-tabs">
-    <button class="sync-tab active" data-sync-tab="source" onclick="showSyncTab('source',this)">数据源同步</button>
-    <button class="sync-tab" data-sync-tab="mydb" onclick="showSyncTab('mydb',this)">私有存储同步（手动）</button>
-  </div>
-
-  <!-- 子页签1：数据源同步（A股行情增量同步） -->
-  <div id="sync-source" class="sync-panel active">
-  <div class="hero">
-    <div class="hero-status"><span id="heroSpin" class="spin" style="display:none"></span><span id="heroStatus">…</span></div>
-    <div class="hero-sub" id="heroSub">…</div>
-    <div class="hero-sub" id="heroTask" style="margin-top:2px"></div>
-    <div class="hero-actions">
-      <button id="syncBtn2" onclick="startSync(false)">立即热更新</button>
-      <span class="hint" id="lastSuccess">…</span>
-      <span style="flex:1"></span>
-      <button class="btn-ghost btn-sm" onclick="toggleMenu()">更多操作 <span id="menuCaret">▾</span></button>
-    </div>
-    <div id="moreMenu" style="display:none;margin-top:12px">
-      <div class="hint" style="margin-bottom:8px">默认热更新不中断行情服务；以下为故障兜底。</div>
-      <button class="btn-danger btn-sm" onclick="startSync(true)">停服同步（备用）</button>
-    </div>
-    <div id="syncProgress" style="display:none;margin-top:14px">
-      <div style="display:flex;gap:8px;align-items:center;font-size:14px">
-        <span class="spin"></span><span id="progPhase">正在同步数据</span>
-        <span style="flex:1"></span><span class="hint" id="progElapsed">已运行 00:00</span>
-      </div>
-      <div class="progress"><span id="progStage">准备中</span><div class="bar"><i id="progBar"></i></div><span id="progPct">0%</span></div>
-    </div>
-  </div>
-
-  <div class="cols">
-    <div class="card"><div class="card-title">自动同步</div>
-      <div id="schView">
-        <div class="setting-row"><span class="lbl">自动同步</span><label class="switch"><input type="checkbox" id="schEnabled" onchange="saveScheduleNow()"><span class="sl"></span></label></div>
-        <div class="setting-row"><span class="lbl">仅交易日 <span class="dsc">周末 / 法定休市不执行</span></span><label class="switch"><input type="checkbox" id="schTrading" onchange="saveScheduleNow()"><span class="sl"></span></label></div>
-        <div class="setting-row"><span class="lbl">执行时间</span><span class="hint" id="schTimesView">…</span></div>
-        <div class="setting-row"><span class="lbl">下次执行</span><span class="hint" id="schNext">…</span></div>
-        <div style="margin-top:10px;text-align:right"><button class="btn-ghost btn-sm" onclick="toggleSchEdit(true)">编辑计划</button></div>
-      </div>
-      <div id="schEdit" style="display:none">
-        <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px;flex-wrap:wrap">
-          <input type="time" id="schTime" value="15:30" style="width:140px">
-          <button class="btn-ghost btn-sm" onclick="addSchTime()">添加时间点</button>
-        </div>
-        <div id="schTimesEdit" style="margin-bottom:10px"></div>
-        <div style="display:flex;gap:8px;justify-content:flex-end">
-          <button class="btn-ghost btn-sm" onclick="toggleSchEdit(false)">取消</button>
-          <button class="btn-sm" onclick="saveScheduleNow()">保存计划</button>
-        </div>
-      </div>
-      <div class="hint" style="margin-top:8px" id="schLast"></div>
-      <div class="hint" id="schToday"></div>
-    </div>
-    <div class="card"><div class="card-title">数据概况</div>
-      <div class="metrics" style="gap:10px">
-        <div class="m"><div class="lbl">股票</div><div class="val" id="cCountStk">…</div></div>
-        <div class="m"><div class="lbl">ETF</div><div class="val" id="cCountEtf">…</div></div>
-        <div class="m"><div class="lbl">覆盖</div><div class="val" id="cCoverage" style="font-size:14px">…</div></div>
-      </div>
-      <div class="hint" style="margin-top:8px">本地数据 <span id="cLocalDate">…</span> ｜ 镜像数据 <span id="cMirrorDate">…</span></div>
-    </div>
-  </div>
-
-  <div class="card"><div class="card-title">最近同步 <span class="hint" style="font-weight:normal;margin-left:6px" id="histStats"></span></div>
-    <table><thead><tr><th>时间</th><th>触发</th><th>模式</th><th>结果</th><th>下载</th><th>验证</th><th>耗时</th><th>数据最新</th></tr></thead>
-    <tbody id="histBody"><tr><td colspan="8" class="hint">（暂无历史）</td></tr></tbody></table>
-    <div class="hr-cards" id="histCards"></div>
-  </div>
-  <div class="card"><div class="card-title">同步日志</div>
-    <pre id="log">（暂无）</pre>
-  </div>
-  </div>
-
-  <!-- 子页签2：私有存储同步（手动）——港股拉取 + AI 写入接口 -->
-  <div id="sync-mydb" class="sync-panel">
-    <div class="card"><div class="card-title">港股同步 <span class="hint" style="font-weight:normal">（拉取日K写入 hk日k 表 · 手动）</span></div>
-      <div class="hint" style="margin-bottom:8px">输入港股代码（如 00700 腾讯控股）拉取指定时间范围的日K写入私有存储，供个股/ETF研究页查询。手动点击触发。</div>
-      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
-        <input type="text" id="hkCodes" placeholder="港股代码，逗号分隔，如 00700,00941" style="width:280px">
-        <select id="hkYears">
-          <option value="1">近1年</option>
-          <option value="2" selected>近2年</option>
-          <option value="3">近3年</option>
-          <option value="5">近5年</option>
-          <option value="10">近10年</option>
-        </select>
-        <button class="btn-ghost" onclick="hkSync()">拉取港股</button>
-        <span class="hint" id="hkMsg"></span>
-      </div>
-    </div>
-    <div class="card"><div class="card-title">私有数据写入 <span class="hint" style="font-weight:normal">（AI 接口 · 供扩展）</span></div>
-      <div class="hint" style="margin-bottom:8px">写入自定义表（如 <code>hk日k</code>、<code>自定义指标</code>），表名不可与上游保留表（日k/复权/分钟k 等）冲突。该接口预留扩展为 AI agent 介入的写入通道，支持单条或 JSON 批量。</div>
-      <div style="display:flex;gap:12px;align-items:flex-start;flex-wrap:wrap">
-        <div style="display:flex;flex-direction:column;gap:6px;flex:1;min-width:260px">
-          <input type="text" id="dwTable" placeholder="表名，如 自定义指标" style="width:220px">
-          <textarea id="dwPayload" rows="4" placeholder='单条：{"key":"600633","value":{"score":85}}\n批量：{"items":[["000001",{"score":70}],["000967",{"score":80}]]}' style="width:100%;font-family:monospace;font-size:12px"></textarea>
-          <div style="display:flex;gap:8px;align-items:center">
-            <button class="btn-ghost" onclick="dataWrite()">写入</button>
-            <button class="btn-ghost" onclick="dataTables()">查看表</button>
-            <span class="hint" id="dwMsg"></span>
-          </div>
-        </div>
-        <div id="dwTables" class="hint" style="max-height:140px;overflow:auto;flex:1;min-width:200px"></div>
-      </div>
-    </div>
-    <div class="card"><div class="card-title">说明</div>
-      <div class="hint" style="line-height:1.8">
-        · <b>数据源同步</b>：从镜像源增量同步 A 股行情（日K/分钟K/复权），写入 ./data，自动定时或手动触发。<br>
-        · <b>私有存储同步（手动）</b>：港股日K与自定义数据写入私有存储 ./mydb（与上游 ./data 物理隔离，互不冲突）。<br>
-        · 港股数据源：东财/腾讯公网接口；表名以 <code>hk日k</code> / <code>自定义:</code> 等命名空间隔离，不覆盖上游保留表。<br>
-        · <b>AI 接口</b>：私有数据写入 API（<code>POST /api/data/write</code>）预留为 AI agent 介入的扩展点，后续可对接自动数据接入。
-      </div>
-    </div>
-  </div>
-</div>
-
-<!-- 系统：健康检查面板 -->
-<div id="tab-system" class="tab-panel">
-  <div class="card"><div class="card-title">系统健康检查</div>
-    <div id="sysOK" style="display:flex;align-items:center;gap:8px;font-weight:700;font-size:16px;margin-bottom:4px">…</div>
-    <div class="hc-cards">
-      <div class="hc"><div class="lbl">行情服务</div><div class="st"><i id="hcSvcDot"></i><span id="hcSvc">…</span></div><div class="sub" id="hcSvcSub">…</div></div>
-      <div class="hc"><div class="lbl">stockdb</div><div class="st"><i id="hcDkrDot"></i><span id="hcDkr">…</span></div><div class="sub" id="hcDkrSub">…</div></div>
-      <div class="hc"><div class="lbl">自动任务</div><div class="st"><i id="hcSchedDot"></i><span id="hcSched">…</span></div><div class="sub" id="hcSchedSub">…</div></div>
-      <div class="hc"><div class="lbl">同步能力</div><div class="st"><i id="hcCapDot"></i><span id="hcCap">…</span></div><div class="sub" id="hcCapSub">…</div></div>
-    </div>
-    <div id="dkrWarn" class="warn-card" style="display:none">
-      <div class="t">stockdb 进程不可控</div>
-      <div class="d">未检测到 stockdb 进程（pidfile 不存在）。行情查询仍可使用，但无法重启 stockdb 或执行停服同步。</div>
-    </div>
-  </div>
-  <div class="card"><div class="card-title">存储空间</div>
-    <div id="cDisk" style="font-size:15px;font-weight:600">…</div>
-    <div class="storage-bar"><i id="diskBar"></i></div>
-    <div class="hint" style="margin-top:6px">挂载点 /data（数据卷）</div>
-  </div>
-  <div class="card"><div class="card-title">运行信息</div>
-    <div class="info-grid">
-      <div class="it"><span class="lk">数据卷</span><span id="cImage">—</span></div>
-      <div class="it"><span class="lk">stockdb 进程</span><span id="cState">—</span></div>
-      <div class="it"><span class="lk">进程时长</span><span id="cUptime">—</span></div>
-      <div class="it"><span class="lk">同步节点</span><span id="cSource">—</span></div>
-      <div class="it"><span class="lk">WebUI 版本</span><span id="cVer">—</span></div>
-      <div class="it"><span class="lk">WebUI 启动</span><span id="cStart">—</span></div>
-      <div class="it"><span class="lk">调度心跳</span><span id="cHeartbeat">—</span></div>
-      <div class="it"><span class="lk">数据目录</span><span id="cDataDir">—</span></div>
-      <div class="it"><span class="lk">交易日历</span><span id="cCalendar">—</span></div>
-      <div class="it"><span class="lk">最近同步</span><span id="cLastSyncInfo">—</span></div>
-    </div>
-  </div>
-  <div class="card"><div class="card-title">运维工具</div>
-    <div class="actions">
-      <button class="btn-ghost" id="btnLogs" disabled onclick="toggleContainerLogs()">查看 stockdb 日志</button>
-      <button class="btn-danger" id="btnRestart" disabled onclick="restartContainer()">重启 stockdb</button>
-      <span class="hint" id="containerMsg"></span>
-    </div>
-    <pre id="containerLog" style="display:none;margin-top:10px">（加载中…）</pre>
-  </div>
-  <div class="card"><div class="card-title">版本检查 <span class="hint" style="font-weight:normal" id="verMeta">（对比上游最新 release）</span></div>
-    <div id="verStale" class="ver-stale" style="display:none">
-      <div class="t">上游有新版</div>
-      <div class="d" id="verStaleText"></div>
-    </div>
-    <div id="verSkel"><div class="skel skel-line"></div><div class="skel skel-line" style="width:70%"></div></div>
-    <div class="info-grid" id="verGrid" style="display:none">
-      <div class="it"><span class="lk">WebUI 版本</span><span id="verWebui">—</span></div>
-      <div class="it"><span class="lk">镜像引擎 tag</span><span id="verImage">—</span></div>
-      <div class="it"><span class="lk">上游最新 release</span><span id="verUp">—</span></div>
-      <div class="it"><span class="lk">发布日期</span><span id="verUpDate">—</span></div>
-      <div class="it"><span class="lk">发布链接</span><span id="verUpLink">—</span></div>
-    </div>
-    <div id="verDegraded" class="degraded" style="display:none"></div>
-  </div>
-  <div class="card"><div class="card-title">开发工具 <span class="hint" style="font-weight:normal">（行情原始查询，代理 stockdb HTTP API）</span></div>
-    <details>
-      <summary class="hint" style="cursor:pointer">展开原始查询</summary>
-      <div style="display:flex;gap:8px;margin:10px 0;flex-wrap:wrap">
-        <select id="qtype">
-          <option value="股票代码">股票代码</option>
-          <option value="日k:600633:20260810">日K 示例</option>
-          <option value="分钟k:600633:20260810140000">分钟K 示例</option>
-          <option value="复权:600633:2026*">复权 示例</option>
-        </select>
-        <button class="btn-ghost btn-sm" onclick="doQuery()">查询</button>
-      </div>
-      <pre id="qres">（查询结果）</pre>
-    </details>
-  </div>
-</div>
-
-<!-- 模拟盘：状态 / 账户总览 / 今日时间轴 / 决策 / 订单 / 收益曲线 / 连通自检 -->
-<div id="tab-paper" class="tab-panel">
-  <div class="hero">
-    <div class="hero-status"><span id="ppDot" style="display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:8px"></span><span id="ppTitle">模拟盘</span></div>
-    <div class="hero-sub" id="ppSub">…</div>
-    <div class="hero-actions">
-      <span class="hint" id="ppGate"></span>
-      <span style="flex:1"></span>
-      <span class="hint">暂停开关</span>
-      <label class="switch"><input type="checkbox" id="ppPause" onchange="paperSetPause()"><span class="sl"></span></label>
-      <button class="btn-ghost btn-sm" onclick="paperConnectivity()">连通自检</button>
-    </div>
-  </div>
-  <div class="cols">
-    <div class="card"><div class="card-title">状态</div>
-      <div class="info-grid">
-        <div class="it"><span class="lk">apikey</span><span id="ppCfg">…</span></div>
-        <div class="it"><span class="lk">apikey 配置</span>
-          <input type="password" id="ppKey" placeholder="粘贴 MX_APIKEY，仅存本机 /data/mx_apikey.txt" style="width:56%;box-sizing:border-box" autocomplete="off">
-          <button class="btn-ghost btn-sm" onclick="paperSaveKey()">保存</button>
-          <button class="btn-ghost btn-sm" onclick="paperClearKey()">清除</button>
-        </div>
-        <div class="it"><span class="lk">交易开关</span><span id="ppTrading">…</span></div>
-        <div class="it"><span class="lk">引擎</span><span id="ppEngine">…</span></div>
-        <div class="it"><span class="lk">下次触发</span><span id="ppNext">…</span></div>
-        <div class="it"><span class="lk">数据库</span><span id="ppDb">…</span></div>
-        <div class="it"><span class="lk">时点</span><span id="ppTimes">…</span></div>
-      </div>
-      <div id="ppReason" class="warn-card" style="display:none"><div class="t">不可用原因</div><div class="d" id="ppReasonText"></div></div>
-    </div>
-    <div class="card"><div class="card-title">账户总览 <span class="hint" style="font-weight:normal">（本地账本 · 最新组合快照）</span></div>
-      <div class="row">
-        <div><div class="k">总资产（净值）</div><div class="v" id="ppNav">…</div></div>
-        <div><div class="k">可用资金</div><div class="v" id="ppCash">…</div></div>
-        <div><div class="k">持仓</div><div class="v" id="ppPos" style="font-size:14px">…</div></div>
-        <div><div class="k">浮盈（对初始本金）</div><div class="v" id="ppPnl">…</div></div>
-      </div>
-      <div class="hint" style="margin-top:8px" id="ppSnapTs"></div>
-    </div>
-  </div>
-  <div class="card"><div class="card-title">今日时间轴 <span class="hint" style="font-weight:normal" id="ppToday"></span></div>
-    <div id="ppTimeline" style="display:grid;grid-template-columns:repeat(8,1fr);gap:8px;margin-bottom:12px"></div>
-    <div id="ppTpDetail" style="margin:0 0 12px"></div>
-    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-      <select id="ppTp"><option value="">选择时点手动触发</option></select>
-      <button class="btn-ghost btn-sm" onclick="paperRunNow()">手动执行</button>
-      <span class="hint" id="ppRunMsg"></span>
-    </div>
-  </div>
-  <div class="cols">
-    <div class="card"><div class="card-title">决策 <span class="hint" style="font-weight:normal" id="ppDecMeta"></span></div>
-      <div class="frow">
-        <label>日期</label><input type="date" id="ppDecFrom" onchange="renderPaperDecisions()">
-        <span class="hint">~</span><input type="date" id="ppDecTo" onchange="renderPaperDecisions()">
-        <label>状态</label><select id="ppDecSt" onchange="renderPaperDecisions()"><option value="">全部</option></select>
-      </div>
-      <table><thead><tr><th>交易日</th><th>信号（prev→cur）</th><th>目标（prev→desired）</th><th>理由</th><th>状态</th></tr></thead>
-      <tbody id="ppDecBody"><tr><td colspan="5" class="hint">（加载中…）</td></tr></tbody></table>
-    </div>
-    <div class="card"><div class="card-title">订单 <span class="hint" style="font-weight:normal" id="ppOrdMeta"></span></div>
-      <div class="frow">
-        <label>日期</label><input type="date" id="ppOrdFrom" onchange="renderPaperOrders()">
-        <span class="hint">~</span><input type="date" id="ppOrdTo" onchange="renderPaperOrders()">
-        <label>状态</label><select id="ppOrdSt" onchange="renderPaperOrders()"><option value="">全部</option></select>
-      </div>
-      <table><thead><tr><th>交易日</th><th>动作</th><th>目标 / 差额</th><th>价格类型</th><th>状态</th></tr></thead>
-      <tbody id="ppOrdBody"><tr><td colspan="5" class="hint">（加载中…）</td></tr></tbody></table>
-    </div>
-  </div>
-  <div class="cols">
-    <div class="card"><div class="card-title">收益曲线 <span class="hint" style="font-weight:normal">（组合净值 · 最近 60 个快照）</span></div>
-      <div id="ppCurve"></div>
-    </div>
-    <div class="card"><div class="card-title">最近事件 <span class="hint" style="font-weight:normal" id="ppEvMeta"></span></div>
-      <div class="frow">
-        <label>时点</label><select id="ppEvTp" onchange="renderPaperEvents()"><option value="">全部时点</option></select>
-      </div>
-      <div id="ppEvents" style="max-height:280px;overflow:auto"></div>
-    </div>
-  </div>
-  <div class="card"><div class="card-title">连通自检结果 <span class="hint" style="font-weight:normal">（POST /api/paper/connectivity）</span></div>
-    <pre id="ppConn">（点击上方「连通自检」查看结果）</pre>
-  </div>
-</div>
-
-<!-- 通知：告警中心（级别着色 / 清空 / 空态） -->
-<div id="tab-alerts" class="tab-panel">
-  <div class="card">
-    <div class="card-title" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
-      <span>告警中心</span><span class="hint" style="font-weight:normal" id="alertsMeta"></span>
-      <span style="flex:1"></span>
-      <button class="btn-ghost btn-sm" id="alertsClearBtn" onclick="alertsClear()">清空告警</button>
-    </div>
-    <div id="alertsSkel"><div class="skel skel-line"></div><div class="skel skel-line"></div><div class="skel skel-line"></div></div>
-    <table><thead><tr><th style="width:150px">时间</th><th style="width:70px">级别</th><th style="width:90px">来源</th><th>消息</th></tr></thead>
-    <tbody id="alertsBody"><tr><td colspan="4" class="empty-hint">（加载中…）</td></tr></tbody></table>
-    <div id="alertsEmpty" class="empty-hint" style="display:none">（暂无告警，一切正常）</div>
-  </div>
-</div>
-
-<!-- MCP 观测：调用统计 / 按工具 / 最近调用（30s 自动刷新） -->
-<div id="tab-mcp" class="tab-panel">
-  <div class="card"><div class="card-title">调用统计 <span class="hint" style="font-weight:normal" id="mcpMeta">（最近 500 条调用窗口）</span></div>
-    <div class="mcp-cards" id="mcpCards">
-      <div class="mcp"><div class="lbl">总调用</div><div class="val"><div class="skel skel-line" style="margin:2px 0;width:70%"></div></div></div>
-      <div class="mcp"><div class="lbl">成功率</div><div class="val"><div class="skel skel-line" style="margin:2px 0;width:70%"></div></div></div>
-      <div class="mcp"><div class="lbl">平均耗时</div><div class="val"><div class="skel skel-line" style="margin:2px 0;width:70%"></div></div></div>
-      <div class="mcp"><div class="lbl">P95 耗时</div><div class="val"><div class="skel skel-line" style="margin:2px 0;width:70%"></div></div></div>
-    </div>
-    <div class="card-title" style="margin-top:4px">按工具</div>
-    <table><thead><tr><th>工具</th><th>次数</th><th>成功</th><th>平均耗时</th></tr></thead>
-    <tbody id="mcpToolBody"><tr><td colspan="4" class="empty-hint">（加载中…）</td></tr></tbody></table>
-    <div class="card-title" style="margin-top:16px">最近调用 <span class="hint" style="font-weight:normal" id="mcpCallMeta"></span></div>
-    <table><thead><tr><th>时间</th><th>工具</th><th>耗时</th><th>成败</th><th>字节</th></tr></thead>
-    <tbody id="mcpCallBody"><tr><td colspan="5" class="empty-hint">（加载中…）</td></tr></tbody></table>
-  </div>
-</div>
-</div>
-<script>
-async function j(url,opt){const r=await fetch(url,opt);if(!r.ok)throw new Error(r.status);return r.json()}
-function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
-function pctCls(v){return v>0?'color:#F87171':v<0?'color:#4ADE80':'color:#8FA2BC'}
-function fmtPct(v){return v==null?'—':(v>0?'+':'')+Number(v).toFixed(2)+'%'}
-function fmtPrice(v){return v==null?'—':Number(v).toFixed(2)}
-function $(id){return document.getElementById(id)}
-function fmtYMD(v){const t=String(v);return t.length===8?t.slice(0,4)+'-'+t.slice(4,6)+'-'+t.slice(6,8):t}
-let _toastTimer=null;
-// 统一 toast：右下角、自动消失、级别样式（success/warn/error，缺省 info 中性）
-function toast(msg,level){const t=$('toast');t.textContent=msg;
-  t.className=(level==='success'||level==='warn'||level==='error')?('show '+level):'show';
-  clearTimeout(_toastTimer);_toastTimer=setTimeout(()=>t.classList.remove('show'),2600)}
-function fmtDur(sec){sec=Math.max(0,Math.floor(sec||0));return String(Math.floor(sec/60)).padStart(2,'0')+':'+String(sec%60).padStart(2,'0')}
-function fmtClock(ts){
-  if(!ts)return '';
-  const d=new Date(ts.replace(' ','T'));if(isNaN(d))return ts;
-  const now=new Date(),day0=new Date(now.getFullYear(),now.getMonth(),now.getDate());
-  const dd=new Date(d.getFullYear(),d.getMonth(),d.getDate());
-  const hm=String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0');
-  const diff=Math.round((day0-dd)/86400000);
-  if(diff===0)return '今天 '+hm;if(diff===1)return '昨天 '+hm;
-  return String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0')+' '+hm;
+_MIME = {
+    ".html": "text/html; charset=utf-8",
+    ".js": "text/javascript; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".json": "application/json; charset=utf-8",
+    ".svg": "image/svg+xml",
+    ".png": "image/png",
+    ".ico": "image/x-icon",
+    ".woff": "font/woff",
+    ".woff2": "font/woff2",
+    ".map": "application/json; charset=utf-8",
 }
-function showTab(name,btn){
-  document.querySelectorAll('.tab-btn').forEach(b=>b.classList.remove('active'));
-  document.querySelectorAll('.tab-panel').forEach(p=>p.classList.remove('active'));
-  (btn||document.querySelector('[data-tab="'+name+'"]')).classList.add('active');
-  $('tab-'+name).classList.add('active');
-  refresh(true); // 切页立即按当前页刷新
-}
-function showSyncTab(name,btn){
-  document.querySelectorAll('.sync-tab').forEach(b=>b.classList.remove('active'));
-  document.querySelectorAll('.sync-panel').forEach(p=>p.classList.remove('active'));
-  (btn||document.querySelector('[data-sync-tab="'+name+'"]')).classList.add('active');
-  $('sync-'+name).classList.add('active');
-}
+# 可长缓存的静态资源扩展名（Vite 产物文件名带内容哈希，可 immutable 缓存）
+_CACHEABLE_EXT = {".js", ".css", ".svg", ".png", ".ico", ".woff", ".woff2", ".map"}
 
-const PHASE_STAGE={stopping:'停服中',syncing:'同步数据',verifying:'校验数据完整性',restarting:'重启服务'};
-const PHASE_PCT={stopping:15,syncing:45,verifying:80,restarting:95};
-let _lastExit=null;
-let _healthCache=null;   // 最近一次 /api/health 结果缓存：停留概览/行情页时顶部状态用它，避免 h=null 误报"服务异常"
 
-// 轮询互斥 + 排队：避免重叠请求；切页 force 触发一次立即刷新
-let _refreshing=false,_refreshQueued=false;
-async function refresh(force){
-  if(_refreshing){if(force)_refreshQueued=true;return}
-  _refreshing=true;
-  try{
-    const active=document.querySelector('.tab-panel.active')?.id||'tab-sync';
-    if(active==='tab-sync'){
-      // 同步页：进度/日志需精确 → 每帧全量 status+health（后端 TTL 缓存后开销大降）
-      const s=await j('/api/status');
-      const h=await j('/api/health');
-      if(h)_healthCache=h;
-      renderHero(s,h);
-      renderSchView(s.schedule||{});
-      renderDataOverview(s);
-      const sched=s.schedule||{};
-      $('schToday').textContent=(sched.enabled&&sched.trading_only)?(s.trading_today?'':'今日非交易日，定时跳过'):'';
-      loadHistory();
-      const lg=await j('/api/log?n=80');
-      $('log').textContent=lg.log;   // 日志常展开（HTML 无 display:none，无需折叠逻辑）
-    }else if(active==='tab-system'){
-      // 系统页：健康卡需实时 → 每帧全量 status+health（后端缓存后已可接受）
-      const s=await j('/api/status');
-      const h=await j('/api/health');
-      if(h)_healthCache=h;
-      renderSystem(s);
-      loadHistory();
-      refreshVersion();
-    }else if(active==='tab-paper'){
-      await refreshPaper();
-    }else if(active==='tab-alerts'){
-      await refreshAlerts();
-    }else if(active==='tab-mcp'){
-      await refreshMCP();
+def _static_file(rel: str):
+    """在 STATIC_DIR 内安全定位文件：路径穿越 / 不存在一律返回 None。"""
+    base = STATIC_DIR.resolve()
+    target = (base / rel.lstrip("/")).resolve()
+    if target != base and not str(target).startswith(str(base) + os.sep):
+        return None
+    if not target.is_file():
+        return None
+    return target
+
+
+def _spa_index() -> str:
+    f = _static_file("index.html")
+    if f is None:
+        f = _static_file("legacy/index.html")  # SPA 未构建（本地 dev）→ 兜底旧面板
+    if f is None:
+        return "<!doctype html><html><body><h1>static 目录缺失</h1></body></html>"
+    return f.read_text(encoding="utf-8")
+
+
+def _ui_index() -> str:
+    """根路径入口：WEBUI_UI=legacy → 旧面板；否则 SPA index.html。"""
+    if WEBUI_UI == "legacy":
+        f = _static_file("legacy/index.html")
+        return f.read_text(encoding="utf-8") if f else _spa_index()
+    return _spa_index()
+
+
+def version_payload() -> dict:
+    """版本信息载荷（_version 与 /api/overview 共用）。"""
+    upstream = fetch_upstream_release()
+    image_tag = os.environ.get("IMAGE_TAG") or os.environ.get("STOCKDB_VERSION") or None
+    stale = False
+    msg = ""
+    if upstream is not None and upstream.get("tag_name"):
+        up_tag = upstream["tag_name"]
+        cur_src = image_tag if image_tag else WEBUI_VERSION
+        ut = _version_tuple(up_tag)
+        ct = _version_tuple(cur_src)
+        if ut and ct and ut > ct:
+            stale = True
+            msg = (f"上游已发布 {up_tag}（当前{'镜像' if image_tag else '面板'} "
+                   f"{cur_src}），建议升级")
+    return {
+        "webui": {"version": WEBUI_VERSION},
+        "image": {"tag": image_tag},
+        "upstream": upstream,
+        "stale": stale,
+        "msg": msg,
+        "ui_mode": WEBUI_UI,
     }
-  }catch(e){
-    $('log').textContent='状态刷新失败: '+e;$('log').style.display='block';
-  }
-  _refreshing=false;
-  if(_refreshQueued){_refreshQueued=false;refresh()}
-}
 
-// ==================== Phase 4.5：全局状态条 / 通知中心 / MCP 观测 / 版本检查 ====================
-function calLag(v){const s=String(v||'').trim();if(s.length<8)return null;
-  const y=parseInt(s.slice(0,4),10),m=parseInt(s.slice(4,6),10),d=parseInt(s.slice(6,8),10);
-  if(!y||!m||!d)return null;
-  const today=new Date(),t0=new Date(today.getFullYear(),today.getMonth(),today.getDate());
-  return Math.round((t0-new Date(y,m-1,d))/86400000);
-}
-async function refreshStatusbar(){
-  // 数据新鲜度 + stockdb 健康（/api/status）
-  try{
-    const s=await j('/api/status');
-    const latest=s.data_latest,lag=calLag(latest);
-    const fEl=$('barFresh');
-    if(latest==null){fEl.innerHTML='<span class="sb-dot" style="background:var(--err)"></span>未知'}
-    else{fEl.innerHTML='<span class="sb-dot" style="background:'+(lag<=0?'var(--ok)':lag<=1?'var(--warn)':'var(--err)')+'"></span>'
-      +fmtYMD(latest).slice(5)+(lag>0?' · 滞后 '+lag+' 天':'')}
-    const cs=s.container||{};
-    $('barSvc').innerHTML='<span class="sb-dot" style="background:'+(cs.ok?'var(--ok)':'var(--err)')+'"></span>'
-      +(cs.ok?'运行中':(cs.status==='stopped'?'已停止':'不可用'));
-  }catch(e){$('barFresh').textContent='—';$('barSvc').textContent='—'}
-  // 模拟盘（/api/paper/status 恒 200）
-  try{
-    const p=await j('/api/paper/status');
-    const el=$('barPaper');
-    if(!p.engine_available){el.innerHTML='<span class="sb-dot" style="background:var(--err)"></span>不可用'}
-    else if(!p.configured){el.innerHTML='<span class="sb-dot" style="background:var(--warn)"></span>未配置'}
-    else if(p.paused){el.innerHTML='<span class="sb-dot" style="background:var(--warn)"></span>已暂停'}
-    else if(p.trading_enabled){el.innerHTML='<span class="sb-dot" style="background:var(--ok)"></span>运行中'}
-    else{el.innerHTML='<span class="sb-dot" style="background:var(--warn)"></span>交易未开'}
-  }catch(e){$('barPaper').textContent='—'}
-  // 告警红点（count>0 显示数字徽标）
-  try{
-    const a=await j('/api/alerts/summary');
-    const n=(a&&typeof a.count==='number')?a.count:0;
-    const bEl=$('barAlerts');
-    bEl.style.display=n>0?'inline-block':'none';
-    bEl.textContent=n>99?'99+':n;
-  }catch(e){$('barAlerts').style.display='none'}
-  // 通知页激活时静默跟随刷新列表（与顶栏同频，失败不打扰）
-  if(document.querySelector('#tab-alerts').classList.contains('active'))refreshAlerts(true);
-}
-// ==================== 通知中心（B2：列表/级别着色/清空/空态） ====================
-let _alerts=[];
-async function refreshAlerts(silent){
-  try{
-    const r=await j('/api/alerts?limit=200');
-    _alerts=(Array.isArray(r.alerts)?r.alerts:(Array.isArray(r.items)?r.items:[]));
-  }catch(e){
-    if(silent)return;   // 静默失败保留现状（顶栏红点已隐藏）
-    _alerts=[];
-    $('alertsBody').innerHTML='<tr><td colspan="4" class="empty-hint">模块不可用：告警接口未就绪（'+(e&&e.message?e.message:e)+'）</td></tr>';
-    $('alertsSkel').style.display='none';
-    $('alertsEmpty').style.display='none';
-    $('alertsMeta').textContent='';
-    return;
-  }
-  renderAlerts();
-}
-function renderAlerts(){
-  $('alertsSkel').style.display='none';
-  $('alertsMeta').textContent=_alerts.length?('共 '+_alerts.length+' 条'):'';
-  $('alertsEmpty').style.display=_alerts.length?'none':'block';
-  $('alertsBody').innerHTML=_alerts.map(a=>{
-    const lv=(a.level==='error')?'error':(a.level==='warning'||a.level==='warn')?'warning':'info';
-    const color=lv==='error'?'var(--err)':lv==='warning'?'var(--warn)':'var(--brand)';
-    return '<tr><td class="hint">'+esc(String(a.ts||'').slice(0,19).replace('T',' '))+'</td>'
-      +'<td><span class="alv alv-'+lv+'">'+(lv==='warning'?'警告':lv==='error'?'错误':'提示')+'</span></td>'
-      +'<td>'+esc(a.source||'—')+'</td>'
-      +'<td style="color:'+color+'">'+esc(a.message||'')+'</td></tr>';
-  }).join('');
-}
-async function alertsClear(){
-  if(!_alerts.length){toast('当前没有告警','warn');return}
-  if(!confirm('确认清空全部 '+_alerts.length+' 条告警？'))return;
-  try{
-    const r=await j('/api/alerts/clear',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
-    _alerts=[];renderAlerts();refreshStatusbar();
-    toast((r&&r.msg)?r.msg:'已清空告警','success');
-  }catch(e){toast('清空失败: '+e,'error')}
-}
-// ==================== MCP 观测（B3：统计卡/按工具/最近调用，30s 自动刷新） ====================
-async function refreshMCP(){
-  try{
-    const st=await j('/api/mcp/stats');
-    const cl=await j('/api/mcp/calls?limit=50');
-    renderMCP(st,Array.isArray(cl.calls)?cl.calls:(Array.isArray(cl.list)?cl.list:[]));
-  }catch(e){
-    $('mcpCards').innerHTML='<div class="degraded" style="grid-column:1/-1">模块不可用：MCP 观测接口未就绪（'+(e&&e.message?e.message:e)+'）</div>';
-    $('mcpToolBody').innerHTML='<tr><td colspan="4" class="empty-hint">—</td></tr>';
-    $('mcpCallBody').innerHTML='<tr><td colspan="5" class="empty-hint">—</td></tr>';
-    $('mcpMeta').textContent='';
-    $('mcpCallMeta').textContent='';
-  }
-}
-function renderMCP(st,calls){
-  const fmtMs=v=>v==null?'—':(Number(v).toFixed(1)+' ms');
-  const fmtRate=v=>v==null?'—':(Number(v).toFixed(1)+'%');
-  $('mcpCards').innerHTML=
-    '<div class="mcp"><div class="lbl">总调用</div><div class="val">'+esc(String(st.total!=null?st.total:0))+'</div></div>'
-    +'<div class="mcp"><div class="lbl">成功率</div><div class="val" style="color:'+(st.ok_rate==null?'':st.ok_rate>=0.9?'var(--ok)':st.ok_rate>=0.7?'var(--warn)':'var(--err)')+'">'+fmtRate(st.ok_rate!=null?st.ok_rate*100:null)+'</div></div>'
-    +'<div class="mcp"><div class="lbl">平均耗时</div><div class="val">'+fmtMs(st.avg_ms)+'</div></div>'
-    +'<div class="mcp"><div class="lbl">P95 耗时</div><div class="val">'+fmtMs(st.p95_ms)+'</div></div>';
-  const tools=st.by_tool||[];
-  $('mcpToolBody').innerHTML=tools.length?tools.map(t=>'<tr>'
-    +'<td>'+esc(t.tool||'?')+'</td>'
-    +'<td>'+esc(String(t.n!=null?t.n:0))+'</td>'
-    +'<td style="color:'+((t.ok!=null&&t.n!=null&&t.ok>=t.n)?'var(--ok)':((t.ok||0)<(t.n||1)?'var(--warn)':'var(--err)'))+'">'+esc(String(t.ok!=null?t.ok:0))+'</td>'
-    +'<td>'+fmtMs(t.avg_ms)+'</td></tr>').join('')
-    :'<tr><td colspan="4" class="empty-hint">（尚无调用记录，MCP 工具调用后自动采集）</td></tr>';
-  $('mcpCallMeta').textContent=calls.length?('最近 '+calls.length+' 条'):'';
-  $('mcpCallBody').innerHTML=calls.map(c=>{
-    const ok=!!c.ok&&!c.is_error;
-    return '<tr>'
-      +'<td class="hint">'+esc(String(c.ts||'').slice(0,19).replace('T',' '))+'</td>'
-      +'<td>'+esc(c.tool||'?')+'</td>'
-      +'<td class="hint">'+(c.elapsed_ms==null?'—':esc(String(c.elapsed_ms))+' ms')+'</td>'
-      +'<td>'+(ok?'<span class="dot-ok"></span>成功':'<span class="dot-fail"></span>失败')+'</td>'
-      +'<td class="hint">'+(c.bytes==null?'—':esc(String(c.bytes)))+'</td></tr>';
-  }).join('')||'<tr><td colspan="5" class="empty-hint">（暂无调用记录）</td></tr>';
-}
-// ==================== 版本检查（B5：当前版本/镜像 tag/上游 release/stale 提示） ====================
-async function refreshVersion(){
-  const grid=$('verGrid'),skel=$('verSkel'),de=$('verDegraded');
-  try{
-    const r=await j('/api/version');
-    skel.style.display='none';de.style.display='none';grid.style.display='grid';
-    const web=(r.webui&&r.webui.version)||'—';
-    const img=(r.image&&(r.image.tag||r.image.version))||r.image_tag||'—';
-    const up=r.upstream||null;
-    const upTag=up?(up.tag_name||up.tag||null):null;
-    const upDate=up?(up.published_at||up.date||''):'';
-    $('verWebui').textContent=web;
-    $('verImage').textContent=img;
-    $('verUp').textContent=upTag||'未获取到';
-    $('verUpDate').textContent=upDate?String(upDate).slice(0,10):'—';
-    $('verUpLink').innerHTML=up&&up.html_url?('<a href="'+esc(up.html_url)+'" target="_blank" rel="noopener" style="color:var(--brand)">打开发布页 ↗</a>'):'—';
-    const stale=!!r.stale;
-    $('verStale').style.display=stale?'block':'none';
-    if(stale)$('verStaleText').textContent=r.msg||('当前 '+web+'，上游最新 '+upTag+'，建议升级');
-    $('verMeta').textContent=stale?'':'（已是最新或无法对比）';
-  }catch(e){
-    skel.style.display='none';grid.style.display='none';
-    de.style.display='block';
-    de.textContent='模块不可用：版本检查接口未就绪（'+(e&&e.message?e.message:e)+'）';
-    $('verStale').style.display='none';
-  }
-}
-setInterval(refreshStatusbar,15000);   // B1：顶栏 15s 静默刷新
-setInterval(()=>{if(document.querySelector('#tab-mcp').classList.contains('active'))refreshMCP()},30000);  // B3：MCP 页 30s 自动刷新
 
-function renderHero(s,h){
-  const spin=$('heroSpin'),st=$('heroStatus'),sub=$('heroSub');
-  $('syncBtn2').disabled=s.sync_running;
-  if(s.sync_running){
-    window._syncStarted=s.sync_started;
-    spin.style.display='inline-block';
-    st.textContent='正在同步数据';st.style.color='';
-    sub.textContent='当前：'+(PHASE_STAGE[s.sync_phase]||'处理中');
-    $('syncProgress').style.display='block';
-    const pct=PHASE_PCT[s.sync_phase]||45;
-    $('progPhase').textContent='正在同步数据';
-    $('progStage').textContent=PHASE_STAGE[s.sync_phase]||'处理中';
-    $('progBar').style.width=pct+'%';
-    $('progPct').textContent=pct+'%';
-    $('progElapsed').textContent='已运行 '+fmtDur((Date.now()/1000)-(s.sync_started||Date.now()/1000));
-    $('log').style.display='block';
-  }else{
-    spin.style.display='none';
-    $('syncProgress').style.display='none';
-    if(h.status==='ok'){
-      st.textContent='数据已是最新';st.style.color='var(--ok)';
-      sub.textContent='更新至 '+fmtYMD(h.latest)+' · 服务正常';
-    }else if(h.status==='stale'){
-      st.textContent='数据有待更新';st.style.color='var(--warn)';
-      sub.textContent=h.note||'建议执行一次同步';
-    }else{
-      st.textContent='数据状态未知';st.style.color='var(--err)';
-      sub.textContent=h.note||'无法获取数据最新日期';
+def paper_status_payload() -> dict:
+    """模拟盘状态载荷（_paper_status 与 /api/overview 共用，始终只读不写）。"""
+    engine, ok, reason = paper_gate(require_trading=True)
+    configured = False
+    masked = "未配置"
+    if engine is not None:
+        try:
+            masked = engine.mx.masked_key
+        except Exception:  # noqa: BLE001
+            masked = "?"
+        configured = masked != "未配置"
+    return {
+        "configured": configured,
+        "trading_enabled": paper_trading_enabled(),
+        "paused": paper_is_paused(),
+        "next_runs": paper_next_runs(),
+        "last_events": list(_paper_last_events),
+        "engine_available": engine is not None,
+        "reason": reason if not ok else "",
+        "modules_ok": PAPER_MODULES_AVAILABLE,
+        "times": PAPER_TIMES,
+        "timepoint_labels": _PAPER_TIMEPOINT_LABELS,
+        "today": datetime.now().strftime("%Y%m%d"),
+        "timeline": _paper_timeline(),
+        "scheduler_alive": _paper_scheduler_alive,
+        "scheduler_heartbeat": _paper_scheduler_heartbeat,
+        "masked_key": masked,
+        "db_path": str(engine.db.db_path) if engine is not None else None,
     }
-  }
-}
-function renderDataOverview(s){
-  const cc=s.code_stats||{};
-  $('cCountStk').textContent=cc.stock!=null?cc.stock:'—';
-  $('cCountEtf').textContent=cc.etf!=null?cc.etf:'—';
-  const cov=s.coverage||{};
-  $('cCoverage').textContent=(cov.earliest?String(cov.earliest).slice(0,4)+' ~ '+String(cov.latest).slice(0,4):'—');
-  $('cLocalDate').textContent=s.data_latest?fmtYMD(s.data_latest):'—';
-  $('cMirrorDate').textContent=s.mirror||'—';
-}
-function toggleMenu(){const m=$('moreMenu');const show=m.style.display==='none';m.style.display=show?'block':'none';$('menuCaret').textContent=show?'▴':'▾'}
-async function startSync(strict){
-  const opt={method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({hot:!strict})};
-  try{
-    const r=await j('/api/sync',opt);
-    toast(r.msg||'已启动同步','success');
-    toggleMenu();
-    if(r.msg&&r.msg.includes('运行中')){
-      // 同步引擎被占用（如定时任务正在跑）：明确提示，不做无谓动作
-    }else{
-      // 已请求启动：立即展开日志并强制刷新一次，主状态区切到同步进度
-      $('log').style.display='block';
-      if(!$('log').textContent.trim()||$('log').textContent==='（暂无）')$('log').textContent='同步启动中，请稍候…';
-      refresh(true);
-    }
-  }catch(e){toast('启动失败: '+e,'error')}
-}
 
-// 自动同步：编辑模式下不覆盖时间点草稿（防 4s 轮询吞掉未保存的修改）
-function renderSchView(sch){
-  const editing=$('schEdit').style.display==='block';
-  $('schEnabled').checked=!!sch.enabled;
-  $('schTrading').checked=sch.trading_only!==false;
-  const times=sch.times||[];
-  $('schTimesView').textContent=times.length?times.join('、'):'（未设置）';
-  $('schNext').textContent=sch.enabled?(sch.next_trigger?sch.next_trigger:'（时间点已过，明天触发）'):'定时未启用';
-  $('schLast').textContent=(sch.last_trigger&&sch.last_trigger.ts)?('上次触发 '+fmtClock(sch.last_trigger.ts)+(sch.last_trigger.exit===0?' ✅':sch.last_trigger.exit==null?' ⏳':' ❌')):'';
-  if(!editing)renderEditTimes(times);
-}
-function renderEditTimes(times){
-  $('schTimesEdit').innerHTML=(times||[]).map(t=>'<span class="times-pill">'+esc(t)+' <a href="#" onclick="rmSchTime(\''+t+'\',event);return false" style="color:var(--err);text-decoration:none">✕</a></span>').join('')||'<span class="hint">（无时间点）</span>';
-}
-function toggleSchEdit(open){$('schView').style.display=open?'none':'block';$('schEdit').style.display=open?'block':'none'}
-function addSchTime(){
-  const t=$('schTime').value;if(!t){toast('请选择时间','warn');return}
-  const cur=[...($('schTimesEdit').textContent.match(/\d{2}:\d{2}/g)||[]),t];
-  $('schTime').value='';
-  renderEditTimes([...new Set(cur)]);
-}
-function rmSchTime(t,ev){ev.preventDefault();const cur=($('schTimesEdit').textContent.match(/\d{2}:\d{2}/g)||[]).filter(x=>x!==t);renderEditTimes(cur)}
-async function saveScheduleNow(){
-  const enabled=$('schEnabled').checked,trading=$('schTrading').checked;
-  const times=[...($('schTimesEdit').textContent.match(/\d{2}:\d{2}/g)||[])];
-  if(!times.length){toast('至少保留一个执行时间点','warn');return}
-  try{
-    const r=await j('/api/schedule?action=save&enabled='+enabled+'&trading_only='+trading+'&times='+encodeURIComponent(times.join(',')));
-    toast(r.msg||'自动同步计划已保存','success');
-    if($('schEdit').style.display==='block')toggleSchEdit(false);
-    renderSchView(r.schedule||{});
-  }catch(e){toast('保存失败: '+e,'error')}
-}
-
-// 历史：记录按新 → 旧排序（原文件 append，最新在末尾）
-let _hist=[];
-async function loadHistory(){
-  try{
-    const h=await j('/api/history');
-    _hist=(h.history||[]).slice().reverse();
-    const st=$('histStats');
-    if(_hist.length){
-      const recent=_hist.slice(0,7),ok=recent.filter(x=>x.exit_code===0).length;
-      const durs=recent.filter(x=>x.duration_sec!=null).map(x=>x.duration_sec);
-      const avg=durs.length?Math.round(durs.reduce((a,b)=>a+b,0)/durs.length):null;
-      st.textContent='近 7 次：成功 '+ok+' / '+recent.length+(avg!=null?' · 平均 '+avg+'s':'');
-    }else st.textContent='';
-    const ls=_hist.find(x=>x.exit_code===0);
-    $('lastSuccess').textContent=ls?('上次成功：'+fmtClock(ls.ts)):'';
-    _lastExit=_hist.length?_hist[0].exit_code:null;
-    $('histBody').innerHTML=_hist.map((x,i)=>historyRow(x,i)).join('')||'<tr><td colspan="8" class="hint">（暂无历史）</td></tr>';
-    $('histCards').innerHTML=_hist.map(historyCard).join('')||'<div class="hint">（暂无历史）</div>';
-    // 主状态区：同步任务状态（数据状态与同步管道健康分开）
-    const tEl=$('heroTask');
-    if(tEl){
-      if(_hist.length){
-        const x=_hist[0];
-        if(x.exit_code===0&&x.warn)tEl.innerHTML='同步任务：<span style="color:var(--warn)">上次未生效 '+fmtClock(x.ts)+'</span> · <span style="color:var(--muted)">'+esc(x.warn)+'</span>';
-        else if(x.exit_code===0)tEl.textContent='同步任务：上次成功 '+fmtClock(x.ts);
-        else if(x.exit_code==null)tEl.textContent='同步任务：进行中';
-        else tEl.innerHTML='同步任务：<span style="color:var(--err)">上次失败 '+fmtClock(x.ts)+'</span> · <span style="color:var(--muted)">'+esc(x.reason||('退出码 '+x.exit_code))+'</span>';
-      }else tEl.textContent='';
-    }
-    // 系统页运行信息：最近同步
-    const ci=$('cLastSyncInfo');
-    if(ci)ci.textContent=_hist.length?(fmtClock(_hist[0].ts)+(_hist[0].exit_code===0?' ✅':_hist[0].exit_code==null?' ⏳':' ❌')+(_hist[0].duration_sec!=null?' · '+_hist[0].duration_sec+'s':'')):'—';
-  }catch(e){}
-}
-function trigLabel(t){return t==='scheduled'?'⏰定时':t==='scheduled-retry'?'↻定时·重试':'手动'}
-function resultCell(x){
-  if(x.exit_code===0&&x.warn)return '<span class="dot-warn"></span>未生效';
-  if(x.exit_code===0)return '<span class="dot-ok"></span>成功';
-  if(x.exit_code==null)return '<span class="spin" style="width:8px;height:8px;border-width:2px;border-color:var(--brand);border-top-color:transparent"></span>运行中';
-  return '<span class="dot-fail"></span>失败';
-}
-function historyRow(x,i){
-  return `<tr class="hr-row" onclick="toggleHistDetail(${i})">
-    <td>${esc(x.ts)}</td><td>${trigLabel(x.trigger)}</td><td>${x.mode==='hot'?'热更新':'严格'}</td>
-    <td>${resultCell(x)}</td><td>${x.downloads==null?'—':x.downloads}</td>
-    <td>${x.verified==='pass'?'通过':x.verified==='fail'?'失败':x.verified==='skipped'?'跳过':'—'}</td>
-    <td>${x.duration_sec==null?'—':esc(x.duration_sec)+'s'}</td><td>${esc(x.data_latest||'—')}</td></tr>`;
-}
-function historyCard(x){
-  const reason=x.reason?(' · '+esc(x.reason)):'';
-  const warnHtml=x.warn?('<div class="warn-text">⚠ '+esc(x.warn)+'</div>'):'';
-  return `<div class="hr-card">
-    <div class="row1"><span>${resultCell(x)}</span><span class="hint">${trigLabel(x.trigger)}</span></div>
-    <div class="row2">${esc((x.ts||'').slice(0,16))} · ${x.mode==='hot'?'热更新':'严格'}</div>
-    <div class="row3">${x.downloads!=null?('下载 '+x.downloads+' 个文件 · '):''}${x.verified==='pass'?'校验通过':x.verified==='fail'?'校验失败':x.verified==='skipped'?'未校验':''}${x.duration_sec!=null?(' · '+x.duration_sec+' 秒'):''}${reason}</div>
-    <div class="row3">数据更新至 ${esc(x.data_latest||'—')}</div>${warnHtml}
-  </div>`;
-}
-function toggleHistDetail(i){
-  const x=_hist[i];if(!x)return;
-  const rows=document.querySelectorAll('#histBody tr.hr-row');
-  if(!rows[i])return;
-  let n=rows[i].nextElementSibling;
-  if(n&&n.classList.contains('hr-detail')){n.remove();return}
-  const det='失败原因：'+(x.reason||'—')+' ｜ 下载 '+(x.downloads==null?'—':x.downloads)+' 个 ｜ 删除 '+(x.deletes==null?'—':x.deletes)+' 个 ｜ 数据最新 '+(x.data_latest||'—');
-  rows[i].insertAdjacentHTML('afterend','<tr class="hr-detail"><td colspan="8">'+esc(det)+'</td></tr>');
-}
-
-function renderSystem(s){
-  const cs=s.container||{};
-  const lat=(s.code_stats&&s.code_stats.latency_ms!=null)?s.code_stats.latency_ms:null;
-  // 行情服务：以实际请求成功与延迟为准
-  const svcOK=lat!=null;
-  $('hcSvcDot').style.background=svcOK?'var(--ok)':'var(--err)';
-  $('hcSvc').textContent=svcOK?'正常':'不可用';
-  $('hcSvcSub').textContent='响应 '+(lat!=null?lat+' ms':'—')+' · 数据至 '+(s.data_latest?String(s.data_latest).slice(4,6)+'-'+String(s.data_latest).slice(6,8):'—');
-  // stockdb 进程（单镜像同容器，进程级控制）
-  $('hcDkrDot').style.background=cs.ok?'var(--ok)':'var(--err)';
-  $('hcDkr').textContent=cs.ok?'运行中':'已停止';
-  $('hcDkrSub').textContent=cs.ok?('进程 '+cs.status):'stockdb 进程未运行';
-  // 自动任务：运行状态 + 待重试提示
-  const sch=s.schedule||{};
-  $('hcSchedDot').style.background=s.scheduler_alive?'var(--ok)':'var(--err)';
-  $('hcSched').textContent=s.scheduler_alive?'运行中':'未运行';
-  const rp=sch.retry_pending;
-  $('hcSchedSub').innerHTML=(sch.enabled?(sch.next_trigger?'下次 '+esc(sch.next_trigger):'已启用'):'定时未启用')+''
-    +(rp?(' · <span style="color:var(--warn)">等待重试：'+esc(rp.slice(11,16))+'</span>'):(sch.enabled?' · 无待重试':''));
-  // 同步能力：更新程序/数据源/数据卷（待重试为 warn，不判不可用）
-  const cap=s.sync_cap||{ok:false,checks:{}};
-  const fails=Object.values(cap.checks||{}).filter(c=>c&&c.ok===false);
-  $('hcCapDot').style.background=cap.ok?'var(--ok)':'var(--err)';
-  $('hcCap').textContent=cap.ok?'可用':'不可用';
-  $('hcCapSub').textContent=fails.length?('受阻：'+fails.map(f=>f.detail).slice(0,2).join('；')):'更新程序 · 数据源 · 数据卷 就绪';
-  // 总状态
-  const issues=(svcOK?0:1)+(cap.ok?0:1)+(s.scheduler_alive?0:1)+(cs.ok?0:1);
-  $('sysOK').innerHTML='<span class="dot '+(issues===0?'ok':'warn')+'"></span> '+(issues===0?'系统运行正常':'存在待处理项');
-  // stockdb 不可控警告卡 + 运维按钮禁用
-  $('dkrWarn').style.display=cs.ok?'none':'block';
-  $('btnLogs').disabled=!cs.ok;
-  $('btnRestart').disabled=!cs.ok;
-  // 存储
-  if(s.disk&&s.disk.total_gb!=null){
-    const pct=Math.round(s.disk.used_gb/s.disk.total_gb*100);
-    $('cDisk').textContent=s.disk.used_gb+' GB / '+s.disk.total_gb+' GB · '+pct+'%'+(s.disk.free_gb!=null?'（'+s.disk.free_gb+' GB 可用）':'');
-    const bar=$('diskBar');bar.style.width=pct+'%';bar.className=pct>80?'high':'';
-  }
-  // 运行信息
-  $('cImage').textContent=s.data_dir||'—';
-  $('cState').textContent=cs.status||'—';
-  $('cUptime').textContent=cs.started?fmtUptime(cs.started):'—';
-  $('cSource').textContent=s.source||'—';
-  $('cVer').textContent=(s.webui&&s.webui.version)||'—';
-  $('cStart').textContent=(s.webui&&s.webui.started)?new Date(s.webui.started*1000).toLocaleString('zh-CN',{hour12:false}).replace(/\//g,'-'):'—';
-  const hb=$('cHeartbeat');
-  if(hb){
-    if(s.webui&&s.webui.heartbeat){
-      const sec=Math.floor(Date.now()/1000-s.webui.heartbeat);
-      const t=sec<0?'刚刚':sec<60?sec+' 秒前':sec<3600?Math.floor(sec/60)+' 分钟前':Math.floor(sec/3600)+' 小时前';
-      hb.innerHTML=sec>120?('<span style="color:var(--err)">'+t+'</span>'):t;
-    }else hb.textContent='—';
-  }
-  $('cDataDir').textContent=s.data_dir||'—';
-  // 交易日历覆盖：临近到期（<90 天）黄色提醒
-  const cal=s.calendar||{};
-  const cCal=$('cCalendar');
-  if(cCal){
-    if(cal.through){
-      const daysLeft=Math.round((new Date(cal.through.replace(/-/g,'/'))-Date.now())/86400000);
-      cCal.innerHTML=cal.through+'（'+cal.days+' 个休市日）'
-        +(daysLeft<90?('<span style="color:var(--warn)"> ｜ 即将到期，请更新休市表</span>'):'');
-    }else cCal.textContent='—';
-  }
-}
-
-async function doQuery(){
-  const q=$('qtype').value;
-  const r=await fetch('/api/query?t='+encodeURIComponent(q));
-  $('qres').textContent=await r.text();
-}
-
-function fmtUptime(iso){
-  try{
-    const s=new Date(iso),t=Date.now();
-    if(isNaN(s))return iso;
-    let sec=Math.floor((t-s.getTime())/1000);if(sec<0)sec=0;
-    const d=Math.floor(sec/86400),h=Math.floor(sec%86400/3600),m=Math.floor(sec%3600/60);
-    return (d>0?d+' 天 ':'')+(h>0?h+' 小时 ':'')+m+' 分钟';
-  }catch(e){return iso}
-}
-async function restartContainer(){
-  if(!confirm('确定重启 stockdb 进程？重启期间行情服务会短暂中断。')){$('containerMsg').textContent='已取消';return}
-  try{const r=await j('/api/container/restart',{method:'POST'});$('containerMsg').textContent=r.msg||'已执行';toast(r.msg||'已执行','success')}
-  catch(e){$('containerMsg').textContent='重启失败: '+e}
-}
-// ---- 数据写入（mydb 私有存储，手动触发） ----
-function parsePayload(text){
-  // 支持单条 {key,value} 或批量 {items:[[k,v],...]}
-  const t=(text||'').trim();
-  if(!t)throw new Error('请输入 JSON');
-  const obj=JSON.parse(t);
-  if(obj.items)return {items:obj.items};
-  if(obj.key!==undefined)return {key:String(obj.key),value:obj.value};
-  throw new Error('格式需为 {"key":"...","value":...} 或 {"items":[["k",v],...]}');
-}
-async function dataWrite(){
-  const table=$('dwTable').value.trim();
-  if(!table){$('dwMsg').textContent='请输入表名';return}
-  let payload;
-  try{payload=parsePayload($('dwPayload').value)}catch(e){$('dwMsg').textContent=e.message;return}
-  $('dwMsg').textContent='写入中…';
-  try{
-    const r=await j('/api/data/write',{method:'POST',body:JSON.stringify({table,...payload})});
-    $('dwMsg').textContent=r.msg||('写入 '+r.written+' 条');
-    toast(r.msg||'写入完成','success');
-    dataTables();
-  }catch(e){$('dwMsg').textContent='写入失败: '+e}
-}
-async function dataTables(){
-  try{
-    const r=await j('/api/data/tables');
-    const ts=r.tables||[];
-    const el=$('dwTables');
-    if(r.error){el.textContent=r.error;return}
-    el.innerHTML=ts.length?('自定义表：<br>'+ts.map(t=>'<div style="margin:2px 0">• '+esc(t)+'</div>').join('')):'（无自定义表）';
-  }catch(e){$('dwTables').textContent='读取失败: '+e}
-}
-async function hkSync(){
-  const codes=$('hkCodes').value.trim();
-  if(!codes){$('hkMsg').textContent='请输入港股代码';return}
-  const list=codes.split(/[,，\s]+/).filter(Boolean);
-  const years=parseInt($('hkYears').value||'2',10);
-  $('hkMsg').textContent='拉取中…';
-  try{
-    const r=await j('/api/hk/sync',{method:'POST',body:JSON.stringify({codes:list,years})});
-    const parts=Object.entries(r).map(([c,v])=>c+' '+(v.ok?('✓ '+v.bars+'根'):('✗ '+v.error))).join('；');
-    $('hkMsg').textContent=parts;
-    toast('港股同步完成','success');
-  }catch(e){$('hkMsg').textContent='拉取失败: '+e}
-}
-async function toggleContainerLogs(){
-  const pre=$('containerLog');
-  if(pre.style.display!=='none'){pre.style.display='none';return}
-  pre.style.display='block';pre.textContent='（加载中…）';
-  try{
-    const r=await j('/api/container/logs?tail=150');
-    pre.textContent=r.log||'（stockdb 日志为空）';
-    if(r.error)pre.textContent+='\n\n'+r.error;
-    $('containerMsg').textContent='';
-  }catch(e){pre.textContent='读取失败: '+e}
-}
-setInterval(()=>{if($('syncProgress')&&$('syncProgress').style.display==='block'&&window._syncStarted){$('progElapsed').textContent='已运行 '+fmtDur(Date.now()/1000-window._syncStarted)}},1000);
-// 输入框 Enter 快捷触发（页面无 <form>，原生 Enter 无动作）：港股同步输入框回车即拉取
-document.addEventListener('keydown',e=>{
-  if(e.key==='Enter'&&e.target&&e.target.id==='hkCodes'){e.preventDefault();hkSync()}
-});
-// ==================== 模拟盘页（任务E：状态 / 账户总览 / 时间轴 / 决策 / 订单 / 收益曲线 / 连通自检） ====================
-let _ppEngineOk=false;
-let _ppDecisions=[],_ppOrders=[],_ppEvents=[];   // B4：原始数据（前端日期区间/状态/时点筛选用）
-let _ppStatusCache=null,_ppToday='',_ppTpOpen=null;  // B4：时间轴展开状态
-function fmtMoney(v){return Number(v).toLocaleString('zh-CN',{minimumFractionDigits:2,maximumFractionDigits:2})}
-async function refreshPaper(){
-  let s=null;
-  try{s=await j('/api/paper/status')}
-  catch(e){renderPaperStatus({engine_available:false,modules_ok:false,reason:'状态接口异常: '+e,trading_enabled:false,paused:false});return}
-  renderPaperStatus(s);
-  if(!s.engine_available)return;   // 引擎不可用：读接口 501，直接停在降级提示
-  try{renderPaperOverview(await j('/api/paper/overview'))}catch(e){}
-  try{const d=await j('/api/paper/decisions?limit=500');_ppDecisions=d.decisions||[]}catch(e){_ppDecisions=[]}
-  renderPaperDecisions();
-  try{const o=await j('/api/paper/orders?limit=500');_ppOrders=o.orders||[]}catch(e){_ppOrders=[]}
-  renderPaperOrders();
-  try{const sn=await j('/api/paper/snapshot?limit=60');renderPaperCurve(sn.snapshots||[])}catch(e){}
-  try{const ev=await j('/api/paper/events?limit=200');_ppEvents=ev.events||[]}catch(e){_ppEvents=[]}
-  renderPaperEvents();
-}
-function renderPaperStatus(s){
-  _ppEngineOk=!!s.engine_available;
-  _ppStatusCache=s;
-  const title=$('ppTitle'),dot=$('ppDot');
-  const reasons=[];
-  if(!s.engine_available){reasons.push('模块不可用：'+(s.reason||'模拟盘模块缺失'))}
-  if(s.engine_available&&!s.configured)reasons.push('MX apikey 未配置');
-  if(s.engine_available&&!s.trading_enabled)reasons.push('交易开关未启用');
-  if(s.engine_available&&s.paused)reasons.push('已暂停');
-  if(!s.engine_available){
-    title.textContent='模拟盘（引擎不可用）';
-    dot.style.background='var(--err)';
-  }else{
-    title.textContent='模拟盘';
-    dot.style.background=s.configured?(s.paused?'var(--warn)':'var(--ok)'):'var(--warn)';
-  }
-  $('ppSub').textContent=s.engine_available
-    ?('apikey '+(s.configured?('已配置（'+esc(s.masked_key||'')+'）'):'未配置')+' ｜ 交易开关 '+(s.trading_enabled?'已开启':'未开启')+' ｜ 暂停 '+(s.paused?'是':'否'))
-    :('模块不可用：'+(s.reason||'模拟盘模块缺失'));
-  $('ppGate').textContent=reasons.length?('⛔ '+reasons.join('；')):'';
-  $('ppCfg').textContent=s.configured?(esc(s.masked_key||'已配置')):'未配置';
-  $('ppTrading').innerHTML=s.trading_enabled?'<span style="color:var(--ok)">已开启</span>':'<span style="color:var(--warn)">未开启</span>';
-  $('ppEngine').textContent=s.engine_available?'可用':'不可用';
-  $('ppNext').textContent=(s.next_runs&&s.next_runs.length)?s.next_runs.join(' · '):'（今日无未来时点）';
-  $('ppDb').textContent=s.db_path?esc(s.db_path):'—';
-  $('ppTimes').textContent=(s.times||[]).join(' / ');
-  $('ppPause').checked=!!s.paused;
-  $('ppPause').disabled=!s.engine_available;
-  $('ppReason').style.display=(s.engine_available&&s.reason)?'block':'none';
-  $('ppReasonText').textContent=s.reason||'';
-  renderPaperTimeline(s);
-  renderPaperRunSelect(s);
-}
-function renderPaperTimeline(s){
-  _ppToday=s.today||'';
-  const colors={ok:'var(--ok)',warn:'var(--warn)',err:'var(--err)',run:'var(--brand)',wait:'var(--panel2)'};
-  $('ppToday').textContent=s.today?('· '+fmtYMD(s.today)):'';
-  $('ppTimeline').innerHTML=(s.timeline||[]).map(x=>{
-    const open=_ppTpOpen===x.tp;
-    return '<div class="tp-card'+(open?' open':'')+'" onclick="paperTpToggle(\''+esc(x.tp)+'\')" title="点击展开当日该时点事件明细" style="background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:10px 12px;min-width:104px">'
-    +'<div style="display:flex;align-items:center;gap:6px">'
-    +'<i style="display:inline-block;width:8px;height:8px;border-radius:50%;background:'+(colors[x.state]||'var(--muted)')+'"></i>'
-    +'<b style="font-size:14px">'+esc(x.tp)+'</b>'
-    +'<span class="tp-caret">'+(open?'▾':'▸')+'</span></div>'
-    +'<div class="hint" style="margin-top:2px;font-size:12px">'+esc(x.label)+'</div>'
-    +'<div class="hint" style="margin-top:2px;font-size:11px">'+(x.detail?esc(x.detail):(x.fired?'已触发':'待触发'))+'</div>'
-    +'</div>';
-  }).join('');
-  paperRenderTpDetail();
-}
-// B4：时点卡片点击 → 内联展开当日该时点事件明细
-function paperTpToggle(tp){
-  _ppTpOpen=(_ppTpOpen===tp)?null:tp;
-  if(_ppStatusCache)renderPaperTimeline(_ppStatusCache);
-}
-function paperRenderTpDetail(){
-  const el=$('ppTpDetail');
-  if(!_ppTpOpen){el.innerHTML='';return}
-  const list=_ppEvents.filter(e=>e.timepoint===_ppTpOpen&&(!e.trade_date||e.trade_date===_ppToday));
-  el.innerHTML='<div style="background:var(--panel2);border:1px solid var(--brand);border-radius:10px;padding:10px 14px;font-size:12px">'
-    +'<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;flex-wrap:wrap"><b style="color:var(--brand)">'+esc(_ppTpOpen)+' 当日事件</b><span class="hint">'+esc(_ppToday?fmtYMD(_ppToday):'')+' · 共 '+list.length+' 条</span></div>'
-    +(list.length?list.map(e=>{
-      const color=e.level==='ERROR'?'var(--err)':e.level==='WARN'?'var(--warn)':'var(--muted)';
-      return '<div style="display:flex;gap:10px;padding:3px 0;border-bottom:1px solid var(--line);flex-wrap:wrap">'
-        +'<span class="hint">'+esc(String(e.ts||'').slice(11,19))+'</span>'
-        +'<span style="color:'+color+';min-width:34px">'+esc(e.level||'')+'</span>'
-        +'<span style="color:var(--text)">'+esc(e.event||'')+'</span>'
-        +'<span class="hint" style="overflow:hidden;text-overflow:ellipsis">'+esc(e.detail||'')+'</span></div>';
-    }).join(''):'<div class="hint">（该时点今日暂无事件）</div>')
-    +'</div>';
-}
-function renderPaperRunSelect(s){
-  const sel=$('ppTp');
-  sel.innerHTML='<option value="">选择时点手动触发</option>'
-    +(s.times||[]).map(t=>'<option value="'+esc(t)+'">'+esc(t)+' '+(s.timepoint_labels&&s.timepoint_labels[t]?esc(s.timepoint_labels[t]):'')+'</option>').join('');
-}
-function renderPaperOverview(ov){
-  const pnl=ov&&ov.pnl?ov.pnl:null;
-  $('ppNav').textContent=pnl&&pnl.nav!=null?fmtMoney(pnl.nav):'—';
-  const cash=ov&&ov.latest_snapshot?ov.latest_snapshot.available_cash:null;
-  $('ppCash').textContent=cash==null?'—':fmtMoney(cash);
-  const qty=ov&&ov.latest_snapshot?ov.latest_snapshot.position_qty:null;
-  const mv=ov&&ov.latest_snapshot?ov.latest_snapshot.position_mv:null;
-  $('ppPos').textContent=qty==null?'—':(qty+' 股'+(mv!=null?' · '+fmtMoney(mv):''));
-  const pv=pnl&&pnl.pnl!=null?pnl.pnl:null;
-  const pc=pnl&&pnl.pnl_pct!=null?pnl.pnl_pct:null;
-  $('ppPnl').innerHTML=pv==null?'—':'<span style="color:'+(pv>=0?'#F87171':'#4ADE80')+'">'+(pv>0?'+':'')+fmtMoney(pv)+(pc!=null?'（'+(pc>0?'+':'')+pc.toFixed(2)+'%）':'')+'</span>';
-  $('ppSnapTs').textContent=ov&&ov.latest_snapshot?('快照交易日 '+fmtYMD(ov.latest_snapshot.trade_date)+' · 名义本金 '+fmtMoney(ov.model_nav||0)):'（暂无组合快照，收盘对账后生成）';
-}
-// B4：状态下拉选项（保留当前选择）
-function ppFillStatusSelect(selId,list,key){
-  const sel=$(selId),cur=sel.value;
-  const seen={};
-  list.forEach(x=>{const v=x&&x[key];if(v!=null&&v!=='')seen[v]=true});
-  sel.innerHTML='<option value="">全部</option>'
-    +Object.keys(seen).sort().map(v=>'<option value="'+esc(v)+'">'+esc(v)+'</option>').join('');
-  if(cur)sel.value=cur;
-}
-function renderPaperDecisions(){
-  ppFillStatusSelect('ppDecSt',_ppDecisions,'status');
-  const from=($('ppDecFrom').value||'').replace(/-/g,''),to=($('ppDecTo').value||'').replace(/-/g,'');
-  const st=$('ppDecSt').value;
-  const list=_ppDecisions.filter(d=>(!from||String(d.trade_date)>=from)&&(!to||String(d.trade_date)<=to)&&(!st||d.status===st));
-  $('ppDecMeta').textContent='共 '+_ppDecisions.length+' 条 · 显示 '+list.length+' 条';
-  $('ppDecBody').innerHTML=list.map(d=>'<tr>'
-    +'<td>'+fmtYMD(d.trade_date)+'</td>'
-    +'<td>'+esc(d.previous_rank==null?'—':d.previous_rank)+' → '+esc(d.current_rank==null?'—':d.current_rank)+'</td>'
-    +'<td>'+esc(d.previous_target==null?'—':d.previous_target)+' → '+esc(d.desired_target==null?'—':d.desired_target)+'</td>'
-    +'<td>'+esc(d.reason_code||'—')+'</td>'
-    +'<td>'+esc(d.status||'—')+'</td>'
-    +'</tr>').join('')||'<tr><td colspan="5" class="hint">'+(st||from||to?'（无符合筛选条件的决策）':'（暂无决策）')+'</td></tr>';
-}
-function renderPaperOrders(){
-  ppFillStatusSelect('ppOrdSt',_ppOrders,'status');
-  const from=($('ppOrdFrom').value||'').replace(/-/g,''),to=($('ppOrdTo').value||'').replace(/-/g,'');
-  const st=$('ppOrdSt').value;
-  const list=_ppOrders.filter(o=>(!from||String(o.trade_date)>=from)&&(!to||String(o.trade_date)<=to)&&(!st||o.status===st));
-  $('ppOrdMeta').textContent='共 '+_ppOrders.length+' 条 · 显示 '+list.length+' 条';
-  $('ppOrdBody').innerHTML=list.map(o=>'<tr>'
-    +'<td>'+fmtYMD(o.trade_date)+'</td>'
-    +'<td>'+esc(o.action||'—')+'</td>'
-    +'<td>'+esc(o.target_qty)+'（差额 '+esc(o.delta_qty)+'）</td>'
-    +'<td>'+esc(o.price_type||'—')+'</td>'
-    +'<td>'+esc(o.status||'—')+'</td>'
-    +'</tr>').join('')||'<tr><td colspan="5" class="hint">'+(st||from||to?'（无符合筛选条件的订单）':'（暂无订单）')+'</td></tr>';
-}
-function renderPaperCurve(snaps){
-  const el=$('ppCurve');
-  if(!snaps.length){el.innerHTML='<div class="hint">（暂无净值快照，收盘对账后生成收益曲线）</div>';return}
-  const rev=snaps.slice().reverse();            // 旧 → 新
-  const vals=rev.map(s=>Number(s.nav)||0);
-  const w=560,h=140,pad=8;
-  let min=Math.min(...vals),max=Math.max(...vals);
-  if(max===min)max=min+1;
-  const pts=vals.map((v,i)=>{
-    const x=pad+(w-2*pad)*(vals.length===1?0.5:i/(vals.length-1));
-    const y=h-pad-(h-2*pad)*(v-min)/(max-min);
-    return x.toFixed(1)+','+y.toFixed(1);
-  }).join(' ');
-  const up=vals[vals.length-1]>=vals[0];
-  const last=rev[rev.length-1];
-  el.innerHTML='<div class="hint" style="margin-bottom:4px">'+esc(last.trade_date)+' 净值 '+fmtMoney(vals[vals.length-1])+'（'+(up?'▲':'▼')+'）</div>'
-    +'<svg viewBox="0 0 '+w+' '+h+'" preserveAspectRatio="none" style="width:100%;max-width:640px;height:150px;display:block;background:#0A0F1C;border:1px solid var(--line);border-radius:8px">'
-    +'<polyline fill="none" stroke="'+(up?'#22C55E':'#EF4444')+'" stroke-width="2" points="'+pts+'"/>'
-    +'</svg>';
-}
-// B4：事件流加 timepoint 过滤；渲染后同步时间轴展开面板
-function renderPaperEvents(){
-  const sel=$('ppEvTp'),cur=sel.value;
-  const tps={};
-  _ppEvents.forEach(e=>{const v=e&&e.timepoint;if(v!=null&&v!=='')tps[v]=true});
-  sel.innerHTML='<option value="">全部时点</option>'
-    +Object.keys(tps).sort().map(v=>'<option value="'+esc(v)+'">'+esc(v)+'</option>').join('');
-  if(cur)sel.value=cur;
-  const tp=sel.value;
-  const list=_ppEvents.filter(e=>!tp||e.timepoint===tp);
-  $('ppEvMeta').textContent='共 '+_ppEvents.length+' 条 · 显示 '+list.length+' 条';
-  $('ppEvents').innerHTML=list.map(e=>{
-    const color=e.level==='ERROR'?'var(--err)':e.level==='WARN'?'var(--warn)':'var(--muted)';
-    return '<div style="display:flex;gap:8px;padding:4px 0;border-bottom:1px solid var(--line);font-size:12px">'
-      +'<span class="hint" style="flex-shrink:0">'+esc(String(e.ts||'').slice(11,19))+'</span>'
-      +(e.timepoint?'<span class="hint" style="flex-shrink:0;color:var(--brand)">'+esc(e.timepoint)+'</span>':'')
-      +'<span style="color:'+color+';flex-shrink:0;min-width:34px">'+esc(e.level||'')+'</span>'
-      +'<span style="flex-shrink:0;color:var(--text)">'+esc(e.event||'')+'</span>'
-      +'<span class="hint" style="overflow:hidden;text-overflow:ellipsis">'+esc(e.detail||'')+'</span>'
-      +'</div>';
-  }).join('')||'<div class="hint">'+(tp?'（该时点暂无事件）':'（暂无事件）')+'</div>';
-  paperRenderTpDetail();
-}
-async function paperSetPause(){
-  const enabled=$('ppPause').checked;
-  try{
-    const r=await j('/api/paper/pause',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled})});
-    toast(r.msg||(enabled?'已暂停':'已恢复'),'success');
-  }catch(e){toast('切换失败: '+e,'error');$('ppPause').checked=!enabled}
-  refresh(true);
-}
-async function paperSaveKey(){
-  const k=$('ppKey').value.trim();
-  if(!k){toast('请先粘贴 apikey','warn');return}
-  try{
-    const r=await j('/api/paper/apikey',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({apikey:k})});
-    $('ppKey').value='';
-    toast(r.configured?('apikey 已保存（仅存本机 /data，掩码 '+r.masked+'）'):'未生效，请检查','success');
-    refresh(true);
-  }catch(e){toast('保存失败: '+e,'error')}
-}
-async function paperClearKey(){
-  if(!confirm('确认清除本地保存的 apikey？'))return;
-  try{
-    const r=await j('/api/paper/apikey',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({apikey:''})});
-    $('ppKey').value='';
-    toast('已清除本地 apikey','success');
-    refresh(true);
-  }catch(e){toast('清除失败: '+e,'error')}
-}
-async function paperRunNow(){
-  const tp=$('ppTp').value;
-  if(!tp){toast('请选择要手动执行的时点','warn');return}
-  $('ppRunMsg').textContent='执行中…';
-  try{
-    const r=await j('/api/paper/run-now',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({timepoint:tp})});
-    $('ppRunMsg').textContent=(r.error?('未执行：'+r.error):(r.detail||(r.ok?'执行完成':'执行失败')));
-    if(r.error)toast(r.error,'error');else toast(r.ok?'手动执行完成':'未执行：'+(r.detail||''),r.ok?'success':'warn');
-    refresh(true);
-  }catch(e){$('ppRunMsg').textContent='请求失败: '+e;toast('手动执行失败: '+e,'error')}
-}
-async function paperConnectivity(){
-  const pre=$('ppConn');pre.textContent='检测中…';
-  try{
-    const r=await fetch('/api/paper/connectivity',{method:'POST'});
-    const body=await r.text();
-    let obj=null;try{obj=JSON.parse(body)}catch(e){}
-    pre.textContent=r.ok?JSON.stringify(obj,null,2):((obj&&obj.error)?obj.error:('HTTP '+r.status+' '+body));
-    toast(r.ok?(obj&&obj.ok?'连通自检通过':'自检完成'):'连通自检失败',r.ok?'success':'error');
-  }catch(e){pre.textContent='连通自检失败: '+e}
-}
-refresh();setInterval(()=>refresh(),4000);
-refreshStatusbar();   // 顶栏首次进入即填充，之后由 15s 定时静默刷新
-</script></body></html>"""
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -4034,60 +2839,98 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urlparse(self.path).path
         try:
-            if path in ("/", "/index.html"):
-                self._send(200, PAGE, "text/html; charset=utf-8")
-            elif path == "/api/status":
-                self._status()
-            elif path == "/api/history":
-                self._history()
-            elif path == "/api/schedule":
-                self._schedule()
-            elif path == "/api/health":
-                self._health()
-            elif path == "/api/log":
-                self._log()
-            elif path == "/api/query":
-                self._query()
-            elif path == "/api/container/logs":
-                self._container_logs()
-            elif path == "/api/data/tables":
-                self._data_tables()
-            elif path == "/api/data/read":
-                self._data_read()
-            elif path == "/api/hk/sync":
-                self._hk_sync()
-            elif path == "/api/paper/status":
-                self._paper_status()
-            elif path == "/api/paper/overview":
-                self._paper_overview()
-            elif path == "/api/paper/decisions":
-                self._paper_decisions()
-            elif path == "/api/paper/orders":
-                self._paper_orders()
-            elif path == "/api/paper/snapshot":
-                self._paper_snapshot()
-            elif path == "/api/paper/events":
-                self._paper_events()
-            elif path == "/api/paper/audit":
-                self._paper_audit()
-            elif path == "/api/paper/signal-status":
-                self._paper_signal_status()
-            elif path == "/api/alerts":
-                self._alerts()
-            elif path == "/api/alerts/summary":
-                self._alerts_summary()
-            elif path == "/api/mcp/stats":
-                self._mcp_stats()
-            elif path == "/api/mcp/calls":
-                self._mcp_calls()
-            elif path == "/api/version":
-                self._version()
-            elif path == "/api/version-check":  # /api/version 别名（前端旧路径兼容）
-                self._version()
+            if path == "/api" or path.startswith("/api/"):
+                self._route_api_get(path)
+            elif path == "/legacy" or path.startswith("/legacy/"):
+                # 旧面板逃生通道：原 PAGE 字符串已外置 static/legacy/index.html
+                f = _static_file("legacy/index.html")
+                if f is None:
+                    self._send(404, json.dumps({"error": "legacy 页面缺失"}))
+                else:
+                    self._send_file(f)
             else:
-                self._send(404, json.dumps({"error": "not found"}))
+                self._serve_static(path)
         except Exception as exc:
             self._send(500, json.dumps({"error": str(exc)}))
+
+    def _route_api_get(self, path: str):
+        """GET /api/* 路由表（与原 do_GET 分支逐一对应，行为不变；新增 /api/overview）。"""
+        if path == "/api/status":
+            self._status()
+        elif path == "/api/history":
+            self._history()
+        elif path == "/api/schedule":
+            self._schedule()
+        elif path == "/api/health":
+            self._health()
+        elif path == "/api/log":
+            self._log()
+        elif path == "/api/query":
+            self._query()
+        elif path == "/api/container/logs":
+            self._container_logs()
+        elif path == "/api/data/tables":
+            self._data_tables()
+        elif path == "/api/data/read":
+            self._data_read()
+        elif path == "/api/hk/sync":
+            self._hk_sync()
+        elif path == "/api/paper/status":
+            self._paper_status()
+        elif path == "/api/paper/overview":
+            self._paper_overview()
+        elif path == "/api/paper/decisions":
+            self._paper_decisions()
+        elif path == "/api/paper/orders":
+            self._paper_orders()
+        elif path == "/api/paper/snapshot":
+            self._paper_snapshot()
+        elif path == "/api/paper/events":
+            self._paper_events()
+        elif path == "/api/paper/audit":
+            self._paper_audit()
+        elif path == "/api/paper/signal-status":
+            self._paper_signal_status()
+        elif path == "/api/overview":
+            self._overview()
+        elif path == "/api/alerts":
+            self._alerts()
+        elif path == "/api/alerts/summary":
+            self._alerts_summary()
+        elif path == "/api/mcp/stats":
+            self._mcp_stats()
+        elif path == "/api/mcp/calls":
+            self._mcp_calls()
+        elif path == "/api/version":
+            self._version()
+        elif path == "/api/version-check":  # /api/version 别名（前端旧路径兼容）
+            self._version()
+        else:
+            self._send(404, json.dumps({"error": "not found"}))
+
+    def _serve_static(self, path: str):
+        """GET 静态服务：精确命中 static 文件 → 直出（带缓存策略）；
+        未命中的非 API 路径 → SPA 回退 index.html（前端路由接管深链刷新）。"""
+        f = _static_file(path)
+        if f is not None:
+            self._send_file(f, cache=f.suffix.lower() in _CACHEABLE_EXT)
+            return
+        self._send(200, _ui_index(), "text/html; charset=utf-8")
+
+    def _send_file(self, f: Path, cache: bool = False):
+        try:
+            data = f.read_bytes()
+        except OSError:
+            self._send(404, json.dumps({"error": "not found"}))
+            return
+        self.send_response(200)
+        self.send_header("Content-Type",
+                         _MIME.get(f.suffix.lower(), "application/octet-stream"))
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control",
+                         "public, max-age=31536000, immutable" if cache else "no-cache")
+        self.end_headers()
+        self.wfile.write(data)
 
     def do_POST(self):
         path = urlparse(self.path).path
@@ -4470,33 +3313,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _paper_status(self):
         """GET /api/paper/status：配置/开关/暂停/下次触发/最近事件/引擎可用性（始终 200）。"""
-        engine, ok, reason = paper_gate(require_trading=True)
-        configured = False
-        masked = "未配置"
-        if engine is not None:
-            try:
-                masked = engine.mx.masked_key
-            except Exception:  # noqa: BLE001
-                masked = "?"
-            configured = masked != "未配置"
-        self._send(200, json.dumps({
-            "configured": configured,
-            "trading_enabled": paper_trading_enabled(),
-            "paused": paper_is_paused(),
-            "next_runs": paper_next_runs(),
-            "last_events": list(_paper_last_events),
-            "engine_available": engine is not None,
-            "reason": reason if not ok else "",
-            "modules_ok": PAPER_MODULES_AVAILABLE,
-            "times": PAPER_TIMES,
-            "timepoint_labels": _PAPER_TIMEPOINT_LABELS,
-            "today": datetime.now().strftime("%Y%m%d"),
-            "timeline": _paper_timeline(),
-            "scheduler_alive": _paper_scheduler_alive,
-            "scheduler_heartbeat": _paper_scheduler_heartbeat,
-            "masked_key": masked,
-            "db_path": str(engine.db.db_path) if engine is not None else None,
-        }, ensure_ascii=False))
+        self._send(200, json.dumps(paper_status_payload(), ensure_ascii=False))
 
     def _paper_overview(self):
         """GET /api/paper/overview：本地账本账户总览（最新组合快照）+ pnl（对初始名义本金）。"""
@@ -4725,31 +3542,38 @@ class Handler(BaseHTTPRequestHandler):
             signal_status(str(DATA_DIR / "emotion"), td), ensure_ascii=False))
 
     def _version(self):
-        """GET /api/version：webui 版本 / 镜像引擎 tag / 上游最新 release / stale 提示。
+        """GET /api/version：webui 版本 / 镜像引擎 tag / 上游最新 release / stale 提示 /
+        ui_mode（spa|legacy，当前前端壳）。
 
         镜像 tag 取环境变量 IMAGE_TAG（或 STOCKDB_VERSION，Dockerfile 构建时注入，
         缺省 None → 前端显示 '—'）；stale 用版本三元组比较上游 tag 与当前版本
         （镜像 tag 未知时回退比 webui 版本）。
         """
-        upstream = fetch_upstream_release()
-        image_tag = os.environ.get("IMAGE_TAG") or os.environ.get("STOCKDB_VERSION") or None
-        stale = False
-        msg = ""
-        if upstream is not None and upstream.get("tag_name"):
-            up_tag = upstream["tag_name"]
-            cur_src = image_tag if image_tag else WEBUI_VERSION
-            ut = _version_tuple(up_tag)
-            ct = _version_tuple(cur_src)
-            if ut and ct and ut > ct:
-                stale = True
-                msg = (f"上游已发布 {up_tag}（当前{'镜像' if image_tag else '面板'} "
-                       f"{cur_src}），建议升级")
+        self._send(200, json.dumps(version_payload(), ensure_ascii=False))
+
+    def _overview(self):
+        """GET /api/overview：总览看板聚合（健康/告警/模拟盘状态/MCP 统计/版本）。
+
+        全部复用现有只读函数，一次请求替代前端 5 次轮询；单个子块异常只降级该块
+        （None/[]），整体始终 200。
+        """
+        def _safe(fn, default):
+            try:
+                return fn()
+            except Exception:  # noqa: BLE001 - 总览聚合单块降级
+                return default
+
+        alerts = _safe(_get_alerts, None)
         self._send(200, json.dumps({
-            "webui": {"version": WEBUI_VERSION},
-            "image": {"tag": image_tag},
-            "upstream": upstream,
-            "stale": stale,
-            "msg": msg,
+            "generated_at": datetime.now().isoformat(timespec="seconds"),
+            "health": _safe(health_status, None),
+            "alerts": {
+                "count": alerts.count() if alerts is not None else 0,
+                "recent": alerts.list(8) if alerts is not None else [],
+            },
+            "paper": _safe(paper_status_payload, None),
+            "mcp": _safe(mcp_stats, None),
+            "version": _safe(version_payload, None),
         }, ensure_ascii=False))
 
 
