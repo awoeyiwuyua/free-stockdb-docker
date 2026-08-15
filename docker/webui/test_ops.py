@@ -841,30 +841,41 @@ class _AuctionBackfillTests(_OpsTestCase):
         def fake_snapshot(args):
             return {"points": self.POINTS.get(args.get("date"), [])}
 
+        # 契约替身（0.8.6 教训）：真实 pybao 只存原生对象——JSON 字符串会被静默存空。
+        # 替身若再收到字符串直接炸，逼测试暴露"存值类型"回归，而不是像真机那样悄悄变 {}。
         def fake_write(table, items):
             self.store.setdefault(table, {})
             for k, v in items:
+                if isinstance(v, str):
+                    raise AssertionError(
+                        f"mydb 契约违反：值不能是 JSON 字符串（{table}/{k}），必须存原生对象")
                 self.store[table][str(k)] = v
+
+        def fake_read(table, key=""):
+            rows = self.store.get(table, {})
+            if key:
+                return {"table": table, "key": key, "value": rows.get(key)}
+            return {"table": table, "key": key,
+                    "values": {str(k): v for k, v in rows.items()}}
 
         self._patch_snap = mock.patch.object(app, "_auction_query_snapshot", side_effect=fake_snapshot)
         self._patch_write = mock.patch.object(app, "mydb_write", side_effect=fake_write)
+        self._patch_read = mock.patch.object(app, "mydb_read", side_effect=fake_read)
         self._patch_latest = mock.patch.object(app, "data_latest_date", return_value="20260814")
         self._patch_prev = mock.patch.object(app, "_auction_prev_trade_date", side_effect={
             "20260814": "20260813", "20260813": "20260812",
             "20260812": "20260811", "20260811": "20260810",
         }.get)
-        for p in (self._patch_snap, self._patch_write, self._patch_latest, self._patch_prev):
+        for p in (self._patch_snap, self._patch_write, self._patch_read,
+                  self._patch_latest, self._patch_prev):
             p.start()
         self.addCleanup(lambda: [p.stop() for p in (self._patch_snap, self._patch_write,
-                                                    self._patch_latest, self._patch_prev)])
+                                                    self._patch_read, self._patch_latest,
+                                                    self._patch_prev)])
 
     def _load_series(self, metric):
-        table = self.store.get(f"打板序列:{metric}", {})
-        raw = table.get("series")
-        if not raw:
-            return None
-        data = raw if isinstance(raw, dict) else json.loads(raw)
-        return data.get("values")
+        # round-trip：走真实读取链（app._auction_series_read → mydb_read 契约替身）
+        return app._auction_load_series(app._auction_series_read, metric)
 
     def test_backfill_builds_series_and_daily_metrics(self):
         r = app.auction_run_backfill(days=3)
@@ -889,8 +900,9 @@ class _AuctionBackfillTests(_OpsTestCase):
         self.assertEqual(self._load_series("success_rate"), [1.0, 0.0, 1.0])
 
     def _metrics(self, d8):
-        raw = self.store.get(f"打板指标:{d8}", {}).get("metrics")
-        return raw if isinstance(raw, dict) else json.loads(raw)
+        # round-trip：走 mydb_read 契约替身（与真实读取语义一致）
+        v = app.mydb_read(f"打板指标:{d8}", "metrics").get("value")
+        return v if isinstance(v, dict) else json.loads(v)
 
     def test_backfill_idempotent(self):
         app.auction_run_backfill(days=3)
