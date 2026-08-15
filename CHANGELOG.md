@@ -3,6 +3,19 @@
 本项目面板版本号 = `WEBUI_VERSION`（`docker/webui/app.py`），镜像 tag 跟随上游引擎版本。
 发布纪律见 `docs/webui-spa/release-policy.md`；部署记录见 `docs/DEPLOYMENTS.md`。
 
+## [0.8.10] — 2026-08-16（rd 单连接加固：锁 + 自愈重连 + 值归一化 + RSS 遥测）
+- 事故：0.8.9 部署后回填成功（60 天全绿），但 /api/data/read + /api/data/tables 并发探测
+  触发全进程冻结（TCP 可连、零响应）+ NAS 内存暴增 3.8GB，需重启容器恢复
+- 根因：`_mydb_rd()` 全局单连接无锁，多线程并发写同一 socket → 协议帧交错 →
+  C 扩展阻塞持 GIL → 全进程冻结（MCP 层早有 _PYBAO_LOCK，app.py 的 rd 面一直裸奔）
+- 修复一：全部 rd 读写（mydb_read/write/tables + hk_sync_codes/hk_klines）持 `_rd_lock` 串行化
+- 修复二：rd 调用异常 → `_mydb_rd_reset()` 丢弃缓存连接，下次调用重新 init（自愈楔死连接）
+- 修复三：`_to_py` 改为 `_rd_to_py`，与 MCP `_auction_value_to_dict` 语义对齐：
+  QueryResult/JSON 串统一转 dict，转换失败按缺失（旧实现原样返回 QueryResult，
+  /api/data/read 报 "Object of type QueryResult is not JSON serializable"）
+- 遥测：/api/diag env 新增 rss_mb（进程常驻内存，内存类事故可远程观察）
+- 测试 +8（归一化×4 / 并发串行化 / 失败自愈 / 全表列出 / hk 读），Python 188 全绿
+
 ## [0.8.9] — 2026-08-16（溢价日显式清单 >200 只分块修复）
 - 修复：打板溢价日回填对清单股显式查快照，清单 >200 只时 MCP 显式路径报
   ValueError "codes 数量必须为 1-200"（0.8.8 全市场口径修复后清单实测 256 只触发）
