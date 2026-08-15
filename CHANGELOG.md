@@ -1,0 +1,49 @@
+# CHANGELOG
+
+本项目面板版本号 = `WEBUI_VERSION`（`docker/webui/app.py`），镜像 tag 跟随上游引擎版本。
+发布纪律见 `docs/webui-spa/release-policy.md`；部署记录见 `docs/DEPLOYMENTS.md`。
+
+## [0.6.6] — 2026-08-15（稳定性收官）
+- 空载荷安全性全量加固：PaperSignal/OpsSync 等页在后端瞬时失败（载荷 null）时不再渲染崩溃
+- 新增回归防线：10 个页面「所有 API 拒绝」状态下的挂载测试（views-null-safety.test.js，10 例）
+- 前端测试 77 例 / Python 240 例全绿
+
+## [0.6.5] — 2026-08-15
+- 修复：/ops/sync 在 /api/status 失败（status=null）时裸读 sync_running 导致渲染异常（错误兜底捕获的真凶）
+
+## [0.6.4] — 2026-08-15
+- stockdb 上游访问闸口：熔断器（探针连续失败→降级 5 分钟）+ 信号量（并发≤8，超出降级不排队）
+- 舱壁隔离：控制路径（同步校验/用户查询/基准）只过信号量，不受探针熔断牵连
+- 新增《运行时模型》文档（Little's Law 三因子/依赖地图/失败矩阵/新增功能评审清单）
+
+## [0.6.3] — 2026-08-15
+- 修复多标签切页打瘫后端：data_latest_date 失败结果缓存 8s + 探测单飞锁 + 前端在途请求去重
+
+## [0.6.2] — 2026-08-15
+- 全局错误兜底：未捕获异常不再白屏，弹提示带错误文案（定位根因的窗口）
+
+## [0.6.1] — 2026-08-15
+- Phase 5.1 LuCI 风格面板重组：菜单树 3 组 11 页（一页一职责），诊断中心（/api/diag 一键体检）、
+  日志中心（三源聚合+搜索）、数据同步趋势图、系统健康页（含环境信息卡）
+- 全站密度收紧、顶栏精简、6 条旧路径重定向
+
+## [0.6.0] — 2026-08-15
+- Phase 5 SPA 重构（M0→M3）：前端重写为 Vue 3 + Vite + Element Plus + ECharts
+- 十页搬迁（含旧面板缺失 UI 的审计报告/信号体检补位）、api 四域封装、EChart 按需封装
+- 路由懒加载 + vendor 分包（index 主包 1.2MB→16KB）
+- 双轨底座：/legacy 逃生通道 + WEBUI_UI 开关 + /api/overview 聚合
+- 新增轻量测试门禁 test.yml（push/PR 只跑测试不建镜像）
+
+## [0.5.6] — 2026-08-14
+- Phase 4.5 运营支撑 + 面板优化：数据新鲜度告警、情绪投递状态卡、策略验收报告、
+  全局状态条、通知中心、MCP 调用观测、模拟盘页增强、上游版本检查卡
+
+## [0.5.0] — 2026-08-13
+- Phase 4 模拟盘：固定策略合同（emotion-trend-159915-v1）、SQLite WAL 审计账本（9 表）、
+  妙想模拟盘接入、7 时点时间轴、T+1、幂等键、trading_enabled=false 默认
+
+## 更早
+- 0.4.x：数据契约（统一信封/8 错误码/时点快照/交易日历）
+- 0.3.x：MCP 工具集（12 只读工具）、screen_stocks、get_mydb_data
+- 0.2.x：get_indicators（39 指标）、get_board_members、get_kline 升级
+- 0.1.x：单镜像 Docker 封装（stockdb + updater + webui + pybao + MCP）
