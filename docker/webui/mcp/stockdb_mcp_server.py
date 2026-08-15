@@ -770,8 +770,14 @@ def query_fullmarket_daily_snapshot(
         if limit > 0:
             requested_codes = requested_codes[:limit]
 
+        # 连接卫生（0.8.5）：该路径同样全市场并发拉取，默认 16 线程无节流会耗尽
+        # NAS 临时端口（与 query_point_snapshot 0.8.4 同因）。8 并发 + 每请求 50ms。
+        workers = max(1, min(int(workers or 8), 8))
+        pacing = 0.05
+
         def fetch_one(code: str) -> tuple[str, list, str | None]:
             last_error: Exception | None = None
+            time.sleep(pacing)  # 每请求节流：峰值 ≈160 req/s，TIME_WAIT 存量安全
             for _ in range(3):
                 try:
                     rows = _normalize_rows(
