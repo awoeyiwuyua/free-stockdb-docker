@@ -105,14 +105,14 @@ jobs:
           docker run --rm --entrypoint python \
             --platform linux/amd64 \
             ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:latest \
-            -c "import stockdb, zb_core, zhibiao; print('amd64 pybao ok')"
+            -c "import stockdb, zb_core, zhibiao; import sys; sys.path.insert(0, '/opt/webui'); import auction_collect, auction_metrics, auction_list; print('amd64 pybao + auction ok')"
 
       - name: Verify pybao import (linux/arm64)
         run: |
           docker run --rm --entrypoint python \
             --platform linux/arm64 \
             ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:latest \
-            -c "import stockdb, zb_core, zhibiao; print('arm64 pybao ok')"
+            -c "import stockdb, zb_core, zhibiao; import sys; sys.path.insert(0, '/opt/webui'); import auction_collect, auction_metrics, auction_list; print('arm64 pybao + auction ok')"
 
   test-spa:
     name: SPA 前端构建 + 单测（Node，离线）

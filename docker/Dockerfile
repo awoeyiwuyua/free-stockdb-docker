@@ -100,6 +100,8 @@ COPY webui/app.py webui/entrypoint.sh /opt/webui/
 COPY webui/mcp/ /opt/webui/mcp/
 # ---- 模拟盘模块（任务E：paper_core/paper_db/mx_client/paper_engine，与 app.py 同目录分发） ----
 COPY webui/paper_core.py webui/paper_db.py webui/mx_client.py webui/paper_engine.py /opt/webui/
+# ---- 打板竞价采集模块（0.7.0：采集器/指标分位/清单，与 app.py 同目录分发） ----
+COPY webui/auction_collect.py webui/auction_metrics.py webui/auction_list.py /opt/webui/
 # ---- 前端静态资源：SPA 构建产物（根路径 /）+ 旧面板逃生通道（/legacy） ----
 # app.py 按 WEBUI_STATIC_DIR（默认 <app.py>/static）服务；legacy 必须落在此目录下。
 COPY --from=spa-build /build/dist /opt/webui/static/
