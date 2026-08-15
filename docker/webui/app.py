@@ -19,16 +19,20 @@
 
 from __future__ import annotations
 
+import collections
 import http.client
 import json
+import math
 import os
+import re
 import signal
 import sqlite3
 import subprocess
 import sys
 import threading
 import time
-from datetime import datetime, timedelta
+import urllib.request
+from datetime import date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs, unquote
@@ -75,7 +79,7 @@ _last_verify_result: str | None = None  # 最近一次完整性验证结果（pa
 _scheduler_alive = False             # 定时线程心跳（每次循环更新时间戳）
 _scheduler_heartbeat = 0.0           # 定时线程最近一次心跳时间戳（unix）
 _webui_started = time.time()         # webui 进程启动时间戳
-WEBUI_VERSION = "0.5.5"
+WEBUI_VERSION = "0.5.6"
 
 HISTORY_FILE = DATA_DIR / "sync_history.json"
 SCHEDULE_FILE = DATA_DIR / "sync_schedule.json"
@@ -1434,6 +1438,7 @@ def stockdb_get(table: str) -> str:
 # 惰性 import：任一模块缺失/加载失败 → 页签降级提示，webui 其余功能不受影响
 # （engine_available=false + 中文原因，见 /api/paper/status 与「模拟盘」页签）。
 try:
+    import paper_core  # 对账重放 / 状态机判定（paper_audit_report 用 decide_target/replay_decision/state_transition）
     from paper_core import (STRATEGY_ID as PAPER_STRATEGY_ID,
                             STRATEGY_VERSION as PAPER_STRATEGY_VERSION,
                             SYMBOL as PAPER_SYMBOL,
@@ -1444,6 +1449,7 @@ try:
     PAPER_MODULES_AVAILABLE = True
     PAPER_IMPORT_ERROR = ""
 except Exception as _paper_import_exc:  # noqa: BLE001 - 惰性降级：模块缺失不拖垮 webui
+    paper_core = None
     PAPER_MODULES_AVAILABLE = False
     PAPER_IMPORT_ERROR = f"{type(_paper_import_exc).__name__}: {_paper_import_exc}"
 
@@ -1857,6 +1863,854 @@ def _paper_balance_summary(raw) -> dict:
     return out
 
 
+# ==================== 运营支撑（Phase 4.5：告警中心 / MCP 调用捕获 / 上游版本探针） ====================
+# 自 test_ops.py 可执行规格迁移（行为基线一致）：仅标准库、不含 apikey、落盘失败静默降级。
+MAX_ALERTS = 200                      # 告警中心滚动上限（保留最新 200 条）
+ALERT_LEVELS = ("info", "warning", "error")   # 合法告警级别（小写）
+ALERT_LEVEL_ALIASES = {"warn": "warning"}     # 级别别名归一化
+
+MCP_CALLS_FILE_MAX_LINES = 2000       # mcp_calls.jsonl 行数上限（超出截断保留尾部）
+MCP_CALLS_DEQUE_MAX = 500             # 内存调用 deque 上限（最新 500 条）
+MCP_CALLS_LIST_DEFAULT = 100          # list_mcp_calls 默认条数
+
+GITHUB_RELEASE_URL = "https://api.github.com/repos/hello245m/free-stockdb/releases/latest"
+RELEASE_TTL_SECONDS = 3600            # 上游版本探针 TTL 缓存（成功与失败均缓存）
+
+
+def _now_iso() -> str:
+    """当前本地时间 ISO（秒级）：2026-08-14T21:52:30。"""
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def _warn(msg: str) -> None:
+    """stderr 提示（落盘失败等降级场景；不抛）。"""
+    print(f"ops: {msg}", file=sys.stderr)
+
+
+class Alerts:
+    """面板内告警中心：JSON 持久化 DATA_DIR/alerts.json + 内存镜像。
+
+    文件格式：JSON 数组 [{ts, level, source, message}, ...]，按时间升序存储；
+    list() 返回最新在前。同 (date=ts[:10], source, message) 当日去重：同日重复
+    add 返回既有条目（幂等），跨日允许再次出现。超出 MAX_ALERTS=200 时滚动
+    保留最新。线程安全：读写均持锁；落盘用「临时文件 + os.replace」原子替换，
+    避免并发/崩溃产生半截文件。
+    """
+
+    def __init__(self, path: str):
+        """构造并加载既有告警（文件缺失 / 损坏 → 空列表，不抛）。"""
+        self.path = path
+        self._lock = threading.Lock()
+        self._items: list[dict] = []
+        self._load()
+
+    @classmethod
+    def init(cls, path: str) -> "Alerts":
+        """按路径构造告警中心（等价 __init__，命名与任务简报一致）。"""
+        return cls(path)
+
+    # ---------------- 内部 ----------------
+    def _load(self) -> None:
+        """从 JSON 文件加载既有告警（容错：缺失/损坏/非数组均视为空）。"""
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            return
+        if not isinstance(data, list):
+            return
+        items = []
+        for e in data:
+            if isinstance(e, dict) and all(isinstance(e.get(k), str)
+                                           for k in ("ts", "level", "source", "message")):
+                items.append(e)
+        self._items = items[-MAX_ALERTS:]  # 加载即夹到上限（防御外部写入超长）
+
+    def _save(self) -> None:
+        """原子落盘（临时文件 + os.replace）；失败仅 stderr 提示，不影响内存镜像。"""
+        try:
+            parent = os.path.dirname(os.path.abspath(self.path))
+            if parent and not os.path.isdir(parent):
+                os.makedirs(parent, exist_ok=True)
+            tmp = self.path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self._items, f, ensure_ascii=False)
+            os.replace(tmp, self.path)
+        except OSError as exc:
+            _warn(f"告警落盘失败：{self.path}（{exc}）")
+
+    @staticmethod
+    def _normalize_level(level) -> str:
+        """级别归一化并校验：小写 + 别名（warn→warning）；非法抛中文 ValueError。"""
+        s = str(level).strip().lower()
+        s = ALERT_LEVEL_ALIASES.get(s, s)
+        if s not in ALERT_LEVELS:
+            raise ValueError(
+                f"告警级别 {level!r} 非法；合法级别：{', '.join(ALERT_LEVELS)}"
+            )
+        return s
+
+    # ---------------- 任务 API ----------------
+    def add(self, level: str, source: str, message: str) -> dict:
+        """新增告警。
+
+        返回告警 dict {ts, level, source, message}（ts=ISO 本地时间）；
+        同 (当日日期, source, message) 去重：重复投递返回既有条目、不新增。
+        级别非法 / source、message 为空 → 中文 ValueError。
+        """
+        level = self._normalize_level(level)
+        source = str(source).strip()
+        message = str(message).strip()
+        if not source:
+            raise ValueError("告警 source 必须为非空字符串")
+        if not message:
+            raise ValueError("告警 message 必须为非空字符串")
+        ts = _now_iso()
+        with self._lock:
+            for e in self._items:  # 当日去重：同 (date, source, message) 幂等
+                if e["ts"][:10] == ts[:10] and e["source"] == source \
+                        and e["message"] == message:
+                    return e
+            entry = {"ts": ts, "level": level, "source": source, "message": message}
+            self._items.append(entry)
+            if len(self._items) > MAX_ALERTS:  # 滚动：保留最新 200 条
+                self._items = self._items[-MAX_ALERTS:]
+            self._save()
+            return entry
+
+    def list(self, limit: int = 50) -> list:
+        """告警列表（最新在前）；limit 缺省 50。"""
+        try:
+            limit = int(limit)
+        except (TypeError, ValueError):
+            limit = 50
+        if limit < 1:
+            limit = 50
+        with self._lock:
+            return [dict(e) for e in reversed(self._items)][:limit]
+
+    def count(self) -> int:
+        """当前告警条数。"""
+        with self._lock:
+            return len(self._items)
+
+    def clear(self) -> None:
+        """清空全部告警并落盘（文件写 '[]'，保持文件存在）。"""
+        with self._lock:
+            self._items = []
+            self._save()
+
+
+# ---- 模块级告警单例（绑定 DATA_DIR，惰性创建） ----
+_alerts_singleton: "Alerts | None" = None
+_alerts_singleton_lock = threading.Lock()
+
+
+def _get_alerts() -> Alerts:
+    """模块级告警单例：首次调用时按 DATA_DIR 惰性创建（进程内复用）。"""
+    global _alerts_singleton
+    with _alerts_singleton_lock:
+        if _alerts_singleton is None:
+            _alerts_singleton = Alerts.init(str(DATA_DIR / "alerts.json"))
+        return _alerts_singleton
+
+
+def notify_alert(level: str, source: str, message: str) -> dict:
+    """模块级告警助手：等价 _get_alerts().add（生产接线点，看门狗/调度侧零配置调用）。
+
+    迁移自 test_ops.py 可执行规格（行为基线一致）：级别校验/当日去重/200 条滚动
+    均由 Alerts.add 承担；不含 apikey 等敏感信息。
+    """
+    return _get_alerts().add(level, source, message)
+
+
+# ---- 数据新鲜度告警（迁移自 test_ops.py 可执行规格，行为基线一致） ----
+FRESHNESS_LAG_THRESHOLD = 2   # 数据新鲜度滞后阈值（交易日滞后 > 2 天告警）
+
+
+def _parse_date(s) -> date | None:
+    """解析日期：支持 YYYYMMDD / YYYY-MM-DD；非法返回 None（不抛）。"""
+    s = str(s).strip()
+    if len(s) == 8 and s.isdigit():
+        try:
+            return datetime.strptime(s, "%Y%m%d").date()
+        except ValueError:
+            return None
+    try:
+        return date.fromisoformat(s[:10])
+    except (ValueError, TypeError):
+        return None
+
+
+def data_freshness_alert(latest_date, is_trading_day, *,
+                         threshold: int = FRESHNESS_LAG_THRESHOLD,
+                         alerts=None) -> None:
+    """行情数据新鲜度告警（两分支，均为 warning 级、来源「数据」、当日去重）。
+
+    分支1：latest_date 为 None（探针失败，或日期格式无法解析）→
+          「行情数据不可用（探针失败）」；
+    分支2：滞后天数 = (今天 - latest).days > threshold（默认 2）且 is_trading_day
+          （今天是交易日，数据本应更新）→ 「行情数据已滞后 N 天（最新 D）」。
+          非交易日滞后不告警（休市日数据不更新属正常）；滞后为负（时钟超前）
+          不告警。
+
+    参数：
+      latest_date:    最新交易日 'YYYYMMDD' / 'YYYY-MM-DD'；None 视为探针失败
+      is_trading_day: 今天是否为交易日（由调用方按日历判定后传入）
+      threshold:      滞后天数阈值（默认 2，仅 is_trading_day 时生效）
+      alerts:         告警中心（缺省用模块单例；测试可注入隔离实例）
+    """
+    target = alerts if alerts is not None else _get_alerts()
+    if latest_date is None:
+        target.add("warning", "数据", "行情数据不可用（探针失败）")
+        return
+    d = _parse_date(latest_date)
+    if d is None:  # 日期无法解析 → 视为不可用（保守告警）
+        target.add("warning", "数据", "行情数据不可用（探针失败）")
+        return
+    lag = (date.today() - d).days
+    if is_trading_day and lag > threshold:
+        target.add("warning", "数据", f"行情数据已滞后 {lag} 天（最新 {latest_date}）")
+
+
+def ops_watchdog_loop(interval: float = 60.0) -> None:
+    """运营支撑看门狗线程：周期投递生产告警（告警中心的生产接线点）。
+
+    每 interval 秒评估一次（启动后预热 30s，等待首次数据探针/日历就绪，避免
+    进程启动瞬间误报）：
+      1. 数据新鲜度：data_latest_date() 探针失败，或今日（交易日）滞后 > 阈值
+         → data_freshness_alert 投递 warning（当日去重，不会刷屏）；
+      2. 模拟盘引擎：模块就绪但引擎不可用（初始化失败/库不可开）→ notify_alert
+         投递 warning（当日去重；模块缺失本身由页签降级提示，不重复告警）。
+    看门狗自身异常绝不退出线程（stderr 提示后继续，与调度线程同级容错）。
+    """
+    time.sleep(30)  # 预热：数据探针 / 模拟盘引擎首次构造可能需要数秒
+    while True:
+        try:
+            data_freshness_alert(data_latest_date(), is_trading_day())
+        except Exception:  # noqa: BLE001 - 单次评估异常不退出看门狗
+            _warn("数据新鲜度看门狗评估异常（已忽略）")
+        try:
+            if PAPER_MODULES_AVAILABLE:
+                engine, _ = paper_get_engine()
+                if engine is None:
+                    notify_alert("warning", "模拟盘", "模拟盘引擎不可用（详见模拟盘页）")
+        except Exception:  # noqa: BLE001 - 单次评估异常不退出看门狗
+            _warn("模拟盘引擎看门狗评估异常（已忽略）")
+        time.sleep(interval)
+
+
+# ==================== MCP 调用捕获 / 列表 / 统计 ====================
+_mcp_deque: "collections.deque" = collections.deque(maxlen=MCP_CALLS_DEQUE_MAX)
+_mcp_lock = threading.Lock()
+_mcp_file_lines = 0     # jsonl 当前行数（截断判断用）
+_mcp_loaded = False     # 是否已从文件惰性加载过（进程重启后恢复统计）
+
+
+def _mcp_ensure_loaded_locked() -> None:
+    """惰性加载：进程重启后首次访问，从 jsonl 尾部恢复最近记录到 deque。
+
+    必须在持有 _mcp_lock 时调用。文件缺失/损坏行 → 静默跳过，不影响统计。
+    """
+    global _mcp_loaded, _mcp_file_lines
+    if _mcp_loaded:
+        return
+    _mcp_loaded = True
+    path = str(DATA_DIR / "mcp_calls.jsonl")
+    try:
+        if os.path.isfile(path):
+            with open(path, "r", encoding="utf-8") as f:
+                lines = [ln for ln in f if ln.strip()]
+            _mcp_file_lines = len(lines)
+            for ln in lines[-MCP_CALLS_DEQUE_MAX:]:
+                try:
+                    _mcp_deque.append(json.loads(ln))
+                except (ValueError, TypeError):
+                    continue
+    except OSError:
+        pass
+
+
+def _mcp_truncate_file_locked() -> None:
+    """jsonl 超上限截断：保留尾部 MCP_CALLS_FILE_MAX_LINES 行（锁内调用）。
+
+    读失败时不反复重试：把行数记到上限，下一轮再触发时重新尝试。
+    """
+    global _mcp_file_lines
+    path = str(DATA_DIR / "mcp_calls.jsonl")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        with open(path, "w", encoding="utf-8") as f:
+            f.writelines(lines[-MCP_CALLS_FILE_MAX_LINES:])
+        _mcp_file_lines = len(lines[-MCP_CALLS_FILE_MAX_LINES:])
+    except OSError:
+        _mcp_file_lines = MCP_CALLS_FILE_MAX_LINES
+
+
+def capture_mcp_call(rec: dict) -> None:
+    """捕获一次 MCP 调用。
+
+    rec 只保留 6 键（缺省补默认，冗余键丢弃；值均为 str/int/bool，可安全序列化）：
+      ts         调用时间（缺省当前本地时间 ISO）
+      tool       工具名（如 get_kline）
+      ok         是否成功（缺省 = not is_error）
+      is_error   MCP isError 标记
+      elapsed_ms 耗时毫秒
+      bytes      响应体字节数
+    落盘：DATA_DIR/mcp_calls.jsonl 追加一行 JSON；超 2000 行截断保留尾部。
+    内存：deque（上限 500）供 list/stats 实时计算；落盘失败不影响内存统计。
+    """
+    global _mcp_file_lines
+    ts = str(rec.get("ts") or _now_iso())
+    is_error = bool(rec.get("is_error"))
+    ok = rec.get("ok") if rec.get("ok") is not None else (not is_error)
+    norm = {
+        "ts": ts,
+        "tool": str(rec.get("tool") or ""),
+        "ok": bool(ok),
+        "is_error": is_error,
+        "elapsed_ms": int(rec.get("elapsed_ms") or 0),
+        "bytes": int(rec.get("bytes") or 0),
+    }
+    with _mcp_lock:
+        _mcp_ensure_loaded_locked()
+        try:
+            parent = os.path.dirname(str(DATA_DIR / "mcp_calls.jsonl"))
+            if parent and not os.path.isdir(parent):
+                os.makedirs(parent, exist_ok=True)
+            with open(str(DATA_DIR / "mcp_calls.jsonl"), "a", encoding="utf-8") as f:
+                f.write(json.dumps(norm, ensure_ascii=False) + "\n")
+            _mcp_file_lines += 1
+            if _mcp_file_lines >= MCP_CALLS_FILE_MAX_LINES:
+                _mcp_truncate_file_locked()
+        except OSError:
+            pass  # 落盘失败静默降级：内存统计照常
+        _mcp_deque.append(norm)
+
+
+def list_mcp_calls(limit: int = MCP_CALLS_LIST_DEFAULT) -> list:
+    """最近 MCP 调用（最新在前，来自内存 deque；进程重启后从 jsonl 惰性恢复）。"""
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        limit = MCP_CALLS_LIST_DEFAULT
+    if limit < 1:
+        limit = MCP_CALLS_LIST_DEFAULT
+    with _mcp_lock:
+        _mcp_ensure_loaded_locked()
+        items = [dict(r) for r in reversed(_mcp_deque)]
+    return items[:limit]
+
+
+def mcp_stats() -> dict:
+    """MCP 调用统计（从内存 deque 计算，最新 500 条窗口）。
+
+    返回 {total, ok_rate, avg_ms, p95_ms, by_tool}：
+      ok_rate   成功率 0~1（空窗口为 None）
+      avg_ms    平均耗时毫秒（空窗口 None）
+      p95_ms    耗时 P95（最近邻排序法；空窗口 None）
+      by_tool   [{tool, n, ok, avg_ms}, ...]（按调用次数降序）
+    """
+    with _mcp_lock:
+        _mcp_ensure_loaded_locked()
+        recs = list(_mcp_deque)
+    total = len(recs)
+    if total == 0:
+        return {"total": 0, "ok_rate": None, "avg_ms": None,
+                "p95_ms": None, "by_tool": []}
+    ok = sum(1 for r in recs if r.get("ok"))
+    ms = [float(r.get("elapsed_ms") or 0) for r in recs]
+    avg_ms = sum(ms) / total
+    sorted_ms = sorted(ms)
+    p95 = sorted_ms[max(0, math.ceil(0.95 * total) - 1)]
+    by_tool: dict[str, dict] = {}
+    for r in recs:
+        tool = str(r.get("tool") or "?")
+        b = by_tool.setdefault(tool, {"tool": tool, "n": 0, "ok": 0, "_sum": 0.0})
+        b["n"] += 1
+        if r.get("ok"):
+            b["ok"] += 1
+        b["_sum"] += float(r.get("elapsed_ms") or 0)
+    out = []
+    for b in by_tool.values():
+        out.append({"tool": b["tool"], "n": b["n"], "ok": b["ok"],
+                    "avg_ms": round(b["_sum"] / b["n"], 1)})
+    out.sort(key=lambda x: (-x["n"], x["tool"]))
+    return {"total": total,
+            "ok_rate": round(ok / total, 4),
+            "avg_ms": round(avg_ms, 1),
+            "p95_ms": round(p95, 1),
+            "by_tool": out}
+
+
+def _mcp_tool_name(msg: dict) -> str:
+    """从 JSON-RPC 请求提取工具名：tools/call → params.name；其余 → method。"""
+    if not isinstance(msg, dict):
+        return ""
+    method = str(msg.get("method") or "")
+    if method == "tools/call":
+        params = msg.get("params")
+        if isinstance(params, dict) and params.get("name"):
+            return str(params["name"])
+    return method
+
+
+# ==================== 上游最新版本探针 ====================
+_RELEASE_CACHE = {"at": 0.0, "val": None}   # {at: unix 秒, val: dict|None}
+
+
+def fetch_upstream_release(*, timeout: float = 10, ttl: float = RELEASE_TTL_SECONDS,
+                           force: bool = False) -> dict | None:
+    """上游最新版本探针：GET GitHub releases/latest（浏览器形态 UA）。
+
+    成功 → {tag_name, html_url, published_at}；失败/网络异常/解析失败 → None
+    （不抛）。结果 TTL 缓存（默认 3600s；成功与失败均缓存，避免失败时反复打
+    GitHub）；force=True 绕过缓存（手动刷新用）。
+    """
+    now = time.time()
+    if not force and now - _RELEASE_CACHE["at"] < ttl:
+        return _RELEASE_CACHE["val"]
+    val = None
+    try:
+        req = urllib.request.Request(
+            GITHUB_RELEASE_URL,
+            headers={
+                # 浏览器形态 UA：GitHub API 对默认 urllib UA 偶发 403
+                "User-Agent": ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                               "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"),
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        if isinstance(data, dict) and data.get("tag_name") is not None:
+            val = {"tag_name": str(data["tag_name"]),
+                   "html_url": str(data.get("html_url") or ""),
+                   "published_at": data.get("published_at")}
+    except Exception:  # noqa: BLE001 - 探针失败返回 None，不抛
+        val = None
+    _RELEASE_CACHE.update(at=now, val=val)
+    return val
+
+
+# ==================== 模拟盘只读审计报告 / 信号文件体检（迁移自 test_ops.py 可执行规格） ====================
+SIGNAL_SUPPORTED_CONTRACTS_DEFAULT = ("emotion-v1",)  # 受支持的情绪契约版本（与引擎默认一致）
+
+
+def _dash_date(d: str) -> str:
+    """'YYYYMMDD' → 'YYYY-MM-DD'（基准曲线键兼容）。"""
+    return f"{d[:4]}-{d[4:6]}-{d[6:]}"
+
+
+def _ro_connect(db_path: str) -> sqlite3.Connection:
+    """只读打开 SQLite（file:URI mode=ro），只读不写库。
+
+    - db_path 已是 file: URI（如共享内存库）→ 原样 uri=True 透传；
+    - ':memory:' → 'file::memory:?mode=ro'（新建空只读内存库，命中「空库不抛」）；
+    - 普通文件路径 → file:<绝对路径>?mode=ro（URL 编码）。
+    """
+    import urllib.parse
+    if isinstance(db_path, str) and db_path.startswith("file:"):
+        return sqlite3.connect(db_path, uri=True)
+    if db_path == ":memory:":
+        return sqlite3.connect("file::memory:?mode=ro", uri=True)
+    uri = "file:" + urllib.parse.quote(os.path.abspath(db_path), safe="/:@") + "?mode=ro"
+    return sqlite3.connect(uri, uri=True)
+
+
+def _dup_count(q, table: str, col: str) -> int:
+    """按主键分组统计重复组数（decision_id / intent_key 正常应为 0）。"""
+    rows = q(f"SELECT {col} AS k, COUNT(*) AS n FROM {table} "
+             f"GROUP BY {col} HAVING COUNT(*) > 1")
+    return len(rows)
+
+
+def _benchmark_series(fetch_benchmark, navs: list) -> list:
+    """基准净值曲线：fetch_benchmark(dates) -> {date: close}，归一化同基点 1.0。
+
+    仅返回 nav_series 日期中能取到 close 的点（date 键兼容 YYYYMMDD 与
+    YYYY-MM-DD）；fetch_benchmark 为 None / 抛异常 / 返回非 dict → []。
+    """
+    if fetch_benchmark is None or not navs:
+        return []
+    dates = [n["date"] for n in navs]
+    try:
+        closes = fetch_benchmark(dates)
+    except Exception:  # noqa: BLE001 - 基准注入异常 → 空曲线
+        return []
+    if not isinstance(closes, dict):
+        return []
+    base = None
+    series = []
+    for d in dates:
+        c = closes.get(d)
+        if c is None:
+            c = closes.get(_dash_date(d))
+        if c is None:
+            continue
+        try:
+            c = float(c)
+        except (TypeError, ValueError):
+            continue
+        if base is None:
+            base = c
+        if base and base > 0:
+            series.append({"date": d, "value": round(c / base, 6)})
+    return series
+
+
+def paper_audit_report(db_path: str, *, fetch_benchmark=None) -> dict:
+    """模拟盘只读审计报告（file:URI mode=ro，绝不写库）。
+
+    表不存在 / 空库 / 路径不可读 → 对应字段给 0 / []，不抛（连接级失败也返回
+    空报告）。全部查询逐条容错：任何一张表缺失都不影响其余字段。
+
+    报告字段：
+      total_decisions        策略决策行数
+      replay_mismatches      {count, examples:≤5}：每条决策用 paper_core.
+                              decide_target 从存储字段重放，与 desired_target
+                              不一致计数 + 前 5 例（含重放失败例，reason 注明）
+      duplicate_decisions    decision_id 重复组数（正常 0）
+      duplicate_intents      intent_key 重复组数（正常 0）
+      illegal_transitions    {count, examples:≤5}：order_intents 联
+                              strategy_decisions 得 previous_target，用
+                              paper_core.state_transition 判非法
+                              （previous_target 缺失无法判定 → 跳过不计）
+      order_status_counts    各生命周期状态计数（order_intents.status）
+      slippage               {n, avg_slippage}：限价单 |fill_price-price|/price
+                              均值（比值非百分比）与样本数
+      unfilled_count         UNFILLED + UNFILLED_AT_CUTOFF 合计
+      partial_count          PARTIALLY_FILLED 计数
+      nav_series             portfolio_snapshots [{date, nav}]（升序）
+      benchmark_series       fetch_benchmark(dates) 归一化同基点 1.0 的净值曲线
+      generated_at           报告生成时间（ISO 本地时间）
+    """
+    report = {
+        "generated_at": _now_iso(),
+        "db_path": db_path,
+        "total_decisions": 0,
+        "replay_mismatches": {"count": 0, "examples": []},
+        "duplicate_decisions": 0,
+        "duplicate_intents": 0,
+        "illegal_transitions": {"count": 0, "examples": []},
+        "order_status_counts": {},
+        "slippage": {"n": 0, "avg_slippage": None},
+        "unfilled_count": 0,
+        "partial_count": 0,
+        "nav_series": [],
+        "benchmark_series": [],
+    }
+    conn = None
+    try:
+        conn = _ro_connect(db_path)
+        conn.row_factory = sqlite3.Row
+
+        def q(sql: str, params=()) -> list:
+            """查询守卫：表不存在/列缺失 → 空结果（不抛）。"""
+            try:
+                return conn.execute(sql, params).fetchall()
+            except sqlite3.Error:
+                return []
+
+        # --- 重放校验：每条决策从存储字段重放 decide_target ---
+        rows = q("SELECT * FROM strategy_decisions")
+        report["total_decisions"] = len(rows)
+        mismatches = []
+        for r in rows:
+            desired = r["desired_target"]
+            try:
+                replayed, _reason = paper_core.replay_decision({
+                    "current_rank": r["current_rank"],
+                    "previous_rank": r["previous_rank"],
+                    "ma5": r["ma5"], "ma10": r["ma10"], "ma20": r["ma20"],
+                    "current_target": r["previous_target"]})
+                ok = (replayed == desired)
+                reason = None if ok else "重放结果与 desired_target 不一致"
+            except (ValueError, TypeError):
+                ok, replayed, reason = False, None, "重放失败（决策输入字段缺失/非法）"
+            if not ok:
+                mismatches.append({
+                    "decision_id": r["decision_id"], "trade_date": r["trade_date"],
+                    "desired_target": desired, "replayed_desired": replayed,
+                    "reason": reason})
+        report["replay_mismatches"] = {"count": len(mismatches),
+                                       "examples": mismatches[:5]}
+
+        report["duplicate_decisions"] = _dup_count(q, "strategy_decisions", "decision_id")
+        report["duplicate_intents"] = _dup_count(q, "order_intents", "intent_key")
+
+        # --- 非法状态机转移（previous_target 缺失无法判定 → 跳过） ---
+        illegals = []
+        for r in q("SELECT o.intent_key, o.trade_date, o.desired_target, "
+                   "d.previous_target FROM order_intents o "
+                   "LEFT JOIN strategy_decisions d ON o.decision_id = d.decision_id"):
+            prev, desired = r["previous_target"], r["desired_target"]
+            if prev is None or desired is None:
+                continue
+            try:
+                paper_core.state_transition(prev, desired)
+            except ValueError:
+                illegals.append({"intent_key": r["intent_key"],
+                                 "trade_date": r["trade_date"],
+                                 "previous": prev, "desired": desired})
+        report["illegal_transitions"] = {"count": len(illegals),
+                                         "examples": illegals[:5]}
+
+        # --- 状态计数 ---
+        sc: dict[str, int] = {}
+        for r in q("SELECT status, COUNT(*) AS n FROM order_intents GROUP BY status"):
+            sc[r["status"]] = r["n"]
+        report["order_status_counts"] = sc
+
+        # --- 滑点：限价单 |fill_price - price| / price 均值 ---
+        diffs = []
+        for r in q("SELECT b.price, f.fill_price FROM fills f "
+                   "JOIN broker_orders b ON f.order_id = b.order_id "
+                   "WHERE LOWER(b.price_type) = 'limit' AND b.price IS NOT NULL "
+                   "AND f.fill_price IS NOT NULL AND b.price > 0"):
+            diffs.append(abs(float(r["fill_price"]) - float(r["price"]))
+                         / float(r["price"]))
+        report["slippage"] = {
+            "n": len(diffs),
+            "avg_slippage": round(sum(diffs) / len(diffs), 6) if diffs else None,
+        }
+
+        # --- 未成交 / 部分成交 ---
+        u = q("SELECT COUNT(*) FROM order_intents "
+              "WHERE status IN ('UNFILLED', 'UNFILLED_AT_CUTOFF')")
+        report["unfilled_count"] = u[0][0] if u else 0
+        p = q("SELECT COUNT(*) FROM order_intents WHERE status = 'PARTIALLY_FILLED'")
+        report["partial_count"] = p[0][0] if p else 0
+
+        # --- 净值曲线（升序） / 基准曲线 ---
+        navs = [{"date": r["trade_date"], "nav": r["nav"]}
+                for r in q("SELECT trade_date, nav FROM portfolio_snapshots "
+                           "ORDER BY trade_date")]
+        report["nav_series"] = navs
+        report["benchmark_series"] = _benchmark_series(fetch_benchmark, navs)
+    except Exception:  # noqa: BLE001 - 连接级失败（路径不可读等）→ 空报告不抛
+        report["generated_at"] = _now_iso()
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001 - 关闭失败忽略
+                pass
+    return report
+
+
+def signal_status(signal_dir: str, trade_date: str,
+                  *, supported_contracts=None) -> dict:
+    """信号文件体检：signal_dir/<trade_date>.json 存在性 / 可解析性 / 字段 / 校验。
+
+    校验规则与 paper_engine.step_freeze_signal 逐条一致（引擎 7 个校验点全覆盖，
+    与引擎顺序一致：任一不满足即对应引擎 DATA_NOT_QUALIFIED 拒绝）：
+      current_rank_present    current_rank 存在且可转 float ∈ [0,1]
+      metric_value_present    metric_value 必填、可转 float（缺失/非法即拒）
+      history_count_ok        int(history_count) == 60
+      formal_usable_ok        formal_usable 必须为字面量 true
+      contract_supported      source_contract_version ∈ supported_contracts
+                              （缺省 ["emotion-v1"]）
+      known_at_ok             known_at 可解析且 >= 当日 09:25（YYYY-MM-DD HH:MM:SS）
+      previous_rank_ok        previous_rank 缺省 → 合法（引擎从库派生，库中亦无
+                              则保守取 current_rank）；存在时须可转 float ∈ [0,1]
+
+    返回 {exists, path, parsed, error, fields, checks}：
+      exists    文件是否存在
+      parsed    JSON 是否解析成功且根节点为对象
+      error     缺失/解析失败/非对象的中文原因；正常为 None
+      fields    {current_rank, previous_rank, metric_value, history_count,
+                 formal_usable, source_contract_version, known_at}（原始值）
+      checks    上述 7 项，每项 {"ok": bool, "reason": 中文原因}
+
+    trade_date 非法（非 8 位数字）→ 中文 ValueError（与 paper_engine 一致）。
+    """
+    supported = set(supported_contracts) if supported_contracts \
+        else set(SIGNAL_SUPPORTED_CONTRACTS_DEFAULT)
+    td = str(trade_date).strip()
+    if len(td) != 8 or not td.isdigit():
+        raise ValueError(f"trade_date 非法：{trade_date!r}（要求 YYYYMMDD）")
+    path = os.path.join(str(signal_dir), f"{td}.json")
+    result = {"exists": False, "path": path, "parsed": False, "error": None,
+              "fields": {}, "checks": {}}
+    if not os.path.isfile(path):
+        result["error"] = f"信号文件不存在：{path}"
+        return result
+    result["exists"] = True  # 文件确实存在（是否可解析看 parsed）
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except (OSError, ValueError) as exc:
+        result["error"] = f"信号文件读取/解析失败：{exc}"
+        return result
+    if not isinstance(raw, dict):
+        result["error"] = "信号文件根节点必须为 JSON 对象"
+        return result
+    result["parsed"] = True
+    result["fields"] = {
+        "current_rank": raw.get("current_rank"),
+        "previous_rank": raw.get("previous_rank"),
+        "metric_value": raw.get("metric_value"),
+        "history_count": raw.get("history_count"),
+        "formal_usable": raw.get("formal_usable"),
+        "source_contract_version": raw.get("source_contract_version"),
+        "known_at": raw.get("known_at"),
+    }
+    checks: dict[str, dict] = {}
+
+    # current_rank_present：必填且 ∈ [0,1]
+    try:
+        cr = float(raw.get("current_rank"))
+        cr_ok = 0.0 <= cr <= 1.0
+        cr_reason = f"current_rank={raw.get('current_rank')!r} 合法（0~1）" if cr_ok \
+            else f"current_rank={raw.get('current_rank')!r} 超出 0~1 范围"
+    except (TypeError, ValueError):
+        cr_ok, cr_reason = False, f"current_rank 缺失或非法：{raw.get('current_rank')!r}"
+    checks["current_rank_present"] = {"ok": cr_ok, "reason": cr_reason}
+
+    # metric_value_present：必填、可转 float（缺失/非法 → 引擎 DATA_NOT_QUALIFIED；
+    # 引擎只要求可转 float，不做范围限制，此处与引擎一致）
+    try:
+        mv = float(raw.get("metric_value"))
+        mv_ok = True
+        mv_reason = f"metric_value={raw.get('metric_value')!r} 合法（必填，可转 float）✓"
+    except (TypeError, ValueError):
+        mv_ok = False
+        mv_reason = f"metric_value 缺失或非法：{raw.get('metric_value')!r}"
+    checks["metric_value_present"] = {"ok": mv_ok, "reason": mv_reason}
+
+    # history_count_ok：== 60
+    hc = raw.get("history_count")
+    try:
+        hc_ok = int(hc) == 60
+    except (TypeError, ValueError):
+        hc_ok = False
+    checks["history_count_ok"] = {
+        "ok": hc_ok,
+        "reason": f"history_count 必须 == 60，收到 {hc!r}" if not hc_ok
+        else f"history_count={hc} == 60 ✓",
+    }
+
+    # formal_usable_ok：必须为字面量 true
+    fu = raw.get("formal_usable")
+    fu_ok = fu is True
+    checks["formal_usable_ok"] = {
+        "ok": fu_ok,
+        "reason": f"formal_usable 必须为 true，收到 {fu!r}" if not fu_ok
+        else "formal_usable=true ✓",
+    }
+
+    # contract_supported：受支持契约版本
+    scv = raw.get("source_contract_version")
+    scv_ok = scv in supported
+    checks["contract_supported"] = {
+        "ok": scv_ok,
+        "reason": f"source_contract_version {scv!r} 不受支持（支持：{sorted(supported)}）"
+        if not scv_ok else f"source_contract_version={scv!r} 受支持 ✓",
+    }
+
+    # known_at_ok：可解析且 >= 当日 09:25
+    ka = raw.get("known_at")
+    try:
+        ka_dt = datetime.strptime(str(ka).strip(), "%Y-%m-%d %H:%M:%S")
+        td_dt = datetime.strptime(td, "%Y%m%d")
+        ka_ok = ka_dt >= td_dt.replace(hour=9, minute=25, second=0)
+        ka_reason = f"known_at={ka} >= 当日 09:25 ✓" if ka_ok \
+            else f"known_at {ka_dt} 早于当日 09:25"
+    except (TypeError, ValueError):
+        ka_ok, ka_reason = False, f"known_at 非法：{ka!r}（要求 YYYY-MM-DD HH:MM:SS）"
+    checks["known_at_ok"] = {"ok": ka_ok, "reason": ka_reason}
+
+    # previous_rank_ok：缺省 → 合法（引擎从库派生，库中亦无则保守取 current_rank，
+    # 不判非法）；存在时须可转 float ∈ [0,1]（非法 → 引擎 DATA_NOT_QUALIFIED）
+    pr_raw = raw.get("previous_rank")
+    if pr_raw is None:
+        pr_ok = True
+        pr_reason = "previous_rank 缺省 → 合法（引擎将从库派生；库中亦无则保守取 current_rank）"
+    else:
+        try:
+            pr = float(pr_raw)
+            pr_ok = 0.0 <= pr <= 1.0
+            pr_reason = f"previous_rank={pr_raw!r} 合法（0~1）✓" if pr_ok \
+                else f"previous_rank={pr_raw!r} 超出 0~1 范围"
+        except (TypeError, ValueError):
+            pr_ok, pr_reason = False, \
+                f"previous_rank 非法：{pr_raw!r}（存在时须可转 float ∈ [0,1]）"
+    checks["previous_rank_ok"] = {"ok": pr_ok, "reason": pr_reason}
+
+    result["checks"] = checks
+    return result
+
+
+def _paper_benchmark(dates) -> dict:
+    """基准收盘价：对给定日期列表用 159915 日K 取 close（审计 benchmark_series 数据源）。
+
+    优先 mcp.query_kline（stockdb MCP K 线查询，单次区间请求，HTTP 路径无需 pybao）；
+    MCP 不可用/异常/无数据时回退 stockdb HTTP cmd=vals 按月前缀批量拉取
+    （口径同 _paper_fetch_daily）；两者均失败 → {}（不抛，审计端降级为空基准曲线）。
+    返回 {YYYYMMDD: close}（仅含请求日期中能取到 close 的项）。
+    """
+    wanted = [str(d) for d in dates if len(str(d)) == 8 and str(d).isdigit()]
+    if not wanted:
+        return {}
+    s, e = min(wanted), max(wanted)
+    rows: list = []
+    # 优先：MCP query_kline（只读 K 线查询，与 /mcp 路由同实现）
+    try:
+        from mcp.stockdb_mcp_server import query_kline as _mcp_qk
+        out = _mcp_qk({"code": "159915", "frequency": "1d",
+                       "start": s, "end": e, "fields": "date,close"})
+        data = out.get("data") if isinstance(out, dict) else None
+        if isinstance(data, list):
+            rows = [r for r in data if isinstance(r, dict)]
+    except Exception:  # noqa: BLE001 - MCP 不可用/异常 → 回退 HTTP
+        rows = []
+    if not rows:
+        # 回退：stockdb HTTP cmd=vals 按月前缀批量
+        try:
+            start_dt = datetime.strptime(s, "%Y%m%d").date()
+            end_dt = datetime.strptime(e, "%Y%m%d").date()
+            fetched = _paper_fetch_daily("159915", start_dt, end_dt)
+            rows = fetched.get("bars", []) if isinstance(fetched, dict) else []
+        except Exception:  # noqa: BLE001 - 网络/解析失败 → {}（审计不抛）
+            rows = []
+    wanted_set = set(wanted)
+    result: dict[str, float] = {}
+    for r in rows:
+        d, c = r.get("date"), r.get("close")
+        d_s = str(d).strip()  # stockdb 各路径 date 形态不一（str/int），统一转字符串匹配
+        if d_s not in wanted_set:
+            continue
+        try:
+            result[d_s] = float(c)
+        except (TypeError, ValueError):
+            continue
+    return result
+
+
+def _latest_trade_date(d=None, max_back: int = 60) -> str:
+    """最近交易日（8 位 YYYYMMDD）：从给定日期（缺省今天）向前找首个交易日。
+
+    周末/节假日（XSHG_HOLIDAYS 休市表）自动向前回退；找不到（极端情况）退回输入日。
+    """
+    probe = d or date.today()
+    for _ in range(max_back + 1):
+        if is_trading_day(probe):
+            return probe.strftime("%Y%m%d")
+        probe -= timedelta(days=1)
+    return (d or date.today()).strftime("%Y%m%d")
+
+
+def _version_tuple(s) -> tuple | None:
+    """从字符串提取首个 X.Y[.Z] 版本三元组（'v0.3.1' / '测试版本0.3.1' → (0,3,1)）。"""
+    m = re.search(r"(\d+)\.(\d+)(?:\.(\d+))?", str(s))
+    if not m:
+        return None
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3) or 0))
+
+
 # ==================== HTTP 服务 ====================
 PAGE = r"""<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
@@ -1931,11 +2785,15 @@ button:disabled{background:var(--line);color:var(--muted);cursor:not-allowed}
 .spin{display:inline-block;width:14px;height:14px;border:2px solid var(--brand);border-top-color:transparent;border-radius:50%;animation:spin .8s linear infinite;vertical-align:-2px}
 @keyframes spin{to{transform:rotate(360deg)}}
 
-/* Toast */
-#toast{position:fixed;left:50%;bottom:28px;transform:translateX(-50%) translateY(20px);background:var(--panel2);
-border:1px solid var(--line);color:var(--text);padding:10px 18px;border-radius:10px;font-size:14px;
-opacity:0;pointer-events:none;transition:.25s;z-index:100;box-shadow:0 8px 24px rgba(0,0,0,.4)}
-#toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+/* Toast：右下角统一（自动消失，级别左侧色条区分 success/warn/error） */
+#toast{position:fixed;right:20px;bottom:24px;left:auto;transform:translateY(12px);background:var(--panel2);
+border:1px solid var(--line);border-left:3px solid var(--brand);color:var(--text);padding:10px 16px;
+border-radius:10px;font-size:14px;opacity:0;pointer-events:none;transition:.25s;z-index:100;
+box-shadow:0 8px 24px rgba(0,0,0,.4);max-width:420px}
+#toast.show{opacity:1;transform:translateY(0)}
+#toast.success{border-left-color:var(--ok)}
+#toast.warn{border-left-color:var(--warn)}
+#toast.error{border-left-color:var(--err)}
 
 /* 历史 */
 table{width:100%;border-collapse:collapse;font-size:13px}
@@ -1990,13 +2848,79 @@ color:var(--text);padding:8px 10px;border-radius:8px;width:220px}
 .setting-row .lbl{font-size:13px;color:var(--text)}
 .setting-row .dsc{font-size:12px;color:var(--muted)}
 .times-pill{display:inline-block;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:2px 10px;font-size:13px;margin:2px 4px 2px 0}
+
+/* ==================== Phase 4.5 运营面板 ==================== */
+/* 顶栏状态条（全局可见，15s 静默刷新） */
+.statusbar{display:flex;align-items:center;gap:22px;padding:8px 2px 2px;border-top:1px solid var(--line);
+margin-top:8px;font-size:12px;flex-wrap:wrap}
+.sb-item{display:flex;align-items:center;gap:6px;min-width:0}
+.sb-item.clickable{cursor:pointer}
+.sb-item.clickable:hover .sb-lbl{color:var(--text)}
+.sb-lbl{color:var(--muted);font-size:11px;flex-shrink:0}
+.sb-dot{display:inline-block;width:8px;height:8px;border-radius:50%;flex-shrink:0}
+.sb-badge{background:var(--err);color:#fff;border-radius:10px;font-size:11px;font-weight:700;
+line-height:16px;padding:0 7px;min-width:16px;text-align:center}
+.tabs{overflow-x:auto;scrollbar-width:none}
+.tabs::-webkit-scrollbar{display:none}
+.tab-btn{min-width:86px}
+/* 骨架屏（数据未回时占位） */
+.skel{background:linear-gradient(90deg,var(--panel2) 25%,#1B2A45 50%,var(--panel2) 75%);
+background-size:200% 100%;animation:shimmer 1.2s infinite;border-radius:6px}
+@keyframes shimmer{to{background-position:-200% 0}}
+.skel-line{height:14px;margin:8px 0}
+.skel-block{height:88px;margin:10px 0}
+/* 通知中心：级别着色 */
+.alv{display:inline-block;padding:1px 8px;border-radius:8px;font-size:11px;font-weight:700}
+.alv-info{background:rgba(56,189,248,.12);color:var(--brand)}
+.alv-warning{background:rgba(245,158,11,.12);color:var(--warn)}
+.alv-error{background:rgba(239,68,68,.12);color:var(--err)}
+/* MCP 统计卡 */
+.mcp-cards{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:4px 0 16px}
+@media(max-width:760px){.mcp-cards{grid-template-columns:repeat(2,1fr)}}
+.mcp{background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:12px 14px}
+.mcp .lbl{font-size:12px;color:var(--muted);margin-bottom:4px}
+.mcp .val{font-size:20px;font-weight:700}
+/* 过滤行（日期区间 / 状态下拉） */
+.frow{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:0 0 10px}
+.frow label{color:var(--muted);font-size:12px}
+input[type=date]{background:#0A0F1C;border:1px solid var(--line);color:var(--text);
+padding:7px 10px;border-radius:8px;width:auto}
+.frow select{width:auto}
+/* 时间轴卡片：可点击内联展开 */
+.tp-card{cursor:pointer;transition:border-color .15s,background .15s}
+.tp-card:hover{border-color:rgba(56,189,248,.45);background:#16283F}
+.tp-card.open{border-color:var(--brand);background:rgba(56,189,248,.07)}
+/* 版本检查 */
+.ver-stale{background:rgba(56,189,248,.07);border:1px solid rgba(56,189,248,.35);
+border-radius:12px;padding:12px 16px;margin:0 0 12px}
+.ver-stale .t{color:var(--brand);font-weight:700}
+.ver-stale .d{color:var(--muted);font-size:13px;margin-top:4px}
+/* 空态 / 降级文案 */
+.empty-hint{color:var(--muted);font-size:13px;padding:22px 0;text-align:center}
+.degraded{color:var(--warn);font-size:13px;padding:4px 0}
 </style></head><body>
 <div class="topbar"><div class="topbar-inner">
   <nav class="tabs">
     <button class="tab-btn active" data-tab="sync" onclick="showTab('sync',this)">数据同步</button>
     <button class="tab-btn" data-tab="system" onclick="showTab('system',this)">系统</button>
     <button class="tab-btn" data-tab="paper" onclick="showTab('paper',this)">模拟盘</button>
+    <button class="tab-btn" data-tab="alerts" onclick="showTab('alerts',this)">通知</button>
+    <button class="tab-btn" data-tab="mcp" onclick="showTab('mcp',this)">MCP 观测</button>
   </nav>
+  <div class="statusbar" id="statusbar">
+    <div class="sb-item" title="行情数据最新日期与滞后天数">
+      <span class="sb-lbl">数据</span><span id="barFresh"><span class="sb-dot" style="background:var(--muted)"></span>…</span>
+    </div>
+    <div class="sb-item" title="stockdb 进程健康（/api/status container）">
+      <span class="sb-lbl">stockdb</span><span id="barSvc"><span class="sb-dot" style="background:var(--muted)"></span>…</span>
+    </div>
+    <div class="sb-item" title="模拟盘引擎 / apikey 配置 / 交易开关 / 暂停状态">
+      <span class="sb-lbl">模拟盘</span><span id="barPaper"><span class="sb-dot" style="background:var(--muted)"></span>…</span>
+    </div>
+    <div class="sb-item clickable" onclick="showTab('alerts')" title="告警中心（count&gt;0 显示红点数字，点击查看）">
+      <span class="sb-lbl">告警</span><span id="barAlerts" class="sb-badge" style="display:none">0</span>
+    </div>
+  </div>
 </div></div>
 <div class="wrap">
 <div id="toast"></div>
@@ -2161,6 +3085,21 @@ color:var(--text);padding:8px 10px;border-radius:8px;width:220px}
     </div>
     <pre id="containerLog" style="display:none;margin-top:10px">（加载中…）</pre>
   </div>
+  <div class="card"><div class="card-title">版本检查 <span class="hint" style="font-weight:normal" id="verMeta">（对比上游最新 release）</span></div>
+    <div id="verStale" class="ver-stale" style="display:none">
+      <div class="t">上游有新版</div>
+      <div class="d" id="verStaleText"></div>
+    </div>
+    <div id="verSkel"><div class="skel skel-line"></div><div class="skel skel-line" style="width:70%"></div></div>
+    <div class="info-grid" id="verGrid" style="display:none">
+      <div class="it"><span class="lk">WebUI 版本</span><span id="verWebui">—</span></div>
+      <div class="it"><span class="lk">镜像引擎 tag</span><span id="verImage">—</span></div>
+      <div class="it"><span class="lk">上游最新 release</span><span id="verUp">—</span></div>
+      <div class="it"><span class="lk">发布日期</span><span id="verUpDate">—</span></div>
+      <div class="it"><span class="lk">发布链接</span><span id="verUpLink">—</span></div>
+    </div>
+    <div id="verDegraded" class="degraded" style="display:none"></div>
+  </div>
   <div class="card"><div class="card-title">开发工具 <span class="hint" style="font-weight:normal">（行情原始查询，代理 stockdb HTTP API）</span></div>
     <details>
       <summary class="hint" style="cursor:pointer">展开原始查询</summary>
@@ -2220,6 +3159,7 @@ color:var(--text);padding:8px 10px;border-radius:8px;width:220px}
   </div>
   <div class="card"><div class="card-title">今日时间轴 <span class="hint" style="font-weight:normal" id="ppToday"></span></div>
     <div id="ppTimeline" style="display:grid;grid-template-columns:repeat(8,1fr);gap:8px;margin-bottom:12px"></div>
+    <div id="ppTpDetail" style="margin:0 0 12px"></div>
     <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
       <select id="ppTp"><option value="">选择时点手动触发</option></select>
       <button class="btn-ghost btn-sm" onclick="paperRunNow()">手动执行</button>
@@ -2227,25 +3167,71 @@ color:var(--text);padding:8px 10px;border-radius:8px;width:220px}
     </div>
   </div>
   <div class="cols">
-    <div class="card"><div class="card-title">决策 <span class="hint" style="font-weight:normal">（最近 30 条）</span></div>
+    <div class="card"><div class="card-title">决策 <span class="hint" style="font-weight:normal" id="ppDecMeta"></span></div>
+      <div class="frow">
+        <label>日期</label><input type="date" id="ppDecFrom" onchange="renderPaperDecisions()">
+        <span class="hint">~</span><input type="date" id="ppDecTo" onchange="renderPaperDecisions()">
+        <label>状态</label><select id="ppDecSt" onchange="renderPaperDecisions()"><option value="">全部</option></select>
+      </div>
       <table><thead><tr><th>交易日</th><th>信号（prev→cur）</th><th>目标（prev→desired）</th><th>理由</th><th>状态</th></tr></thead>
-      <tbody id="ppDecBody"><tr><td colspan="5" class="hint">（暂无决策）</td></tr></tbody></table>
+      <tbody id="ppDecBody"><tr><td colspan="5" class="hint">（加载中…）</td></tr></tbody></table>
     </div>
-    <div class="card"><div class="card-title">订单 <span class="hint" style="font-weight:normal">（最近 30 条）</span></div>
+    <div class="card"><div class="card-title">订单 <span class="hint" style="font-weight:normal" id="ppOrdMeta"></span></div>
+      <div class="frow">
+        <label>日期</label><input type="date" id="ppOrdFrom" onchange="renderPaperOrders()">
+        <span class="hint">~</span><input type="date" id="ppOrdTo" onchange="renderPaperOrders()">
+        <label>状态</label><select id="ppOrdSt" onchange="renderPaperOrders()"><option value="">全部</option></select>
+      </div>
       <table><thead><tr><th>交易日</th><th>动作</th><th>目标 / 差额</th><th>价格类型</th><th>状态</th></tr></thead>
-      <tbody id="ppOrdBody"><tr><td colspan="5" class="hint">（暂无订单）</td></tr></tbody></table>
+      <tbody id="ppOrdBody"><tr><td colspan="5" class="hint">（加载中…）</td></tr></tbody></table>
     </div>
   </div>
   <div class="cols">
     <div class="card"><div class="card-title">收益曲线 <span class="hint" style="font-weight:normal">（组合净值 · 最近 60 个快照）</span></div>
       <div id="ppCurve"></div>
     </div>
-    <div class="card"><div class="card-title">最近事件 <span class="hint" style="font-weight:normal">（最近 50 条）</span></div>
-      <div id="ppEvents" style="max-height:260px;overflow:auto"></div>
+    <div class="card"><div class="card-title">最近事件 <span class="hint" style="font-weight:normal" id="ppEvMeta"></span></div>
+      <div class="frow">
+        <label>时点</label><select id="ppEvTp" onchange="renderPaperEvents()"><option value="">全部时点</option></select>
+      </div>
+      <div id="ppEvents" style="max-height:280px;overflow:auto"></div>
     </div>
   </div>
   <div class="card"><div class="card-title">连通自检结果 <span class="hint" style="font-weight:normal">（POST /api/paper/connectivity）</span></div>
     <pre id="ppConn">（点击上方「连通自检」查看结果）</pre>
+  </div>
+</div>
+
+<!-- 通知：告警中心（级别着色 / 清空 / 空态） -->
+<div id="tab-alerts" class="tab-panel">
+  <div class="card">
+    <div class="card-title" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+      <span>告警中心</span><span class="hint" style="font-weight:normal" id="alertsMeta"></span>
+      <span style="flex:1"></span>
+      <button class="btn-ghost btn-sm" id="alertsClearBtn" onclick="alertsClear()">清空告警</button>
+    </div>
+    <div id="alertsSkel"><div class="skel skel-line"></div><div class="skel skel-line"></div><div class="skel skel-line"></div></div>
+    <table><thead><tr><th style="width:150px">时间</th><th style="width:70px">级别</th><th style="width:90px">来源</th><th>消息</th></tr></thead>
+    <tbody id="alertsBody"><tr><td colspan="4" class="empty-hint">（加载中…）</td></tr></tbody></table>
+    <div id="alertsEmpty" class="empty-hint" style="display:none">（暂无告警，一切正常）</div>
+  </div>
+</div>
+
+<!-- MCP 观测：调用统计 / 按工具 / 最近调用（30s 自动刷新） -->
+<div id="tab-mcp" class="tab-panel">
+  <div class="card"><div class="card-title">调用统计 <span class="hint" style="font-weight:normal" id="mcpMeta">（最近 500 条调用窗口）</span></div>
+    <div class="mcp-cards" id="mcpCards">
+      <div class="mcp"><div class="lbl">总调用</div><div class="val"><div class="skel skel-line" style="margin:2px 0;width:70%"></div></div></div>
+      <div class="mcp"><div class="lbl">成功率</div><div class="val"><div class="skel skel-line" style="margin:2px 0;width:70%"></div></div></div>
+      <div class="mcp"><div class="lbl">平均耗时</div><div class="val"><div class="skel skel-line" style="margin:2px 0;width:70%"></div></div></div>
+      <div class="mcp"><div class="lbl">P95 耗时</div><div class="val"><div class="skel skel-line" style="margin:2px 0;width:70%"></div></div></div>
+    </div>
+    <div class="card-title" style="margin-top:4px">按工具</div>
+    <table><thead><tr><th>工具</th><th>次数</th><th>成功</th><th>平均耗时</th></tr></thead>
+    <tbody id="mcpToolBody"><tr><td colspan="4" class="empty-hint">（加载中…）</td></tr></tbody></table>
+    <div class="card-title" style="margin-top:16px">最近调用 <span class="hint" style="font-weight:normal" id="mcpCallMeta"></span></div>
+    <table><thead><tr><th>时间</th><th>工具</th><th>耗时</th><th>成败</th><th>字节</th></tr></thead>
+    <tbody id="mcpCallBody"><tr><td colspan="5" class="empty-hint">（加载中…）</td></tr></tbody></table>
   </div>
 </div>
 </div>
@@ -2258,7 +3244,10 @@ function fmtPrice(v){return v==null?'—':Number(v).toFixed(2)}
 function $(id){return document.getElementById(id)}
 function fmtYMD(v){const t=String(v);return t.length===8?t.slice(0,4)+'-'+t.slice(4,6)+'-'+t.slice(6,8):t}
 let _toastTimer=null;
-function toast(msg){const t=$('toast');t.textContent=msg;t.classList.add('show');clearTimeout(_toastTimer);_toastTimer=setTimeout(()=>t.classList.remove('show'),2600)}
+// 统一 toast：右下角、自动消失、级别样式（success/warn/error，缺省 info 中性）
+function toast(msg,level){const t=$('toast');t.textContent=msg;
+  t.className=(level==='success'||level==='warn'||level==='error')?('show '+level):'show';
+  clearTimeout(_toastTimer);_toastTimer=setTimeout(()=>t.classList.remove('show'),2600)}
 function fmtDur(sec){sec=Math.max(0,Math.floor(sec||0));return String(Math.floor(sec/60)).padStart(2,'0')+':'+String(sec%60).padStart(2,'0')}
 function fmtClock(ts){
   if(!ts)return '';
@@ -2316,8 +3305,13 @@ async function refresh(force){
       if(h)_healthCache=h;
       renderSystem(s);
       loadHistory();
+      refreshVersion();
     }else if(active==='tab-paper'){
       await refreshPaper();
+    }else if(active==='tab-alerts'){
+      await refreshAlerts();
+    }else if(active==='tab-mcp'){
+      await refreshMCP();
     }
   }catch(e){
     $('log').textContent='状态刷新失败: '+e;$('log').style.display='block';
@@ -2325,6 +3319,156 @@ async function refresh(force){
   _refreshing=false;
   if(_refreshQueued){_refreshQueued=false;refresh()}
 }
+
+// ==================== Phase 4.5：全局状态条 / 通知中心 / MCP 观测 / 版本检查 ====================
+function calLag(v){const s=String(v||'').trim();if(s.length<8)return null;
+  const y=parseInt(s.slice(0,4),10),m=parseInt(s.slice(4,6),10),d=parseInt(s.slice(6,8),10);
+  if(!y||!m||!d)return null;
+  const today=new Date(),t0=new Date(today.getFullYear(),today.getMonth(),today.getDate());
+  return Math.round((t0-new Date(y,m-1,d))/86400000);
+}
+async function refreshStatusbar(){
+  // 数据新鲜度 + stockdb 健康（/api/status）
+  try{
+    const s=await j('/api/status');
+    const latest=s.data_latest,lag=calLag(latest);
+    const fEl=$('barFresh');
+    if(latest==null){fEl.innerHTML='<span class="sb-dot" style="background:var(--err)"></span>未知'}
+    else{fEl.innerHTML='<span class="sb-dot" style="background:'+(lag<=0?'var(--ok)':lag<=1?'var(--warn)':'var(--err)')+'"></span>'
+      +fmtYMD(latest).slice(5)+(lag>0?' · 滞后 '+lag+' 天':'')}
+    const cs=s.container||{};
+    $('barSvc').innerHTML='<span class="sb-dot" style="background:'+(cs.ok?'var(--ok)':'var(--err)')+'"></span>'
+      +(cs.ok?'运行中':(cs.status==='stopped'?'已停止':'不可用'));
+  }catch(e){$('barFresh').textContent='—';$('barSvc').textContent='—'}
+  // 模拟盘（/api/paper/status 恒 200）
+  try{
+    const p=await j('/api/paper/status');
+    const el=$('barPaper');
+    if(!p.engine_available){el.innerHTML='<span class="sb-dot" style="background:var(--err)"></span>不可用'}
+    else if(!p.configured){el.innerHTML='<span class="sb-dot" style="background:var(--warn)"></span>未配置'}
+    else if(p.paused){el.innerHTML='<span class="sb-dot" style="background:var(--warn)"></span>已暂停'}
+    else if(p.trading_enabled){el.innerHTML='<span class="sb-dot" style="background:var(--ok)"></span>运行中'}
+    else{el.innerHTML='<span class="sb-dot" style="background:var(--warn)"></span>交易未开'}
+  }catch(e){$('barPaper').textContent='—'}
+  // 告警红点（count>0 显示数字徽标）
+  try{
+    const a=await j('/api/alerts/summary');
+    const n=(a&&typeof a.count==='number')?a.count:0;
+    const bEl=$('barAlerts');
+    bEl.style.display=n>0?'inline-block':'none';
+    bEl.textContent=n>99?'99+':n;
+  }catch(e){$('barAlerts').style.display='none'}
+  // 通知页激活时静默跟随刷新列表（与顶栏同频，失败不打扰）
+  if(document.querySelector('#tab-alerts').classList.contains('active'))refreshAlerts(true);
+}
+// ==================== 通知中心（B2：列表/级别着色/清空/空态） ====================
+let _alerts=[];
+async function refreshAlerts(silent){
+  try{
+    const r=await j('/api/alerts?limit=200');
+    _alerts=(Array.isArray(r.alerts)?r.alerts:(Array.isArray(r.items)?r.items:[]));
+  }catch(e){
+    if(silent)return;   // 静默失败保留现状（顶栏红点已隐藏）
+    _alerts=[];
+    $('alertsBody').innerHTML='<tr><td colspan="4" class="empty-hint">模块不可用：告警接口未就绪（'+(e&&e.message?e.message:e)+'）</td></tr>';
+    $('alertsSkel').style.display='none';
+    $('alertsEmpty').style.display='none';
+    $('alertsMeta').textContent='';
+    return;
+  }
+  renderAlerts();
+}
+function renderAlerts(){
+  $('alertsSkel').style.display='none';
+  $('alertsMeta').textContent=_alerts.length?('共 '+_alerts.length+' 条'):'';
+  $('alertsEmpty').style.display=_alerts.length?'none':'block';
+  $('alertsBody').innerHTML=_alerts.map(a=>{
+    const lv=(a.level==='error')?'error':(a.level==='warning'||a.level==='warn')?'warning':'info';
+    const color=lv==='error'?'var(--err)':lv==='warning'?'var(--warn)':'var(--brand)';
+    return '<tr><td class="hint">'+esc(String(a.ts||'').slice(0,19).replace('T',' '))+'</td>'
+      +'<td><span class="alv alv-'+lv+'">'+(lv==='warning'?'警告':lv==='error'?'错误':'提示')+'</span></td>'
+      +'<td>'+esc(a.source||'—')+'</td>'
+      +'<td style="color:'+color+'">'+esc(a.message||'')+'</td></tr>';
+  }).join('');
+}
+async function alertsClear(){
+  if(!_alerts.length){toast('当前没有告警','warn');return}
+  if(!confirm('确认清空全部 '+_alerts.length+' 条告警？'))return;
+  try{
+    const r=await j('/api/alerts/clear',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+    _alerts=[];renderAlerts();refreshStatusbar();
+    toast((r&&r.msg)?r.msg:'已清空告警','success');
+  }catch(e){toast('清空失败: '+e,'error')}
+}
+// ==================== MCP 观测（B3：统计卡/按工具/最近调用，30s 自动刷新） ====================
+async function refreshMCP(){
+  try{
+    const st=await j('/api/mcp/stats');
+    const cl=await j('/api/mcp/calls?limit=50');
+    renderMCP(st,Array.isArray(cl.calls)?cl.calls:(Array.isArray(cl.list)?cl.list:[]));
+  }catch(e){
+    $('mcpCards').innerHTML='<div class="degraded" style="grid-column:1/-1">模块不可用：MCP 观测接口未就绪（'+(e&&e.message?e.message:e)+'）</div>';
+    $('mcpToolBody').innerHTML='<tr><td colspan="4" class="empty-hint">—</td></tr>';
+    $('mcpCallBody').innerHTML='<tr><td colspan="5" class="empty-hint">—</td></tr>';
+    $('mcpMeta').textContent='';
+    $('mcpCallMeta').textContent='';
+  }
+}
+function renderMCP(st,calls){
+  const fmtMs=v=>v==null?'—':(Number(v).toFixed(1)+' ms');
+  const fmtRate=v=>v==null?'—':(Number(v).toFixed(1)+'%');
+  $('mcpCards').innerHTML=
+    '<div class="mcp"><div class="lbl">总调用</div><div class="val">'+esc(String(st.total!=null?st.total:0))+'</div></div>'
+    +'<div class="mcp"><div class="lbl">成功率</div><div class="val" style="color:'+(st.ok_rate==null?'':st.ok_rate>=0.9?'var(--ok)':st.ok_rate>=0.7?'var(--warn)':'var(--err)')+'">'+fmtRate(st.ok_rate!=null?st.ok_rate*100:null)+'</div></div>'
+    +'<div class="mcp"><div class="lbl">平均耗时</div><div class="val">'+fmtMs(st.avg_ms)+'</div></div>'
+    +'<div class="mcp"><div class="lbl">P95 耗时</div><div class="val">'+fmtMs(st.p95_ms)+'</div></div>';
+  const tools=st.by_tool||[];
+  $('mcpToolBody').innerHTML=tools.length?tools.map(t=>'<tr>'
+    +'<td>'+esc(t.tool||'?')+'</td>'
+    +'<td>'+esc(String(t.n!=null?t.n:0))+'</td>'
+    +'<td style="color:'+((t.ok!=null&&t.n!=null&&t.ok>=t.n)?'var(--ok)':((t.ok||0)<(t.n||1)?'var(--warn)':'var(--err)'))+'">'+esc(String(t.ok!=null?t.ok:0))+'</td>'
+    +'<td>'+fmtMs(t.avg_ms)+'</td></tr>').join('')
+    :'<tr><td colspan="4" class="empty-hint">（尚无调用记录，MCP 工具调用后自动采集）</td></tr>';
+  $('mcpCallMeta').textContent=calls.length?('最近 '+calls.length+' 条'):'';
+  $('mcpCallBody').innerHTML=calls.map(c=>{
+    const ok=!!c.ok&&!c.is_error;
+    return '<tr>'
+      +'<td class="hint">'+esc(String(c.ts||'').slice(0,19).replace('T',' '))+'</td>'
+      +'<td>'+esc(c.tool||'?')+'</td>'
+      +'<td class="hint">'+(c.elapsed_ms==null?'—':esc(String(c.elapsed_ms))+' ms')+'</td>'
+      +'<td>'+(ok?'<span class="dot-ok"></span>成功':'<span class="dot-fail"></span>失败')+'</td>'
+      +'<td class="hint">'+(c.bytes==null?'—':esc(String(c.bytes)))+'</td></tr>';
+  }).join('')||'<tr><td colspan="5" class="empty-hint">（暂无调用记录）</td></tr>';
+}
+// ==================== 版本检查（B5：当前版本/镜像 tag/上游 release/stale 提示） ====================
+async function refreshVersion(){
+  const grid=$('verGrid'),skel=$('verSkel'),de=$('verDegraded');
+  try{
+    const r=await j('/api/version');
+    skel.style.display='none';de.style.display='none';grid.style.display='grid';
+    const web=(r.webui&&r.webui.version)||'—';
+    const img=(r.image&&(r.image.tag||r.image.version))||r.image_tag||'—';
+    const up=r.upstream||null;
+    const upTag=up?(up.tag_name||up.tag||null):null;
+    const upDate=up?(up.published_at||up.date||''):'';
+    $('verWebui').textContent=web;
+    $('verImage').textContent=img;
+    $('verUp').textContent=upTag||'未获取到';
+    $('verUpDate').textContent=upDate?String(upDate).slice(0,10):'—';
+    $('verUpLink').innerHTML=up&&up.html_url?('<a href="'+esc(up.html_url)+'" target="_blank" rel="noopener" style="color:var(--brand)">打开发布页 ↗</a>'):'—';
+    const stale=!!r.stale;
+    $('verStale').style.display=stale?'block':'none';
+    if(stale)$('verStaleText').textContent=r.msg||('当前 '+web+'，上游最新 '+upTag+'，建议升级');
+    $('verMeta').textContent=stale?'':'（已是最新或无法对比）';
+  }catch(e){
+    skel.style.display='none';grid.style.display='none';
+    de.style.display='block';
+    de.textContent='模块不可用：版本检查接口未就绪（'+(e&&e.message?e.message:e)+'）';
+    $('verStale').style.display='none';
+  }
+}
+setInterval(refreshStatusbar,15000);   // B1：顶栏 15s 静默刷新
+setInterval(()=>{if(document.querySelector('#tab-mcp').classList.contains('active'))refreshMCP()},30000);  // B3：MCP 页 30s 自动刷新
 
 function renderHero(s,h){
   const spin=$('heroSpin'),st=$('heroStatus'),sub=$('heroSub');
@@ -2371,7 +3515,7 @@ async function startSync(strict){
   const opt={method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({hot:!strict})};
   try{
     const r=await j('/api/sync',opt);
-    toast(r.msg||'已启动同步');
+    toast(r.msg||'已启动同步','success');
     toggleMenu();
     if(r.msg&&r.msg.includes('运行中')){
       // 同步引擎被占用（如定时任务正在跑）：明确提示，不做无谓动作
@@ -2381,7 +3525,7 @@ async function startSync(strict){
       if(!$('log').textContent.trim()||$('log').textContent==='（暂无）')$('log').textContent='同步启动中，请稍候…';
       refresh(true);
     }
-  }catch(e){toast('启动失败: '+e)}
+  }catch(e){toast('启动失败: '+e,'error')}
 }
 
 // 自动同步：编辑模式下不覆盖时间点草稿（防 4s 轮询吞掉未保存的修改）
@@ -2400,7 +3544,7 @@ function renderEditTimes(times){
 }
 function toggleSchEdit(open){$('schView').style.display=open?'none':'block';$('schEdit').style.display=open?'block':'none'}
 function addSchTime(){
-  const t=$('schTime').value;if(!t){toast('请选择时间');return}
+  const t=$('schTime').value;if(!t){toast('请选择时间','warn');return}
   const cur=[...($('schTimesEdit').textContent.match(/\d{2}:\d{2}/g)||[]),t];
   $('schTime').value='';
   renderEditTimes([...new Set(cur)]);
@@ -2409,13 +3553,13 @@ function rmSchTime(t,ev){ev.preventDefault();const cur=($('schTimesEdit').textCo
 async function saveScheduleNow(){
   const enabled=$('schEnabled').checked,trading=$('schTrading').checked;
   const times=[...($('schTimesEdit').textContent.match(/\d{2}:\d{2}/g)||[])];
-  if(!times.length){toast('至少保留一个执行时间点');return}
+  if(!times.length){toast('至少保留一个执行时间点','warn');return}
   try{
     const r=await j('/api/schedule?action=save&enabled='+enabled+'&trading_only='+trading+'&times='+encodeURIComponent(times.join(',')));
-    toast(r.msg||'自动同步计划已保存');
+    toast(r.msg||'自动同步计划已保存','success');
     if($('schEdit').style.display==='block')toggleSchEdit(false);
     renderSchView(r.schedule||{});
-  }catch(e){toast('保存失败: '+e)}
+  }catch(e){toast('保存失败: '+e,'error')}
 }
 
 // 历史：记录按新 → 旧排序（原文件 append，最新在末尾）
@@ -2569,7 +3713,7 @@ function fmtUptime(iso){
 }
 async function restartContainer(){
   if(!confirm('确定重启 stockdb 进程？重启期间行情服务会短暂中断。')){$('containerMsg').textContent='已取消';return}
-  try{const r=await j('/api/container/restart',{method:'POST'});$('containerMsg').textContent=r.msg||'已执行';toast(r.msg||'已执行')}
+  try{const r=await j('/api/container/restart',{method:'POST'});$('containerMsg').textContent=r.msg||'已执行';toast(r.msg||'已执行','success')}
   catch(e){$('containerMsg').textContent='重启失败: '+e}
 }
 // ---- 数据写入（mydb 私有存储，手动触发） ----
@@ -2591,7 +3735,7 @@ async function dataWrite(){
   try{
     const r=await j('/api/data/write',{method:'POST',body:JSON.stringify({table,...payload})});
     $('dwMsg').textContent=r.msg||('写入 '+r.written+' 条');
-    toast(r.msg||'写入完成');
+    toast(r.msg||'写入完成','success');
     dataTables();
   }catch(e){$('dwMsg').textContent='写入失败: '+e}
 }
@@ -2614,7 +3758,7 @@ async function hkSync(){
     const r=await j('/api/hk/sync',{method:'POST',body:JSON.stringify({codes:list,years})});
     const parts=Object.entries(r).map(([c,v])=>c+' '+(v.ok?('✓ '+v.bars+'根'):('✗ '+v.error))).join('；');
     $('hkMsg').textContent=parts;
-    toast('港股同步完成');
+    toast('港股同步完成','success');
   }catch(e){$('hkMsg').textContent='拉取失败: '+e}
 }
 async function toggleContainerLogs(){
@@ -2635,6 +3779,8 @@ document.addEventListener('keydown',e=>{
 });
 // ==================== 模拟盘页（任务E：状态 / 账户总览 / 时间轴 / 决策 / 订单 / 收益曲线 / 连通自检） ====================
 let _ppEngineOk=false;
+let _ppDecisions=[],_ppOrders=[],_ppEvents=[];   // B4：原始数据（前端日期区间/状态/时点筛选用）
+let _ppStatusCache=null,_ppToday='',_ppTpOpen=null;  // B4：时间轴展开状态
 function fmtMoney(v){return Number(v).toLocaleString('zh-CN',{minimumFractionDigits:2,maximumFractionDigits:2})}
 async function refreshPaper(){
   let s=null;
@@ -2643,16 +3789,20 @@ async function refreshPaper(){
   renderPaperStatus(s);
   if(!s.engine_available)return;   // 引擎不可用：读接口 501，直接停在降级提示
   try{renderPaperOverview(await j('/api/paper/overview'))}catch(e){}
-  try{const d=await j('/api/paper/decisions?limit=30');renderPaperDecisions(d.decisions||[])}catch(e){}
-  try{const o=await j('/api/paper/orders?limit=30');renderPaperOrders(o.orders||[])}catch(e){}
+  try{const d=await j('/api/paper/decisions?limit=500');_ppDecisions=d.decisions||[]}catch(e){_ppDecisions=[]}
+  renderPaperDecisions();
+  try{const o=await j('/api/paper/orders?limit=500');_ppOrders=o.orders||[]}catch(e){_ppOrders=[]}
+  renderPaperOrders();
   try{const sn=await j('/api/paper/snapshot?limit=60');renderPaperCurve(sn.snapshots||[])}catch(e){}
-  try{const ev=await j('/api/paper/events?limit=50');renderPaperEvents(ev.events||[])}catch(e){}
+  try{const ev=await j('/api/paper/events?limit=200');_ppEvents=ev.events||[]}catch(e){_ppEvents=[]}
+  renderPaperEvents();
 }
 function renderPaperStatus(s){
   _ppEngineOk=!!s.engine_available;
+  _ppStatusCache=s;
   const title=$('ppTitle'),dot=$('ppDot');
   const reasons=[];
-  if(!s.engine_available){reasons.push(s.reason||'模拟盘模块缺失，功能降级')}
+  if(!s.engine_available){reasons.push('模块不可用：'+(s.reason||'模拟盘模块缺失'))}
   if(s.engine_available&&!s.configured)reasons.push('MX apikey 未配置');
   if(s.engine_available&&!s.trading_enabled)reasons.push('交易开关未启用');
   if(s.engine_available&&s.paused)reasons.push('已暂停');
@@ -2665,7 +3815,7 @@ function renderPaperStatus(s){
   }
   $('ppSub').textContent=s.engine_available
     ?('apikey '+(s.configured?('已配置（'+esc(s.masked_key||'')+'）'):'未配置')+' ｜ 交易开关 '+(s.trading_enabled?'已开启':'未开启')+' ｜ 暂停 '+(s.paused?'是':'否'))
-    :(s.reason||'模拟盘模块缺失，功能降级');
+    :('模块不可用：'+(s.reason||'模拟盘模块缺失'));
   $('ppGate').textContent=reasons.length?('⛔ '+reasons.join('；')):'';
   $('ppCfg').textContent=s.configured?(esc(s.masked_key||'已配置')):'未配置';
   $('ppTrading').innerHTML=s.trading_enabled?'<span style="color:var(--ok)">已开启</span>':'<span style="color:var(--warn)">未开启</span>';
@@ -2681,16 +3831,42 @@ function renderPaperStatus(s){
   renderPaperRunSelect(s);
 }
 function renderPaperTimeline(s){
+  _ppToday=s.today||'';
   const colors={ok:'var(--ok)',warn:'var(--warn)',err:'var(--err)',run:'var(--brand)',wait:'var(--panel2)'};
   $('ppToday').textContent=s.today?('· '+fmtYMD(s.today)):'';
-  $('ppTimeline').innerHTML=(s.timeline||[]).map(x=>
-    '<div style="background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:10px 12px;min-width:104px">'
+  $('ppTimeline').innerHTML=(s.timeline||[]).map(x=>{
+    const open=_ppTpOpen===x.tp;
+    return '<div class="tp-card'+(open?' open':'')+'" onclick="paperTpToggle(\''+esc(x.tp)+'\')" title="点击展开当日该时点事件明细" style="background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:10px 12px;min-width:104px">'
     +'<div style="display:flex;align-items:center;gap:6px">'
     +'<i style="display:inline-block;width:8px;height:8px;border-radius:50%;background:'+(colors[x.state]||'var(--muted)')+'"></i>'
-    +'<b style="font-size:14px">'+esc(x.tp)+'</b></div>'
+    +'<b style="font-size:14px">'+esc(x.tp)+'</b>'
+    +'<span class="tp-caret">'+(open?'▾':'▸')+'</span></div>'
     +'<div class="hint" style="margin-top:2px;font-size:12px">'+esc(x.label)+'</div>'
     +'<div class="hint" style="margin-top:2px;font-size:11px">'+(x.detail?esc(x.detail):(x.fired?'已触发':'待触发'))+'</div>'
-    +'</div>').join('');
+    +'</div>';
+  }).join('');
+  paperRenderTpDetail();
+}
+// B4：时点卡片点击 → 内联展开当日该时点事件明细
+function paperTpToggle(tp){
+  _ppTpOpen=(_ppTpOpen===tp)?null:tp;
+  if(_ppStatusCache)renderPaperTimeline(_ppStatusCache);
+}
+function paperRenderTpDetail(){
+  const el=$('ppTpDetail');
+  if(!_ppTpOpen){el.innerHTML='';return}
+  const list=_ppEvents.filter(e=>e.timepoint===_ppTpOpen&&(!e.trade_date||e.trade_date===_ppToday));
+  el.innerHTML='<div style="background:var(--panel2);border:1px solid var(--brand);border-radius:10px;padding:10px 14px;font-size:12px">'
+    +'<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;flex-wrap:wrap"><b style="color:var(--brand)">'+esc(_ppTpOpen)+' 当日事件</b><span class="hint">'+esc(_ppToday?fmtYMD(_ppToday):'')+' · 共 '+list.length+' 条</span></div>'
+    +(list.length?list.map(e=>{
+      const color=e.level==='ERROR'?'var(--err)':e.level==='WARN'?'var(--warn)':'var(--muted)';
+      return '<div style="display:flex;gap:10px;padding:3px 0;border-bottom:1px solid var(--line);flex-wrap:wrap">'
+        +'<span class="hint">'+esc(String(e.ts||'').slice(11,19))+'</span>'
+        +'<span style="color:'+color+';min-width:34px">'+esc(e.level||'')+'</span>'
+        +'<span style="color:var(--text)">'+esc(e.event||'')+'</span>'
+        +'<span class="hint" style="overflow:hidden;text-overflow:ellipsis">'+esc(e.detail||'')+'</span></div>';
+    }).join(''):'<div class="hint">（该时点今日暂无事件）</div>')
+    +'</div>';
 }
 function renderPaperRunSelect(s){
   const sel=$('ppTp');
@@ -2710,23 +3886,42 @@ function renderPaperOverview(ov){
   $('ppPnl').innerHTML=pv==null?'—':'<span style="color:'+(pv>=0?'#F87171':'#4ADE80')+'">'+(pv>0?'+':'')+fmtMoney(pv)+(pc!=null?'（'+(pc>0?'+':'')+pc.toFixed(2)+'%）':'')+'</span>';
   $('ppSnapTs').textContent=ov&&ov.latest_snapshot?('快照交易日 '+fmtYMD(ov.latest_snapshot.trade_date)+' · 名义本金 '+fmtMoney(ov.model_nav||0)):'（暂无组合快照，收盘对账后生成）';
 }
-function renderPaperDecisions(ds){
-  $('ppDecBody').innerHTML=ds.map(d=>'<tr>'
+// B4：状态下拉选项（保留当前选择）
+function ppFillStatusSelect(selId,list,key){
+  const sel=$(selId),cur=sel.value;
+  const seen={};
+  list.forEach(x=>{const v=x&&x[key];if(v!=null&&v!=='')seen[v]=true});
+  sel.innerHTML='<option value="">全部</option>'
+    +Object.keys(seen).sort().map(v=>'<option value="'+esc(v)+'">'+esc(v)+'</option>').join('');
+  if(cur)sel.value=cur;
+}
+function renderPaperDecisions(){
+  ppFillStatusSelect('ppDecSt',_ppDecisions,'status');
+  const from=($('ppDecFrom').value||'').replace(/-/g,''),to=($('ppDecTo').value||'').replace(/-/g,'');
+  const st=$('ppDecSt').value;
+  const list=_ppDecisions.filter(d=>(!from||String(d.trade_date)>=from)&&(!to||String(d.trade_date)<=to)&&(!st||d.status===st));
+  $('ppDecMeta').textContent='共 '+_ppDecisions.length+' 条 · 显示 '+list.length+' 条';
+  $('ppDecBody').innerHTML=list.map(d=>'<tr>'
     +'<td>'+fmtYMD(d.trade_date)+'</td>'
     +'<td>'+esc(d.previous_rank==null?'—':d.previous_rank)+' → '+esc(d.current_rank==null?'—':d.current_rank)+'</td>'
     +'<td>'+esc(d.previous_target==null?'—':d.previous_target)+' → '+esc(d.desired_target==null?'—':d.desired_target)+'</td>'
     +'<td>'+esc(d.reason_code||'—')+'</td>'
     +'<td>'+esc(d.status||'—')+'</td>'
-    +'</tr>').join('')||'<tr><td colspan="5" class="hint">（暂无决策）</td></tr>';
+    +'</tr>').join('')||'<tr><td colspan="5" class="hint">'+(st||from||to?'（无符合筛选条件的决策）':'（暂无决策）')+'</td></tr>';
 }
-function renderPaperOrders(os){
-  $('ppOrdBody').innerHTML=os.map(o=>'<tr>'
+function renderPaperOrders(){
+  ppFillStatusSelect('ppOrdSt',_ppOrders,'status');
+  const from=($('ppOrdFrom').value||'').replace(/-/g,''),to=($('ppOrdTo').value||'').replace(/-/g,'');
+  const st=$('ppOrdSt').value;
+  const list=_ppOrders.filter(o=>(!from||String(o.trade_date)>=from)&&(!to||String(o.trade_date)<=to)&&(!st||o.status===st));
+  $('ppOrdMeta').textContent='共 '+_ppOrders.length+' 条 · 显示 '+list.length+' 条';
+  $('ppOrdBody').innerHTML=list.map(o=>'<tr>'
     +'<td>'+fmtYMD(o.trade_date)+'</td>'
     +'<td>'+esc(o.action||'—')+'</td>'
     +'<td>'+esc(o.target_qty)+'（差额 '+esc(o.delta_qty)+'）</td>'
     +'<td>'+esc(o.price_type||'—')+'</td>'
     +'<td>'+esc(o.status||'—')+'</td>'
-    +'</tr>').join('')||'<tr><td colspan="5" class="hint">（暂无订单）</td></tr>';
+    +'</tr>').join('')||'<tr><td colspan="5" class="hint">'+(st||from||to?'（无符合筛选条件的订单）':'（暂无订单）')+'</td></tr>';
 }
 function renderPaperCurve(snaps){
   const el=$('ppCurve');
@@ -2748,54 +3943,66 @@ function renderPaperCurve(snaps){
     +'<polyline fill="none" stroke="'+(up?'#22C55E':'#EF4444')+'" stroke-width="2" points="'+pts+'"/>'
     +'</svg>';
 }
-function renderPaperEvents(evs){
-  $('ppEvents').innerHTML=evs.map(e=>{
+// B4：事件流加 timepoint 过滤；渲染后同步时间轴展开面板
+function renderPaperEvents(){
+  const sel=$('ppEvTp'),cur=sel.value;
+  const tps={};
+  _ppEvents.forEach(e=>{const v=e&&e.timepoint;if(v!=null&&v!=='')tps[v]=true});
+  sel.innerHTML='<option value="">全部时点</option>'
+    +Object.keys(tps).sort().map(v=>'<option value="'+esc(v)+'">'+esc(v)+'</option>').join('');
+  if(cur)sel.value=cur;
+  const tp=sel.value;
+  const list=_ppEvents.filter(e=>!tp||e.timepoint===tp);
+  $('ppEvMeta').textContent='共 '+_ppEvents.length+' 条 · 显示 '+list.length+' 条';
+  $('ppEvents').innerHTML=list.map(e=>{
     const color=e.level==='ERROR'?'var(--err)':e.level==='WARN'?'var(--warn)':'var(--muted)';
     return '<div style="display:flex;gap:8px;padding:4px 0;border-bottom:1px solid var(--line);font-size:12px">'
       +'<span class="hint" style="flex-shrink:0">'+esc(String(e.ts||'').slice(11,19))+'</span>'
+      +(e.timepoint?'<span class="hint" style="flex-shrink:0;color:var(--brand)">'+esc(e.timepoint)+'</span>':'')
       +'<span style="color:'+color+';flex-shrink:0;min-width:34px">'+esc(e.level||'')+'</span>'
       +'<span style="flex-shrink:0;color:var(--text)">'+esc(e.event||'')+'</span>'
       +'<span class="hint" style="overflow:hidden;text-overflow:ellipsis">'+esc(e.detail||'')+'</span>'
       +'</div>';
-  }).join('')||'<div class="hint">（暂无事件）</div>';
+  }).join('')||'<div class="hint">'+(tp?'（该时点暂无事件）':'（暂无事件）')+'</div>';
+  paperRenderTpDetail();
 }
 async function paperSetPause(){
   const enabled=$('ppPause').checked;
   try{
     const r=await j('/api/paper/pause',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled})});
-    toast(r.msg||(enabled?'已暂停':'已恢复'));
-  }catch(e){toast('切换失败: '+e);$('ppPause').checked=!enabled}
+    toast(r.msg||(enabled?'已暂停':'已恢复'),'success');
+  }catch(e){toast('切换失败: '+e,'error');$('ppPause').checked=!enabled}
   refresh(true);
 }
 async function paperSaveKey(){
   const k=$('ppKey').value.trim();
-  if(!k){toast('请先粘贴 apikey');return}
+  if(!k){toast('请先粘贴 apikey','warn');return}
   try{
     const r=await j('/api/paper/apikey',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({apikey:k})});
     $('ppKey').value='';
-    toast(r.configured?('apikey 已保存（仅存本机 /data，掩码 '+r.masked+'）'):'未生效，请检查');
+    toast(r.configured?('apikey 已保存（仅存本机 /data，掩码 '+r.masked+'）'):'未生效，请检查','success');
     refresh(true);
-  }catch(e){toast('保存失败: '+e)}
+  }catch(e){toast('保存失败: '+e,'error')}
 }
 async function paperClearKey(){
   if(!confirm('确认清除本地保存的 apikey？'))return;
   try{
     const r=await j('/api/paper/apikey',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({apikey:''})});
     $('ppKey').value='';
-    toast('已清除本地 apikey');
+    toast('已清除本地 apikey','success');
     refresh(true);
-  }catch(e){toast('清除失败: '+e)}
+  }catch(e){toast('清除失败: '+e,'error')}
 }
 async function paperRunNow(){
   const tp=$('ppTp').value;
-  if(!tp){toast('请选择要手动执行的时点');return}
+  if(!tp){toast('请选择要手动执行的时点','warn');return}
   $('ppRunMsg').textContent='执行中…';
   try{
     const r=await j('/api/paper/run-now',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({timepoint:tp})});
     $('ppRunMsg').textContent=(r.error?('未执行：'+r.error):(r.detail||(r.ok?'执行完成':'执行失败')));
-    if(r.error)toast(r.error);else toast(r.ok?'手动执行完成':'未执行：'+(r.detail||''));
+    if(r.error)toast(r.error,'error');else toast(r.ok?'手动执行完成':'未执行：'+(r.detail||''),r.ok?'success':'warn');
     refresh(true);
-  }catch(e){$('ppRunMsg').textContent='请求失败: '+e;toast('手动执行失败: '+e)}
+  }catch(e){$('ppRunMsg').textContent='请求失败: '+e;toast('手动执行失败: '+e,'error')}
 }
 async function paperConnectivity(){
   const pre=$('ppConn');pre.textContent='检测中…';
@@ -2804,10 +4011,11 @@ async function paperConnectivity(){
     const body=await r.text();
     let obj=null;try{obj=JSON.parse(body)}catch(e){}
     pre.textContent=r.ok?JSON.stringify(obj,null,2):((obj&&obj.error)?obj.error:('HTTP '+r.status+' '+body));
-    toast(r.ok?(obj&&obj.ok?'连通自检通过':'自检完成'):'连通自检失败');
+    toast(r.ok?(obj&&obj.ok?'连通自检通过':'自检完成'):'连通自检失败',r.ok?'success':'error');
   }catch(e){pre.textContent='连通自检失败: '+e}
 }
 refresh();setInterval(()=>refresh(),4000);
+refreshStatusbar();   // 顶栏首次进入即填充，之后由 15s 定时静默刷新
 </script></body></html>"""
 
 
@@ -2860,6 +4068,22 @@ class Handler(BaseHTTPRequestHandler):
                 self._paper_snapshot()
             elif path == "/api/paper/events":
                 self._paper_events()
+            elif path == "/api/paper/audit":
+                self._paper_audit()
+            elif path == "/api/paper/signal-status":
+                self._paper_signal_status()
+            elif path == "/api/alerts":
+                self._alerts()
+            elif path == "/api/alerts/summary":
+                self._alerts_summary()
+            elif path == "/api/mcp/stats":
+                self._mcp_stats()
+            elif path == "/api/mcp/calls":
+                self._mcp_calls()
+            elif path == "/api/version":
+                self._version()
+            elif path == "/api/version-check":  # /api/version 别名（前端旧路径兼容）
+                self._version()
             else:
                 self._send(404, json.dumps({"error": "not found"}))
         except Exception as exc:
@@ -2884,6 +4108,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._paper_pause()
             elif path == "/api/paper/run-now":
                 self._paper_run_now()
+            elif path == "/api/alerts/clear":
+                self._alerts_clear()
             elif path == "/mcp":
                 self._mcp()
             else:
@@ -2936,13 +4162,20 @@ class Handler(BaseHTTPRequestHandler):
                     "error": {"code": -32700, "message": f"Parse error: {exc}"},
                 }))
                 return
+            start = time.time()
             try:
                 response = mcp_dispatch(msg)
             except Exception as exc:  # noqa: BLE001 - 分发异常转为 JSON-RPC internal error
-                self._send(200, json.dumps({
+                body = json.dumps({
                     "jsonrpc": "2.0", "id": msg.get("id"),
                     "error": {"code": -32603, "message": f"Internal error: {exc}"},
-                }))
+                })
+                capture_mcp_call({
+                    "tool": _mcp_tool_name(msg), "ok": False, "is_error": True,
+                    "elapsed_ms": int((time.time() - start) * 1000),
+                    "bytes": len(body.encode("utf-8")),
+                })
+                self._send(200, body)
                 return
             if response is None:
                 # 通知：无 JSON-RPC 响应，202 空体
@@ -2950,7 +4183,15 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("Content-Length", "0")
                 self.end_headers()
                 return
-            self._send(200, json.dumps(response, ensure_ascii=False))
+            body = json.dumps(response, ensure_ascii=False)
+            is_err = bool(response.get("error")
+                          or (response.get("result") or {}).get("isError"))
+            capture_mcp_call({
+                "tool": _mcp_tool_name(msg), "ok": not is_err, "is_error": is_err,
+                "elapsed_ms": int((time.time() - start) * 1000),
+                "bytes": len(body.encode("utf-8")),
+            })
+            self._send(200, body)
             return
 
         # ===== SSE 流式分支（Accept: text/event-stream 且 pybao_tools 可用）=====
@@ -3011,17 +4252,32 @@ class Handler(BaseHTTPRequestHandler):
                     },
                 })
             )
+            start = time.time()
             try:
                 response = mcp_dispatch(msg)
             except Exception as exc:  # noqa: BLE001 - 分发异常转为 JSON-RPC internal error
-                _sse_frame({
+                err = {
                     "jsonrpc": "2.0", "id": msg.get("id"),
                     "error": {"code": -32603, "message": f"Internal error: {exc}"},
+                }
+                _sse_frame(err)
+                capture_mcp_call({
+                    "tool": _mcp_tool_name(msg), "ok": False, "is_error": True,
+                    "elapsed_ms": int((time.time() - start) * 1000),
+                    "bytes": len(json.dumps(err, ensure_ascii=False).encode("utf-8")),
                 })
                 return
             if response is not None:
                 # 响应 dict → 写事件帧；通知（None）不写结束帧直接返回
                 _sse_frame(response)
+                is_err = bool(response.get("error")
+                              or (response.get("result") or {}).get("isError"))
+                capture_mcp_call({
+                    "tool": _mcp_tool_name(msg), "ok": not is_err, "is_error": is_err,
+                    "elapsed_ms": int((time.time() - start) * 1000),
+                    "bytes": len(json.dumps(response, ensure_ascii=False)
+                                 .encode("utf-8")),
+                })
         finally:
             pybao_tools.clear_progress_hook()
 
@@ -3410,6 +4666,93 @@ class Handler(BaseHTTPRequestHandler):
             "error": None if entry["ok"] else entry["detail"]}, ensure_ascii=False))
 
 
+    # ==================== 运营支撑 API（Phase 4.5：通知中心 / MCP 观测 / 版本检查） ====================
+    # 隐私：告警/MCP 记录不含 apikey；版本接口只回显版本号与 release 链接。
+    def _alerts(self):
+        """GET /api/alerts?limit=N：告警列表（最新在前）。"""
+        q = parse_qs(urlparse(self.path).query)
+        try:
+            limit = int(q.get("limit", ["100"])[0])
+        except (TypeError, ValueError):
+            limit = 100
+        self._send(200, json.dumps({"alerts": _get_alerts().list(limit)},
+                                   ensure_ascii=False))
+
+    def _alerts_summary(self):
+        """GET /api/alerts/summary：告警条数（顶栏红点徽标数据源）。"""
+        self._send(200, json.dumps({"count": _get_alerts().count()},
+                                   ensure_ascii=False))
+
+    def _alerts_clear(self):
+        """POST /api/alerts/clear：清空全部告警（写入 '[]' 保持文件存在）。"""
+        _get_alerts().clear()
+        self._send(200, json.dumps({"msg": "已清空全部告警", "count": 0},
+                                   ensure_ascii=False))
+
+    def _mcp_stats(self):
+        """GET /api/mcp/stats：MCP 调用统计（总调用/成功率/平均耗时/p95/按工具）。"""
+        self._send(200, json.dumps(mcp_stats(), ensure_ascii=False))
+
+    def _mcp_calls(self):
+        """GET /api/mcp/calls?limit=N：最近 MCP 调用（最新在前）。"""
+        q = parse_qs(urlparse(self.path).query)
+        try:
+            limit = int(q.get("limit", ["50"])[0])
+        except (TypeError, ValueError):
+            limit = 50
+        self._send(200, json.dumps({"calls": list_mcp_calls(limit)},
+                                   ensure_ascii=False))
+
+    def _paper_audit(self):
+        """GET /api/paper/audit：模拟盘只读审计报告（mode=ro 读 DATA_DIR/paper.sqlite3）。
+
+        基准曲线用 _paper_benchmark 现取 159915 日K close（网络/数据不可用 → {}，
+        审计其余字段照常返回，绝不写库）。
+        """
+        self._send(200, json.dumps(
+            paper_audit_report(str(DATA_DIR / "paper.sqlite3"),
+                               fetch_benchmark=_paper_benchmark),
+            ensure_ascii=False))
+
+    def _paper_signal_status(self):
+        """GET /api/paper/signal-status：最近交易日信号文件体检（DATA_DIR/emotion/<date>.json）。
+
+        trade_date 取最近交易日（周末/节假日自动向前回退）；信号文件缺失 → 正常返回
+        exists=false（前端降级提示）。
+        """
+        td = _latest_trade_date()
+        self._send(200, json.dumps(
+            signal_status(str(DATA_DIR / "emotion"), td), ensure_ascii=False))
+
+    def _version(self):
+        """GET /api/version：webui 版本 / 镜像引擎 tag / 上游最新 release / stale 提示。
+
+        镜像 tag 取环境变量 IMAGE_TAG（或 STOCKDB_VERSION，Dockerfile 构建时注入，
+        缺省 None → 前端显示 '—'）；stale 用版本三元组比较上游 tag 与当前版本
+        （镜像 tag 未知时回退比 webui 版本）。
+        """
+        upstream = fetch_upstream_release()
+        image_tag = os.environ.get("IMAGE_TAG") or os.environ.get("STOCKDB_VERSION") or None
+        stale = False
+        msg = ""
+        if upstream is not None and upstream.get("tag_name"):
+            up_tag = upstream["tag_name"]
+            cur_src = image_tag if image_tag else WEBUI_VERSION
+            ut = _version_tuple(up_tag)
+            ct = _version_tuple(cur_src)
+            if ut and ct and ut > ct:
+                stale = True
+                msg = (f"上游已发布 {up_tag}（当前{'镜像' if image_tag else '面板'} "
+                       f"{cur_src}），建议升级")
+        self._send(200, json.dumps({
+            "webui": {"version": WEBUI_VERSION},
+            "image": {"tag": image_tag},
+            "upstream": upstream,
+            "stale": stale,
+            "msg": msg,
+        }, ensure_ascii=False))
+
+
 def main():
     print(f"webui listening on 0.0.0.0:{LISTEN_PORT}", file=sys.stderr)
     print(f"stockdb: {STOCKDB_HOST}:{STOCKDB_PORT}（同容器进程）| data: {DATA_DIR}", file=sys.stderr)
@@ -3420,6 +4763,7 @@ def main():
         print(f"paper: 模块缺失，页签降级：{PAPER_IMPORT_ERROR}", file=sys.stderr)
     threading.Thread(target=scheduler_loop, daemon=True).start()
     threading.Thread(target=paper_scheduler_loop, daemon=True).start()  # 模拟盘调度（2s 轮询，独立线程）
+    threading.Thread(target=ops_watchdog_loop, daemon=True).start()     # 运营支撑看门狗（告警生产接线）
     ThreadingHTTPServer(("0.0.0.0", LISTEN_PORT), Handler).serve_forever()
 
 
