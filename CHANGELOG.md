@@ -3,6 +3,12 @@
 本项目面板版本号 = `WEBUI_VERSION`（`docker/webui/app.py`），镜像 tag 跟随上游引擎版本。
 发布纪律见 `docs/webui-spa/release-policy.md`；部署记录见 `docs/DEPLOYMENTS.md`。
 
+## [0.8.6] — 2026-08-15（mydb 存值类型修复）
+- 修复：打板全链路 mydb_write 存了 JSON 字符串，pybao 只认原生对象 → 实际存成空
+  （回填"成功"但序列/指标读出 {} 即此因）
+- 全部改存原生 dict；读取侧（清单/序列/指标/MCP 合并）本就兼容双形态
+- 部署后重跑一次回填即得真实序列；Python 177 全绿
+
 ## [0.8.5] — 2026-08-15（打板工具全扫路径补节流）
 - 修复同类问题：get_board_open_effect_history 的全市场拉取路径自带 16 线程无节流池
   （与 query_point_snapshot 同因的端口耗尽风险）；统一 8 并发 + 50ms 节流

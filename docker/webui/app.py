@@ -79,7 +79,7 @@ _last_verify_result: str | None = None  # 最近一次完整性验证结果（pa
 _scheduler_alive = False             # 定时线程心跳（每次循环更新时间戳）
 _scheduler_heartbeat = 0.0           # 定时线程最近一次心跳时间戳（unix）
 _webui_started = time.time()         # webui 进程启动时间戳
-WEBUI_VERSION = "0.8.5"
+WEBUI_VERSION = "0.8.6"
 
 HISTORY_FILE = DATA_DIR / "sync_history.json"
 SCHEDULE_FILE = DATA_DIR / "sync_schedule.json"
@@ -2679,8 +2679,7 @@ def _auction_series_write(key: str, value) -> None:
 
     value 可能是 dict（append_series 组装完整载荷）或 str，统一序列化后落库。
     """
-    payload = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
-    mydb_write(key, [("series", payload)])
+    mydb_write(key, [("series", value)])  # 0.8.6：pybao 存原生 dict
 
 
 def _auction_load_codes(trade_date: str) -> list[str]:
@@ -2752,7 +2751,7 @@ def auction_run_collect() -> dict:
             row["known_at"] = f"{today[:4]}-{today[4:6]}-{today[6:8]}T09:25:00"  # 业务口径：9:25 竞价=开盘
             row["diff_pct"] = None             # 对账后回填
             row["reconciled_at"] = None
-            items.append((str(snap["code"]), json.dumps(row, ensure_ascii=False)))
+            items.append((str(snap["code"]), row))  # 0.8.6：pybao 存原生 dict，不存 JSON 字符串
         if items:                              # 空 items 时 mydb_write 会抛 ValueError
             mydb_write(f"竞价快照:{today}", items)
 
@@ -2762,7 +2761,7 @@ def auction_run_collect() -> dict:
         payload = _auction_build_payload(ok_items, series_by,
                                          computed_at=_now_iso(), value_source="auction")
         mydb_write(_auction_metrics_key(today),
-                   [("metrics", json.dumps(payload, ensure_ascii=False))])
+                   [("metrics", payload)])  # 原生 dict
         log(f"📊 打板竞价采集（{today}）: {len(ok_items)} 只快照（errors={len(errors)}），"
             f"premium_mean={metrics.get('premium_mean')}, n={metrics.get('n_samples')}")
         return {"ok": True, "collected": len(ok_items), "errors_count": len(errors),
@@ -2812,7 +2811,7 @@ def auction_run_close() -> dict:
                         "computed_at": _now_iso(),
                         "contract": "limitup-non-yizi-v1"}
         mydb_write(_auction_list_key(tomorrow),
-                   [("list", json.dumps(list_payload, ensure_ascii=False))])
+                   [("list", list_payload)])
 
         # ③ 对账：今日 09:26 竞价快照 vs 今日 K线开盘价（口径偏差长期监测）
         snap_res = mydb_read(f"竞价快照:{today}", "")
@@ -2837,7 +2836,7 @@ def auction_run_close() -> dict:
             row["state"] = "reconciled"            # 生命周期终态：对账结论 + 竞价证据
             row["diff_pct"] = diff_pct
             row["reconciled_at"] = _now_iso()
-            reconcile_items.append((str(code), json.dumps(row, ensure_ascii=False)))
+            reconcile_items.append((str(code), row))  # 原生 dict
             reconciled += 1
             if diff_pct is not None and abs(diff_pct) > 0.005:   # ±0.5% 口径偏差阈值
                 diff_alerts += 1
@@ -2873,7 +2872,7 @@ def auction_run_close() -> dict:
         payload = _auction_build_payload(snapshots, series_by,
                                          computed_at=_now_iso(), value_source="kline")
         mydb_write(_auction_metrics_key(today),
-                   [("metrics", json.dumps(payload, ensure_ascii=False))])
+                   [("metrics", payload)])  # 原生 dict
         log(f"📊 打板收口对账（{today}）: 明日清单 {len(listing.get('codes') or [])} 只，"
             f"对账 {reconciled} 条（偏差告警 {diff_alerts}），"
             f"premium_mean={metrics.get('premium_mean')}")
@@ -2946,7 +2945,7 @@ def auction_run_backfill(days: int = 60) -> dict:
                        "computed_at": _now_iso(), "value_source": "kline",
                        "contract": "auction-metric-v1"}
             mydb_write(_auction_metrics_key(d),
-                       [("metrics", json.dumps(payload, ensure_ascii=False))])
+                       [("metrics", payload)])  # 原生 dict
             for metric in AUCTION_METRICS:
                 if m.get(metric) is not None:
                     all_vals[metric].append(m[metric])
@@ -2959,7 +2958,7 @@ def auction_run_backfill(days: int = 60) -> dict:
                    "window": 60, "contract": "auction-metric-v1",
                    "updated_at": _now_iso(), "source": "backfill-kline"}
             mydb_write(_auction_series_key(metric),
-                       [("series", json.dumps(seq, ensure_ascii=False))])
+                       [("series", seq)])  # 原生 dict
             series_result[metric] = len(vals)
         return {"ok": True, "backfilled_days": len(rows), "series": series_result}
     except Exception as exc:  # noqa: BLE001 - 单块降级
