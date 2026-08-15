@@ -72,7 +72,7 @@
         <h3 class="card-title">状态总览</h3>
 
         <!-- 同步管道横幅：正在同步 → 进度条 + 阶段；空闲 → 最近一次结果 -->
-        <div v-if="status.sync_running" class="sync-banner">
+        <div v-if="status?.sync_running" class="sync-banner">
           <el-progress
             :percentage="phasePct"
             :stroke-width="14"
@@ -108,7 +108,7 @@
             {{ status.container?.image || '—' }}
           </el-descriptions-item>
           <el-descriptions-item label="数据源" :span="1">
-            {{ status.source || '—' }}
+            {{ status?.source || '—' }}
           </el-descriptions-item>
         </el-descriptions>
 
@@ -118,8 +118,8 @@
                本页不必重复请求；≤1 正常 / 2 警告 / >2 错误） -->
           <StatCard
             label="数据最新"
-            :value="status.data_latest ? fmtYMD(status.data_latest) : '—'"
-            :sub="`镜像 ${status.mirror || '—'}`"
+            :value="status?.data_latest ? fmtYMD(status?.data_latest) : '—'"
+            :sub="`镜像 ${status?.mirror || '—'}`"
             :tone="freshTone"
           />
           <!-- 全市场标的数量：code_stats{stock,etf,other} 由后端 15s 缓存兜底 -->
@@ -141,15 +141,15 @@
           />
           <StatCard
             label="定时调度器"
-            :value="status.scheduler_alive ? '运行中' : '已停止'"
-            :tone="status.scheduler_alive ? 'ok' : 'err'"
+            :value="status?.scheduler_alive ? '运行中' : '已停止'"
+            :tone="status?.scheduler_alive ? 'ok' : 'err'"
             sub="scheduler_alive（后台线程心跳）"
           />
           <!-- 今日是否交易日：仅提示用，不影响操作 -->
           <StatCard
             label="今日交易日"
-            :value="status.trading_today ? '是' : '否'"
-            :tone="status.trading_today ? 'ok' : 'warn'"
+            :value="status?.trading_today ? '是' : '否'"
+            :tone="status?.trading_today ? 'ok' : 'warn'"
             sub="trading_today（定时按此跳过休市）"
           />
         </div>
@@ -203,7 +203,7 @@
             type="primary"
             :icon="VideoPlay"
             :loading="syncBusy"
-            :disabled="status.sync_running"
+            :disabled="!!status?.sync_running"
             @click="doSync(true)"
           >
             立即热更新
@@ -212,12 +212,12 @@
             type="warning"
             :icon="SwitchButton"
             :loading="syncBusy"
-            :disabled="status.sync_running"
+            :disabled="!!status?.sync_running"
             @click="doSync(false)"
           >
             停服严格同步
           </el-button>
-          <span v-if="status.sync_running" class="hint">同步进行中，按钮已禁用（后端锁保证串行）</span>
+          <span v-if="status?.sync_running" class="hint">同步进行中，按钮已禁用（后端锁保证串行）</span>
         </div>
       </section>
 
@@ -605,9 +605,9 @@ async function loadSchedule() {
     if (data?.schedule) {
       schedule.value = data.schedule
       if (!schDirty.value) {
-        schEnabled.value = !!data.schedule.enabled
-        schTimes.value = data.schedule.times || []
-        schTrading.value = data.schedule.trading_only !== false
+        schEnabled.value = !!data.schedule?.enabled
+        schTimes.value = data.schedule?.times || []
+        schTrading.value = data.schedule?.trading_only !== false
       }
     }
   } catch (e) {
@@ -694,7 +694,7 @@ async function saveSch() {
     // 后端返回最新 schedule，直接同步回来（含 next_trigger 等派生字段）
     if (r?.schedule) {
       schedule.value = r.schedule
-      schEnabled.value = !!r.schedule.enabled
+      schEnabled.value = !!r.schedule?.enabled
       schTimes.value = r.schedule.times || []
       schTrading.value = r.schedule.trading_only !== false
     }
