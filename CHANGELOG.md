@@ -3,6 +3,10 @@
 本项目面板版本号 = `WEBUI_VERSION`（`docker/webui/app.py`），镜像 tag 跟随上游引擎版本。
 发布纪律见 `docs/webui-spa/release-policy.md`；部署记录见 `docs/DEPLOYMENTS.md`。
 
+## [0.7.1] — 2026-08-15（打包修复）
+- 修复：Dockerfile 遗漏 COPY auction_collect/auction_metrics/auction_list → 镜像内 ModuleNotFoundError
+- CI 加固：verify-pybao job 在镜像内同时 import 三个采集模块（打包缺口从源头拦截）
+
 ## [0.7.0] — 2026-08-15（打板竞价采集：数据基座首个自取能力）
 - 新增打板竞价采集链路（设计：docs/design/auction-collector.md）：
   - 采集器 auction_collect.py：腾讯主源批量（≤50/批、限流 1req/s）+ 东财备源降级，9:25 竞价价=当日开盘价口径
