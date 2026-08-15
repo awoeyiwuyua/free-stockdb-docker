@@ -132,7 +132,7 @@ docker/webui/
 
 ## 6. 信息架构（治"杂"的核心设计）
 
-### 6.1 侧边栏分组（5 页签 → 4 组 9 页）
+### 6.1 侧边栏分组（5 页签 → 4 组 10 页）
 
 | 分组 | 页面（路由） | 内容 | 来源 |
 |---|---|---|---|
@@ -261,3 +261,7 @@ COPY webui/static/legacy/ /opt/webui/static/legacy/
 - [x] M0：spa/ 脚手架、app.py 静态服务（SPA 回退 + /legacy + WEBUI_UI + /api/overview）、
       Dockerfile 多阶段（node:22-alpine 构建期）、CI 新 job（test-spa + ops/paper 并入）、
       229 Python 测试 + 9 前端测试全绿、端到端冒烟通过。导读见 `docs/webui-spa/guide-m0.md`。
+- [x] M1：布局基座（SideNav 分组导航 + StatusBar 顶栏状态条 + App 轮询/失焦降频）、
+      Pinia 全局 store（/api/overview 单一数据源）、深色/浅色主题（localStorage 持久化）、
+      StatCard/EmptyState/ThemeToggle 组件、nav.js 路由与侧边栏同源、
+      前端测试 18 例全绿 + Python 229 全绿 + 端到端冒烟通过。导读见 `docs/webui-spa/guide-m1.md`。
