@@ -1372,6 +1372,42 @@ def _point_snapshot_item(code: str, bar: dict) -> dict:
     }
 
 
+def _fullmarket_sdk_outcomes(codes: list[str], date: str):
+    """全市场单日 bars 批量快路径（0.8.7）：SDK pipeline，一次往返取整批。
+
+    替代 5200 次逐只 HTTP（回填 45min → 秒级）。分块 1000 只/批防单响应过大；
+    缺失代码补一轮重试（一次往返）；SDK 不可用/失败 → 返回 None 由调用方回退 HTTP。
+    """
+    if pybao_tools is None:
+        return None
+    try:
+        sdk = pybao_tools.get_sdk_client()
+    except Exception:  # noqa: BLE001 - SDK 不可用回退
+        return None
+    if sdk is None or not hasattr(sdk, "get_data"):
+        return None
+
+    bars: dict[str, dict] = {}
+
+    def _pull(chunk: list[str]) -> None:
+        data = sdk.get_data(chunk, start=date, end=date, fq=None) or {}
+        for c, recs in data.items():
+            recs = [r for r in (recs or []) if isinstance(r, dict)]
+            if recs:
+                bars[str(c)] = recs[-1]  # 单日区间，取最后一条
+
+    try:
+        for i in range(0, len(codes), 1000):
+            _pull(codes[i:i + 1000])
+        missing = [c for c in codes if str(c) not in bars]
+        if missing:  # 补一轮重试（一次往返），瞬态缺失自愈
+            for i in range(0, len(missing), 1000):
+                _pull(missing[i:i + 1000])
+        return [(c, bars.get(str(c)), None) for c in codes]
+    except Exception:  # noqa: BLE001 - 批路径失败整体回退 HTTP
+        return None
+
+
 def query_point_snapshot(args: dict) -> dict:
     """指定交易日单日时点快照（纯 HTTP，无 pybao 依赖）。
 
@@ -1441,14 +1477,7 @@ def query_point_snapshot(args: dict) -> dict:
     universe_set = _a_share_universe_set()
     latest = _latest_trade_date()
 
-    # 全市场扫描连接卫生（0.8.4）：5000+ 只/次、每只一个新 TCP 连接，无节流会
-    # 快速耗尽 NAS 临时端口（实测 Errno 99 Cannot assign requested address）。
-    # 8 并发 + 每请求 50ms 节流 ≈ 160 req/s，TIME_WAIT 存量远低于端口池上限。
-    _SNAPSHOT_PACING = 0.05
-
     def fetch_one(code: str) -> tuple[str, dict | None, str | None]:
-        if not explicit:
-            time.sleep(_SNAPSHOT_PACING)  # 仅全市场路径节流；显式小清单不需要
         try:
             return code, _bar_from_get(_http_get("get", f"日k:{code}:{date}")), None
         except Exception as exc:  # noqa: BLE001 - 单只失败保留诊断，不影响整体
@@ -1457,11 +1486,21 @@ def query_point_snapshot(args: dict) -> dict:
     if explicit:
         outcomes = [fetch_one(code) for code in requested]
     else:
-        outcomes = []
-        with ThreadPoolExecutor(max_workers=8) as pool:
-            futures = {pool.submit(fetch_one, code): code for code in requested}
-            for future in as_completed(futures):
-                outcomes.append(future.result())
+        # 全市场批量快路径（0.8.7）：SDK pipeline 一次往返取全市场单日 bars，
+        # 替代 5200 次逐只 HTTP（回填 45min → 秒级）。SDK 不可用 → 回退逐只 HTTP。
+        outcomes = _fullmarket_sdk_outcomes(requested, date)
+        if outcomes is None:
+            # 回退路径连接卫生（0.8.4）：8 并发 + 每请求 50ms 节流 ≈ 160 req/s，
+            # 防 5200 条新连接耗尽 NAS 临时端口（Errno 99 事故）。
+            def fetch_one_paced(code: str):
+                time.sleep(0.05)
+                return fetch_one(code)
+
+            outcomes = []
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                futures = {pool.submit(fetch_one_paced, code): code for code in requested}
+                for future in as_completed(futures):
+                    outcomes.append(future.result())
 
     points: list[dict] = []
     errors: list[dict] = []
