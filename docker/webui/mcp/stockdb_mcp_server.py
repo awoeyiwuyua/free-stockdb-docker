@@ -1397,12 +1397,14 @@ def _fullmarket_sdk_outcomes(codes: list[str], date: str):
                 bars[str(c)] = recs[-1]  # 单日区间，取最后一条
 
     try:
-        for i in range(0, len(codes), 1000):
-            _pull(codes[i:i + 1000])
+        # 分块 50：实测 pybao pipeline 单次响应上限 50 条（0.8.8 修复——
+        # 块 1000 时每天只返回 50 只，涨停清单大范围漏检）。
+        for i in range(0, len(codes), 50):
+            _pull(codes[i:i + 50])
         missing = [c for c in codes if str(c) not in bars]
         if missing:  # 补一轮重试（一次往返），瞬态缺失自愈
-            for i in range(0, len(missing), 1000):
-                _pull(missing[i:i + 1000])
+            for i in range(0, len(missing), 50):
+                _pull(missing[i:i + 50])
         return [(c, bars.get(str(c)), None) for c in codes]
     except Exception:  # noqa: BLE001 - 批路径失败整体回退 HTTP
         return None
@@ -1461,10 +1463,10 @@ def query_point_snapshot(args: dict) -> dict:
         requested = sorted(_a_share_universe_set())
 
     try:
-        limit = int(
-            args.get("limit", _POINT_SNAPSHOT_DEFAULT_LIMIT)
-            or _POINT_SNAPSHOT_DEFAULT_LIMIT
-        )
+        raw_limit = args.get("limit", _POINT_SNAPSHOT_DEFAULT_LIMIT)
+        # 注意：不能用 `raw or 默认值`——显式传 0（内部全量语义）会被 or 吞成默认 50，
+        # 0.8.3 的全量修复因此从未生效（0.8.8 修复）。
+        limit = int(raw_limit) if raw_limit not in (None, "") else _POINT_SNAPSHOT_DEFAULT_LIMIT
     except (TypeError, ValueError):
         raise ValueError("get_point_snapshot: limit 必须是整数") from None
     if limit < 0:

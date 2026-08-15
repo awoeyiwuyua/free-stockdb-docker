@@ -2148,7 +2148,7 @@ if __name__ == "__main__":
 class _SnapshotPacingTests(unittest.TestCase):
     """0.8.7 全市场快照双路径：SDK 批量快路径 + HTTP 回退（节流/全量契约）。"""
 
-    CODES = [f"6000{i:02d}" for i in range(20)]
+    CODES = [f"6000{i:02d}" for i in range(60)]  # 60 只 > 截断上限 50：让截断 bug 无所遁形
     BAR = {"date": 20260814, "open": 10.0, "pre_close": 10.0, "close": 11.0,
            "high": 11.0, "low": 9.9, "volume": 100, "amount": 1000, "is_st": False}
 
@@ -2169,10 +2169,10 @@ class _SnapshotPacingTests(unittest.TestCase):
         with self._patch_universe(), \
              mock.patch.object(server.pybao_tools, "get_sdk_client", return_value=FakeSDK()):
             result = server.query_point_snapshot({"date": "20260814", "limit": 0})
-        self.assertEqual(len(result["points"]), 20)
+        self.assertEqual(len(result["points"]), 60)  # limit=0 必须全量，不截断
         self.assertFalse(result["truncated"])
         self.assertTrue(all(kw.get("fq") is None for kw in calls))   # 原始价口径
-        self.assertEqual(len(calls), 1)                              # 一批一次往返（20 只 < 1000）
+        self.assertGreaterEqual(len(calls), 2)                       # 60 只分两块（50+10）                              # 一批一次往返（20 只 < 1000）
 
     def test_sdk_unavailable_falls_back_with_pacing(self):
         """SDK 不可用 → HTTP 回退：每请求 50ms 节流 + 全量不截断。"""
@@ -2181,8 +2181,8 @@ class _SnapshotPacingTests(unittest.TestCase):
              mock.patch.object(server, "_http_get", return_value=self.BAR), \
              mock.patch.object(server.time, "sleep") as m_sleep:
             result = server.query_point_snapshot({"date": "20260814", "limit": 0})
-        self.assertEqual(m_sleep.call_count, 20)      # 每只一次节流
-        self.assertEqual(len(result["points"]), 20)
+        self.assertEqual(m_sleep.call_count, 60)      # 每只一次节流
+        self.assertEqual(len(result["points"]), 60)
         self.assertFalse(result["truncated"])
 
 
