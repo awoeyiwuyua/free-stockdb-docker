@@ -14,9 +14,6 @@ jobs:
   python-tests:
     name: Python 单测（离线）
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      issues: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -32,18 +29,7 @@ jobs:
 
       - name: Run ops unit tests
         working-directory: docker/webui
-        run: |
-          python -m unittest test_ops -v > /tmp/ops.log 2>&1 || true
-          if grep -qE '^(FAIL|ERROR):' /tmp/ops.log; then
-            exit 1
-          fi
-
-      - name: Upload ops log (diagnostic)
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: ops-log-diagnose
-          path: /tmp/ops.log
+        run: python -m unittest test_ops -v
 
       - name: Run auction collector tests
         working-directory: docker/webui

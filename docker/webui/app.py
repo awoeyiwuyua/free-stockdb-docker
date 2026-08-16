@@ -1377,9 +1377,19 @@ def run_sync(hot: bool = True, trigger: str = "manual", retry: bool = False) -> 
         _sync_lock.release()
 
 
+def _sync_log_path() -> "Path":
+    """同步日志路径：动态读 DATA_DIR（测试/部署可 patch，0.9.0 修复——
+
+    旧实现用 import 时求值的模块常量 SYNC_LOG，测试 patch DATA_DIR 后 log() 仍
+    写默认 /data（CI Linux 不可写 → PermissionError 污染被测路径）。
+    """
+    return Path(DATA_DIR) / "sync.log"
+
+
 def log(line: str) -> None:
-    SYNC_LOG.parent.mkdir(parents=True, exist_ok=True)
-    with SYNC_LOG.open("a", encoding="utf-8") as fh:
+    p = _sync_log_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with p.open("a", encoding="utf-8") as fh:
         fh.write(f"{now()}  {line}\n")
 
 
@@ -1388,9 +1398,10 @@ def now() -> str:
 
 
 def tail_log(n: int = 200) -> str:
-    if not SYNC_LOG.exists():
+    p = _sync_log_path()
+    if not p.exists():
         return "（暂无同步日志）"
-    lines = SYNC_LOG.read_text(encoding="utf-8", errors="replace").splitlines()
+    lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
     return "\n".join(lines[-n:])
 
 
