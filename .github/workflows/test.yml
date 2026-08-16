@@ -34,7 +34,7 @@ jobs:
         working-directory: docker/webui
         run: |
           python -m unittest test_ops -v > /tmp/ops.log 2>&1 || true
-          python .github/scripts/ci_diagnose.py
+          python ../../.github/scripts/ci_diagnose.py
           if grep -qE '^(FAIL|ERROR):' /tmp/ops.log; then
             exit 1
           fi
