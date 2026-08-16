@@ -280,6 +280,26 @@ class _MydbRdTests(_OpsTestCase):
         self.assertEqual(r["readback"], [{"v": 1}, {"v": 2}])
         self.assertEqual(rd.data[("t", "k1")], {"v": 1})
 
+    def test_write_nan_inf_guardrail(self):
+        """0.9.4 写前护栏：NaN/Inf 条目剔除计数，不落盘；全拦截 → ValueError。"""
+        rd = _FakeRd()
+        app._mydb_rd._rd = rd
+        self.addCleanup(app._mydb_rd_reset)
+        # 部分拦截：NaN 行剔除，正常行落盘
+        r = app.mydb_write("t", [("k1", {"v": 1}),
+                                 ("bad", {"open": float("nan")}),
+                                 ("bad2", {"close": float("inf")})])
+        self.assertEqual(r["written"], 1)
+        self.assertEqual(r["skipped_invalid"], 2)
+        self.assertIn(("t", "k1"), rd.data)
+        self.assertNotIn(("t", "bad"), rd.data)
+        self.assertNotIn(("t", "bad2"), rd.data)
+        # 嵌套 NaN 同样拦截；全部拦截 → ValueError
+        with self.assertRaises(ValueError):
+            app.mydb_write("t", [("k2", {"rows": [{"open": float("nan")}]})])
+        with self.assertRaises(ValueError):
+            app.mydb_write("t", [("k3", {"v": float("nan")})])
+
     def test_concurrent_reads_serialized(self):
         """多线程并发读 → 锁保证同一时刻至多一条 rd 请求（单连接防交错）。"""
         active, max_active = [], [0]
