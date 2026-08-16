@@ -3019,18 +3019,27 @@ def auction_run_close() -> dict:
         #    在除权除息日为调整昨收，混入分红会失真）
         codes = _auction_load_codes(today) or [str(c) for c in (snap_res.get("values") or {})]
         prev_close_by_code = _auction_lag_close(prev_points)
+        missing_open = 0  # 0.9.0 M1 边界 c：清单股取不到 (open, prev_close) 有效对
         if codes:
             code_set = set(codes)
             snapshots = [{"code": p["code"], "open_price": p.get("open"),
                           "prev_close": prev_close_by_code.get(str(p.get("code")))}
                          for p in points if str(p.get("code")) in code_set]
+            # 守恒：候选 = n_samples + missing_open_count（无 bar / open 缺失 /
+            # T-1 无收盘均计 missing_open；0.9.0 之前静默丢弃）
+            missing_open = len(code_set) - sum(
+                1 for s in snapshots
+                if s["open_price"] is not None and s["prev_close"] is not None)
+            snapshots = [s for s in snapshots
+                         if s["open_price"] is not None and s["prev_close"] is not None]
         else:
             snapshots = [{"code": p["code"], "open_price": p.get("open"),
                           "prev_close": prev_close_by_code.get(str(p.get("code")))}
                          for p in points]
-        # 防御：清单股在 T-1 无收盘（异常）→ 剔除，避免 None 分母进指标
-        snapshots = [s for s in snapshots if s["prev_close"] is not None]
+            # 兜底全市场路径无候选语义：prev_close 缺失防御剔除（0.8.13 语义不变）
+            snapshots = [s for s in snapshots if s["prev_close"] is not None]
         metrics = _auction_compute_metrics(snapshots)
+        metrics = {**metrics, "missing_open_count": missing_open}
         series_by = {}
         for m in AUCTION_METRICS:
             value = metrics.get(m)
@@ -3108,6 +3117,7 @@ def auction_run_backfill(days: int = 60) -> dict:
             # 在除权除息日为交易所调整昨收，会混入分红使溢价失真，不可用作分母）
             prev_close_by_code = {str(p.get("code")): p.get("close") for p in pts1}
             snaps = []
+            missing_open = 0  # 0.9.0 M1 边界 c：板日涨停但指标日无有效 (open, prev_close)
             if codes:
                 # 溢价日只查清单股（免全扫）；清单可能 >200 只 → 分块拉取（0.8.9）
                 pts_t = _auction_points_for_codes(t, codes)
@@ -3118,7 +3128,10 @@ def auction_run_backfill(days: int = 60) -> dict:
                     if p and p.get("open") is not None and prev_close is not None:
                         snaps.append({"code": c, "open_price": p.get("open"),
                                       "prev_close": prev_close})
+                    else:
+                        missing_open += 1  # 守恒：候选 = n_samples + missing_open_count
             m = _auction_compute_metrics(snaps)
+            m = {**m, "missing_open_count": missing_open}
             if m["n_samples"] > 0:
                 rows.append((t, m))
             t = t1

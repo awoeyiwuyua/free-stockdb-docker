@@ -1082,10 +1082,12 @@ class _AuctionBackfillTests(_OpsTestCase):
     """
 
     POINTS = {
-        # 0813：Z 当日涨停（供 0814 清单）+ Y 溢价点（open 9.5；prev_close=999 毒值——
+        # 0813：Z 当日涨停（供 0814 清单）+ 600005 当日涨停但 0814 无 bar
+        # （0.9.0 边界 c：missing_open 计数样本）+ Y 溢价点（open 9.5；prev_close=999 毒值——
         # 0.8.13 起分母改用 T-1 收盘 11.0，毒值用于证明未回退到 pre_close 字段）
         "20260813": [
             {"code": "600004", "open": 10.5, "close": 11.0, "prev_close": 10.0, "is_st": False, "status": "TRADED"},
+            {"code": "600005", "open": 10.5, "close": 11.0, "prev_close": 10.0, "is_st": False, "status": "TRADED"},
             {"code": "600003", "open": 9.5, "prev_close": 999.0},
         ],
         # 0812：Y 当日涨停（供 0813 清单）+ X 溢价点（open 12.1 → 12.1/11.0-1=+10%）
@@ -1184,6 +1186,55 @@ class _AuctionBackfillTests(_OpsTestCase):
         first = self._load_series("premium_mean")
         app.auction_run_backfill(days=3)
         self.assertEqual(self._load_series("premium_mean"), first)
+
+    def test_backfill_missing_open_counted(self):
+        """0.9.0 边界 c：板日涨停但指标日无 bar → missing_open_count 计数且守恒
+        （候选 = n_samples + missing_open_count；指标值不变）。"""
+        r = app.auction_run_backfill(days=3)
+        self.assertTrue(r["ok"], r)
+        # 0814 指标日：0813 候选 = 600004（有溢价点）+ 600005（无 bar）
+        d = self._metrics("20260814")
+        m = d["metrics"]
+        self.assertEqual(m["n_samples"], 1)              # 只有 600004 有有效对
+        self.assertEqual(m["missing_open_count"], 1)     # 600005 无 bar → 计数（0.9.0 前静默丢弃）
+        self.assertEqual(m["n_samples"] + m["missing_open_count"], 2)  # 守恒
+        # 指标值不受影响：0814 premium_mean 仍 = 600004 的 0%
+        self.assertAlmostEqual(m["premium_mean"], 0.0)
+        self.assertEqual(self._load_series("premium_mean")[-1], 0.0)
+        # 无缺口日：0813 指标日（候选 = 600002 唯一，有溢价点）missing_open=0
+        d13 = self._metrics("20260813")
+        self.assertEqual(d13["metrics"]["missing_open_count"], 0)
+
+    def test_close_missing_open_counted(self):
+        """0.9.0 边界 c（收口路径）：清单股指标日无 bar → missing_open_count 守恒。"""
+        today = datetime.date.today().strftime("%Y%m%d")
+        prev_day = app._auction_prev_trade_date(today)
+
+        def fake_close_snapshot(args):
+            d = args.get("date")
+            if d == today:
+                return {"points": [
+                    {"code": "600004", "open": 11.0, "close": 11.5, "prev_close": 10.0,
+                     "is_st": False, "status": "TRADED"},
+                ]}
+            if d == prev_day:
+                return {"points": [
+                    {"code": "600004", "open": 10.0, "close": 10.5, "prev_close": 10.0,
+                     "is_st": False, "status": "TRADED"},
+                ]}
+            return {"points": []}
+
+        with mock.patch.object(app, "data_latest_date", return_value=today), \
+             mock.patch.object(app, "_auction_query_snapshot", side_effect=fake_close_snapshot):
+            # 预置今日清单：候选 = 600004（有溢价点）+ 600005（指标日无 bar）
+            self.store[f"清单:{today}:limitup_non_yizi"] = {
+                "list": {"codes": ["600004", "600005"]}}
+            r = app.auction_run_close()
+            self.assertTrue(r["ok"], r)
+            metrics = r["metrics"] or {}
+            self.assertEqual(metrics["n_samples"], 1)
+            self.assertEqual(metrics["missing_open_count"], 1)
+            self.assertEqual(metrics["n_samples"] + metrics["missing_open_count"], 2)
 
     def test_route_backfill(self):
         """POST /api/auction/run {"task":"backfill","days":3} → 200 异步启动，后台完成后状态落库。"""
