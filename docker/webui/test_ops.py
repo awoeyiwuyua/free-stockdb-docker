@@ -59,6 +59,11 @@ from pathlib import Path
 from unittest import mock
 
 import app                       # 生产实现（被测对象）
+import config                    # 配置单一入口（0.9.1）
+from ops import alerts as ops_alerts  # 告警中心（0.9.2 批次 2 迁 ops/alerts.py）
+from storage.providers import free_stockdb as free_stockdb_mod  # 引擎闸口（批次 3）
+from storage.providers import mydb_store as mydb_store_mod      # mydb 读写（批次 3）
+from services import auction_tasks as auction_tasks_mod          # 打板用例（批次 4）
 
 # 静默 stdlib 无害噪声：urllib 探测非 2xx 时抛出的 HTTPError 内持临时文件，
 # 对象被 GC 时 tempfile 模块发出的 ResourceWarning（本模块主动吞异常是预期行为）。
@@ -81,16 +86,19 @@ class _OpsTestCase(unittest.TestCase):
         # 回收，必须全局保持屏蔽）。
         warnings.filterwarnings("ignore", category=ResourceWarning)
         self.tmp = tempfile.mkdtemp(prefix="test_ops_")
-        # 打补丁 app.DATA_DIR 到临时目录：被测函数全部读模块全局 DATA_DIR
-        #（Alerts 单例 / mcp jsonl / 审计 / 信号目录），保证离线、无残留、互不影响。
+        # 打补丁 DATA_DIR 到临时目录（app + config 双入口，0.9.2 批次 2 起告警/日志
+        # 实现迁 ops/ 并读 config.DATA_DIR）：被测函数全部隔离，保证离线、无残留。
         self._data_patch = mock.patch.object(app, "DATA_DIR", Path(self.tmp))
+        self._data_patch_config = mock.patch.object(config, "DATA_DIR", Path(self.tmp))
         self._data_patch.start()
+        self._data_patch_config.start()
         self.addCleanup(self._reset)
 
     def _reset(self):
         self._data_patch.stop()
-        # 复位 app 模块全局态：告警单例 / MCP 内存 deque 与加载标记 / 版本探针缓存
-        app._alerts_singleton = None
+        self._data_patch_config.stop()
+        # 复位模块全局态：告警单例（ops.alerts）/ MCP 内存 deque 与加载标记 / 版本探针缓存
+        ops_alerts._alerts_singleton = None
         app._mcp_deque.clear()
         app._mcp_loaded = False
         app._mcp_file_lines = 0
@@ -180,7 +188,8 @@ class _LimitReferenceTests(_OpsTestCase):
         pts = [{"code": "600000", "name": "X", "open": 4.6, "close": 4.72,
                 "prev_close": 4.207, "high": 4.72, "low": 4.6,
                 "is_st": False, "status": "TRADED"}]
-        with mock.patch("mcp.pybao_tools.is_fq_event_date", return_value=False):
+        # 0.9.2 批次 4：除权判定走服务层注入点 is_fq_event
+        with mock.patch.object(auction_tasks_mod, "is_fq_event", return_value=False):
             fixed = app._auction_apply_reference(pts, "20260507", {"600000": 4.289})
         self.assertAlmostEqual(fixed[0]["prev_close"], 4.289)
         from auction_list import compute_limitup_list
@@ -194,19 +203,19 @@ class _LimitReferenceTests(_OpsTestCase):
         pts = [{"code": "000100", "name": "X", "open": 4.6, "close": 4.72,
                 "prev_close": 4.58, "high": 4.72, "low": 4.6,
                 "is_st": False, "status": "TRADED"}]
-        with mock.patch("mcp.pybao_tools.is_fq_event_date", return_value=True):
+        with mock.patch.object(auction_tasks_mod, "is_fq_event", return_value=True):
             fixed = app._auction_apply_reference(pts, "20260611", {"000100": 9.99})
         self.assertEqual(fixed[0]["prev_close"], 4.58)  # 原样保留
 
     def test_apply_reference_fallback(self):
         """lag 缺失（停牌跨日）/SDK 不可用 → 原值兜底。"""
         pts = [{"code": "600000", "prev_close": 10.0, "close": 11.0}]
-        with mock.patch("mcp.pybao_tools.is_fq_event_date", return_value=False):
+        with mock.patch.object(auction_tasks_mod, "is_fq_event", return_value=False):
             # lag 缺失 → 原值
             self.assertEqual(app._auction_apply_reference(pts, "20260507", {}), pts)
             # SDK 异常 → 原值
-            with mock.patch("mcp.pybao_tools.is_fq_event_date",
-                            side_effect=RuntimeError("boom")):
+            with mock.patch.object(auction_tasks_mod, "is_fq_event",
+                                   side_effect=RuntimeError("boom")):
                 self.assertEqual(app._auction_apply_reference(pts, "20260507",
                                                               {"600000": 9.0}), pts)
 
@@ -319,7 +328,8 @@ class _MydbRdTests(_OpsTestCase):
         self.assertIsNone(app._mydb_rd._rd)  # 缓存已丢弃（自愈前提）
         fake_mod = mock.Mock()
         fake_mod.init.return_value = good
-        with mock.patch.object(app, "_mydb_import", return_value=fake_mod):
+        # 0.9.2 批次 3：实现迁 storage/providers/mydb_store，patch 实现侧
+        with mock.patch.object(mydb_store_mod, "_mydb_import", return_value=fake_mod):
             r = app.mydb_read("t", "k")
         self.assertEqual(r["value"], {"a": 1})
         self.addCleanup(app._mydb_rd_reset)
@@ -380,7 +390,8 @@ class AlertsTest(_OpsTestCase):
         """跨日放行：同日去重、跨日允许再次出现（patch _now_iso 控制日期）。"""
         times = iter(["2026-08-03T10:00:00", "2026-08-03T11:00:00",
                       "2026-08-04T10:00:00"])
-        with mock.patch.object(app, "_now_iso", side_effect=lambda: next(times)):
+        # 0.9.2 批次 2：实现迁 ops/alerts.py，_now_iso 在 ops 侧
+        with mock.patch.object(ops_alerts, "_now_iso", side_effect=lambda: next(times)):
             a = self._alerts()
             a.add("info", "系统", "跨日消息")   # 08-03
             a.add("info", "系统", "跨日消息")   # 08-03 同日 → 去重
@@ -461,25 +472,25 @@ class AlertsTest(_OpsTestCase):
 
     def test_notify_alert_lazy_singleton(self):
         """notify_alert 惰性单例：首次调用创建、绑定 DATA_DIR、复用同一实例。"""
-        app._alerts_singleton = None
+        ops_alerts._alerts_singleton = None
         try:
-            self.assertIsNone(app._alerts_singleton)      # 惰性：未调用前为 None
+            self.assertIsNone(ops_alerts._alerts_singleton)  # 惰性：未调用前为 None
             e = app.notify_alert("error", "系统", "单例告警")
-            self.assertIsNotNone(app._alerts_singleton)
-            self.assertIs(app._get_alerts(), app._alerts_singleton)   # 复用
-            self.assertEqual(app._alerts_singleton.path,
+            self.assertIsNotNone(ops_alerts._alerts_singleton)
+            self.assertIs(app._get_alerts(), ops_alerts._alerts_singleton)  # 复用
+            self.assertEqual(ops_alerts._alerts_singleton.path,
                              os.path.join(self.tmp, "alerts.json"))
             self.assertTrue(os.path.isfile(os.path.join(self.tmp, "alerts.json")))
             self.assertEqual(e["level"], "error")
             app.notify_alert("error", "系统", "单例告警")  # 当日去重生效
-            self.assertEqual(app._alerts_singleton.count(), 1)
+            self.assertEqual(ops_alerts._alerts_singleton.count(), 1)
             # env 变更不影响已绑定实例（惰性只绑定首次创建时的 DATA_DIR）
             with mock.patch.dict(os.environ, {"DATA_DIR": "/elsewhere"}):
                 app.notify_alert("info", "系统", "第二条")
-            self.assertEqual(app._alerts_singleton.count(), 2)
+            self.assertEqual(ops_alerts._alerts_singleton.count(), 2)
             self.assertFalse(os.path.isfile("/elsewhere/alerts.json"))
         finally:
-            app._alerts_singleton = None
+            ops_alerts._alerts_singleton = None
 
 
 # =====================================================================
@@ -1055,8 +1066,9 @@ class _StockdbGateTests(_OpsTestCase):
 
     def test_semaphore_limits_concurrency(self):
         """信号量满 → 立即 RuntimeError（不阻塞等待堆积线程）。"""
-        with mock.patch.object(app, "_stockdb_gate", threading.Semaphore(1)):
-            gate = app._stockdb_gate
+        # 0.9.2 批次 3：闸口实现迁 storage/providers/free_stockdb，patch 实现侧
+        with mock.patch.object(free_stockdb_mod, "_gate", threading.Semaphore(1)):
+            gate = free_stockdb_mod._gate
             gate.acquire()
             try:
                 with self.assertRaises(RuntimeError):
@@ -1131,20 +1143,34 @@ class _AuctionBackfillTests(_OpsTestCase):
             return {"table": table, "key": key,
                     "values": {str(k): v for k, v in rows.items()}}
 
-        self._patch_snap = mock.patch.object(app, "_auction_query_snapshot", side_effect=fake_snapshot)
+        # 0.9.2 批次 4：打板用例迁 services/auction_tasks.py，patch 服务层注入点
+        # 装配日历注入点（组合根 main() 才装配；测试直接绑定真实交易日历）
+        auction_tasks_mod.is_trading_day = app.is_trading_day
+        self._patch_snap = mock.patch.object(auction_tasks_mod, "query_snapshot",
+                                             side_effect=fake_snapshot)
         self._patch_write = mock.patch.object(app, "mydb_write", side_effect=fake_write)
         self._patch_read = mock.patch.object(app, "mydb_read", side_effect=fake_read)
-        self._patch_latest = mock.patch.object(app, "data_latest_date", return_value="20260814")
-        self._patch_prev = mock.patch.object(app, "_auction_prev_trade_date", side_effect={
+        # 序列读写经 storage.providers.mydb_store（同函数级替身，
+        # 覆盖 storage 内部绑定——打板任务走 app 绑定、序列读写走 storage 绑定）
+        self._patch_store_write = mock.patch.object(mydb_store_mod, "mydb_write",
+                                                    side_effect=fake_write)
+        self._patch_store_read = mock.patch.object(mydb_store_mod, "mydb_read",
+                                                   side_effect=fake_read)
+        self._patch_latest = mock.patch.object(auction_tasks_mod, "data_latest",
+                                               return_value="20260814")
+        self._patch_prev = mock.patch.object(auction_tasks_mod, "_auction_prev_trade_date",
+                                             side_effect={
             "20260814": "20260813", "20260813": "20260812",
             "20260812": "20260811", "20260811": "20260810",
         }.get)
         for p in (self._patch_snap, self._patch_write, self._patch_read,
+                  self._patch_store_write, self._patch_store_read,
                   self._patch_latest, self._patch_prev):
             p.start()
-        self.addCleanup(lambda: [p.stop() for p in (self._patch_snap, self._patch_write,
-                                                    self._patch_read, self._patch_latest,
-                                                    self._patch_prev)])
+        self.addCleanup(lambda: [p.stop() for p in (
+            self._patch_snap, self._patch_write, self._patch_read,
+            self._patch_store_write, self._patch_store_read,
+            self._patch_latest, self._patch_prev)])
 
     def _load_series(self, metric):
         # round-trip：走真实读取链（app._auction_series_read → mydb_read 契约替身）
@@ -1208,7 +1234,9 @@ class _AuctionBackfillTests(_OpsTestCase):
     def test_close_missing_open_counted(self):
         """0.9.0 边界 c（收口路径）：清单股指标日无 bar → missing_open_count 守恒。"""
         today = datetime.date.today().strftime("%Y%m%d")
-        prev_day = app._auction_prev_trade_date(today)
+        # 0.9.2 批次 4：prev 日取服务层 patch 面（setUp 已 patch dict.get → 本用例
+        # today 不在映射 → None；与 close 内部调用同一 patch 面，fake 匹配一致）
+        prev_day = auction_tasks_mod._auction_prev_trade_date(today)
 
         def fake_close_snapshot(args):
             d = args.get("date")
@@ -1224,8 +1252,8 @@ class _AuctionBackfillTests(_OpsTestCase):
                 ]}
             return {"points": []}
 
-        with mock.patch.object(app, "data_latest_date", return_value=today), \
-             mock.patch.object(app, "_auction_query_snapshot", side_effect=fake_close_snapshot):
+        with mock.patch.object(auction_tasks_mod, "data_latest", return_value=today), \
+             mock.patch.object(auction_tasks_mod, "query_snapshot", side_effect=fake_close_snapshot):
             # 预置今日清单：候选 = 600004（有溢价点）+ 600005（指标日无 bar）
             self.store[f"清单:{today}:limitup_non_yizi"] = {
                 "list": {"codes": ["600004", "600005"]}}
@@ -1275,7 +1303,7 @@ class _AuctionBackfillTests(_OpsTestCase):
             captured.append(list(args.get("codes") or []))
             return {"points": [{"code": c} for c in (args.get("codes") or [])]}
 
-        with mock.patch.object(app, "_auction_query_snapshot", side_effect=fake_snapshot_capture):
+        with mock.patch.object(auction_tasks_mod, "query_snapshot", side_effect=fake_snapshot_capture):
             pts = app._auction_points_for_codes(
                 "20260814", [f"{600000 + i}" for i in range(250)])
         self.assertEqual(len(captured), 2)

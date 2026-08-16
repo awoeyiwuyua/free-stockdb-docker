@@ -74,6 +74,54 @@ from config import (  # noqa: E402 - 配置为纯 stdlib，无循环依赖
     WEBUI_VERSION,
 )
 
+# ---- 0.9.2 批次 3：mydb/引擎访问迁 storage/providers（本文件保留同名引用） ----
+from storage.providers.free_stockdb import (  # noqa: E402
+    _breaker as _stockdb_breaker,
+    _breaker_open as _stockdb_breaker_open,
+    _gate as _stockdb_gate,
+    fetch as stockdb_fetch,
+)
+from storage.providers.mydb_store import (  # noqa: E402
+    _mydb_rd,
+    _mydb_rd_reset,
+    _rd_lock,
+    _rd_to_py,
+    auction_series_read as _auction_series_read,
+    auction_series_write as _auction_series_write,
+    mydb_read,
+    mydb_tables,
+    mydb_write,
+    validate_custom_table,
+)
+
+# ---- 0.9.2 批次 4：打板用例迁 services/auction_tasks.py（组合根装配） ----
+# app 保留同名暴露（HTTP/调度引用不变）；注入点绑定见模块末尾（_wire_auction_tasks）。
+import services.auction_tasks as _auction_tasks  # noqa: E402
+from services.auction_tasks import (  # noqa: E402
+    AUCTION_IMPORT_ERROR,
+    AUCTION_METRICS,
+    AUCTION_MODULES_AVAILABLE,
+    _auction_apply_reference,
+    _auction_backfill_state,
+    _auction_fired,
+    _auction_lag_close,
+    _auction_load_codes,
+    _auction_load_series,
+    _auction_prev_trade_date,
+    _auction_points_for_codes,
+    auction_run_backfill,
+    auction_run_backfill_async,
+    auction_run_close,
+    auction_run_collect,
+    auction_scheduler_loop,
+)
+
+# ---- 0.9.2 批次 6：HTTP 路由表外置（web/routes.py） ----
+from web.routes import (  # noqa: E402
+    GET_ROUTES as _WEB_GET_ROUTES,
+    POST_ROUTES as _WEB_POST_ROUTES,
+)
+
 SYNC_LOG = DATA_DIR / "sync.log"
 
 # 同步线程状态
@@ -484,176 +532,10 @@ def _classify_code(code: str) -> str:
     return "other"
 
 
-# ==================== mydb 私有存储写入（pybao 客户端） ====================
-# 上游 stockdb 内置私有存储 ./mydb：HTTP 层只读，写入须用 pybao 客户端
-# （stockdb.abi3.so + stock_sdk.py，随发行包分发，容器内 PYTHONPATH 注入）。
-# 本机开发若未装 pybao，相关接口优雅降级（A 股功能不受影响）。
-
-# 保留表前缀：禁止覆盖上游同步数据，防止与 A 股行情冲突
-_RESERVED_TABLES = ("日k", "分钟k", "复权", "股票代码", "周k", "月k", "板块", "行业", "概念")
-_HK_TABLE = "hk日k"  # 港股日K自定义表（与上游命名空间隔离）
-
-
-def _is_hk_code(code: str) -> bool:
-    """港股代码识别：5 位数字，或带 hk 前缀（如 00700 / hk00700）。"""
-    c = str(code).strip().lower()
-    if c.startswith("hk"):
-        c = c[2:]
-    return c.isdigit() and len(c) == 5
-
-
-def _normalize_hk_code(code: str) -> str:
-    """规范化为 5 位港股代码（00700）。"""
-    c = str(code).strip().lower()
-    if c.startswith("hk"):
-        c = c[2:]
-    return c.zfill(5)
-
-
-def _mydb_import():
-    """惰性导入 pybao 客户端。未安装/加载失败时抛 ImportError（调用方降级）。
-
-    候选路径：容器内 /opt/stockdb/pybao，本地开发 /tmp/pybao_mac 等。
-    """
-    import importlib
-    candidates = ["/opt/stockdb/pybao", "/tmp/pybao_mac"]
-    for p in candidates:
-        try:
-            sys.path.insert(0, p)
-            return importlib.import_module("stockdb")
-        except ImportError:
-            continue
-    raise ImportError("pybao 写库不可用（PYTHONPATH 未注入或平台不兼容）")
-
-
-_rd_lock = threading.Lock()  # pybao rd 单连接非线程安全：全部 rd 读写持锁串行化（0.8.10）
-# 事故背景 2026-08-16：/api/data/* 与回填线程并发用同一 socket，协议帧交错 →
-# C 扩展阻塞持 GIL → 全进程冻结。锁保证同一时刻只有一条 rd 请求在线上。
-
-
-
-def _mydb_rd_reset():
-    """丢弃缓存的 rd 连接：调用失败后置空，下次调用重新 init（0.8.10 自愈楔死连接）。"""
-    _mydb_rd._rd = None
-
-
-def _mydb_rd():
-    """获取连接 NAS stockdb 的 pybao 客户端（惰性、缓存）。"""
-    if getattr(_mydb_rd, "_rd", None) is None:
-        mod = _mydb_import()
-        _mydb_rd._rd = mod.init(STOCKDB_HOST, int(STOCKDB_PORT), socket_timeout=5)
-    return _mydb_rd._rd
-
-
-def _rd_to_py(v):
-    """pybao 返回值归一化（0.8.10 修复）：dict 原样；JSON 字符串解析；QueryResult 转 dict。
-
-    与 mcp._auction_value_to_dict 语义对齐：任何形态一律转 dict，失败按缺失处理——
-    旧实现转换失败原样返回 QueryResult，json.dumps 直接崩（"Object of type
-    QueryResult is not JSON serializable"，/api/data/read 实证）。
-    """
-    if v is None:
-        return None
-    if isinstance(v, dict):
-        return v
-    if isinstance(v, str):
-        try:
-            parsed = json.loads(v)
-        except ValueError:
-            return None
-        return parsed if isinstance(parsed, dict) else None
-    if hasattr(v, "keys") and hasattr(v, "all"):
-        try:  # pybao QueryResult：dict(value) 即原生数据
-            return dict(v)
-        except Exception:  # noqa: BLE001 - 转换失败按缺失处理
-            return None
-    return None
-
-
-def validate_custom_table(table: str) -> str:
-    """校验自定义表名：禁止覆盖上游保留表，禁止危险字符。返回规范化表名。"""
-    t = str(table or "").strip().strip(":")
-    if not t:
-        raise ValueError("表名不能为空")
-    if not all(ch.isalnum() or ch in "_:-" for ch in t):
-        raise ValueError("表名只能含字母数字与 _:-")
-    for r in _RESERVED_TABLES:
-        if t == r or t.startswith(r + ":"):
-            raise ValueError(f"表名 {t!r} 与上游保留表 {r!r} 冲突，请用自定义命名空间（如 hk日k: / 自定义:）")
-    return t
-
-
-def mydb_write(table: str, items: list[tuple], batch: bool = False) -> dict:
-    """写入 mydb 私有存储。items=[(key, value), ...]。
-
-    注意：pybao 的 rd.set 返回 QueryResult，必须调用 .do() 才真正发送写入
-    （否则只是客户端排队，读不到）。batch 参数保留兼容，统一逐条 .do()。
-    0.8.10：全程持 _rd_lock；任何 rd 异常 → 丢弃缓存连接（下次调用重连自愈）。
-    """
-    table = validate_custom_table(table)
-    if not items:
-        raise ValueError("没有可写入的数据")
-    with _rd_lock:
-        try:
-            rd = _mydb_rd()
-            result = []
-            for key, value in items:
-                result.append(rd.set(table, key, value).do())
-            # 回读校验（QueryResult 转原生）
-            readback = []
-            for key, _ in items:
-                try:
-                    readback.append(_rd_to_py(rd.get(table, key)))
-                except Exception:  # noqa: BLE001 - 单键回读失败按缺失
-                    readback.append(None)
-            return {"table": table, "written": len(items), "readback": readback, "result": result}
-        except Exception:
-            _mydb_rd_reset()
-            raise
-
-
-def mydb_read(table: str, key: str = "") -> dict:
-    """读取 mydb 自定义表。key 为空时列出表内全部键值。
-    0.8.10：持 _rd_lock；值统一 _rd_to_py 归一化；rd 异常 → 丢弃连接自愈。"""
-    table = validate_custom_table(table)
-    with _rd_lock:
-        try:
-            rd = _mydb_rd()
-            if key:
-                val = _rd_to_py(rd.get(table, key))
-                return {"table": table, "key": key, "value": val}
-            keys = rd.keys(table, "*") or []
-            values = {}
-            for k in keys:
-                date_str = str(k).split(":")[-1]
-                try:
-                    values[str(k)] = _rd_to_py(rd.get(table, date_str))
-                except Exception:  # noqa: BLE001 - 单键失败按缺失
-                    values[str(k)] = None
-            return {"table": table, "keys": keys, "values": values}
-        except Exception:
-            _mydb_rd_reset()
-            raise
-
-
-def mydb_tables() -> list[str]:
-    """列出自定义表名（含保留表前缀过滤）。0.8.10：rd.keys 持锁 + 异常自愈。"""
-    with _rd_lock:
-        try:
-            rd = _mydb_rd()
-            keys = rd.keys("*") or []
-        except Exception:
-            _mydb_rd_reset()
-            raise
-    tables = set()
-    for k in keys:
-        table = str(k).split(":")[0] if ":" in str(k) else str(k)
-        if table and not any(table.startswith(r) for r in _RESERVED_TABLES):
-            tables.add(table)
-    return sorted(tables)
 
 
 # ==================== 港股数据（东财 + 腾讯，写入 hk日k: 表） ====================
+_HK_TABLE = "hk日k"  # 港股日K自定义表（与上游命名空间隔离）
 _HK_EM = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
 _HK_QT = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
 
@@ -684,6 +566,22 @@ def _hk_fetch_daily_em(code: str) -> list[dict]:
             "amount": float(parts[6]) if len(parts) > 6 else None,
         })
     return rows
+
+
+def _is_hk_code(code: str) -> bool:
+    """港股代码识别：5 位数字，或带 hk 前缀（如 00700 / hk00700）。"""
+    c = str(code).strip().lower()
+    if c.startswith("hk"):
+        c = c[2:]
+    return c.isdigit() and len(c) == 5
+
+
+def _normalize_hk_code(code: str) -> str:
+    """规范化为 5 位港股代码（00700）。"""
+    c = str(code).strip().lower()
+    if c.startswith("hk"):
+        c = c[2:]
+    return c.zfill(5)
 
 
 def _hk_fetch_daily_qt(code: str) -> list[dict]:
@@ -818,49 +716,6 @@ _latest_date_probe_lock = threading.Lock()  # 单飞锁：并发缓存失效时�
 _code_stats_cache: dict = {"at": 0.0, "val": None}   # 15 秒缓存：全市场代码列表 GET 较贵
 _container_state_cache: dict = {"at": 0.0, "val": None}  # 5 秒缓存：stockdb 进程探测
 
-# ==================== stockdb 上游访问治理（并发卫生三件套之二：熔断 + 信号量） ====================
-# 事故复盘（0.6.x 多标签切页打瘫后端）：stockdb 是全部路径的共享依赖，慢/挂时
-# 每次探针都等满超时（扇出 3~4 路 × 10s），并发线程无界堆积。
-# 治理原则：探针路径（breaker=True）记仇快败；全部路径过信号量限并发；
-# 控制路径（启动等待/同步校验）只过信号量、不受熔断牵连。
-_stockdb_gate = threading.Semaphore(STOCKDB_MAX_CONCURRENCY)  # 并发闸门（0.9.1：config 收敛）
-_stockdb_breaker: dict = {"fails": 0, "open_until": 0.0,
-                          "threshold": 3, "cooldown": 300.0}
-
-
-def _stockdb_breaker_open() -> bool:
-    return time.time() < _stockdb_breaker["open_until"]
-
-
-def stockdb_fetch(path: str, timeout: float = 10.0, breaker: bool = False) -> str:
-    """打 stockdb HTTP 的统一闸口。
-
-    - 信号量（全路径）：并发最多 STOCKDB_MAX_CONCURRENCY（默认 8），超出立即抛
-      RuntimeError 由调用方降级（不阻塞等待——等待会再次堆积线程）。
-    - 熔断器（breaker=True 的探针路径）：连续 threshold 次失败后 open_until 内
-      快速失败，调用方降级取缓存，避免 stockdb 挂/忙时每路都等满超时。
-    """
-    if breaker and _stockdb_breaker_open():
-        raise RuntimeError(
-            f"stockdb 熔断中（连续 {_stockdb_breaker['fails']} 次失败，"
-            f"降级至 {datetime.fromtimestamp(_stockdb_breaker['open_until']).strftime('%H:%M:%S')}）")
-    if not _stockdb_gate.acquire(blocking=False):
-        raise RuntimeError("stockdb 并发已满（信号量限流），本次降级")
-    try:
-        import urllib.request
-        with urllib.request.urlopen(
-                f"http://{STOCKDB_HOST}:{STOCKDB_PORT}{path}", timeout=timeout) as resp:
-            data = resp.read().decode("utf-8", "replace")
-        _stockdb_breaker["fails"] = 0  # 成功即复位
-        return data
-    except Exception:
-        if breaker:
-            _stockdb_breaker["fails"] += 1
-            if _stockdb_breaker["fails"] >= _stockdb_breaker["threshold"]:
-                _stockdb_breaker["open_until"] = time.time() + _stockdb_breaker["cooldown"]
-        raise
-    finally:
-        _stockdb_gate.release()
 
 
 def data_coverage() -> dict | None:
@@ -1383,32 +1238,19 @@ def run_sync(hot: bool = True, trigger: str = "manual", retry: bool = False) -> 
         _sync_lock.release()
 
 
-def _sync_log_path() -> "Path":
-    """同步日志路径：动态读 DATA_DIR（测试/部署可 patch，0.9.0 修复——
-
-    旧实现用 import 时求值的模块常量 SYNC_LOG，测试 patch DATA_DIR 后 log() 仍
-    写默认 /data（CI Linux 不可写 → PermissionError 污染被测路径）。
-    """
-    return Path(DATA_DIR) / "sync.log"
-
-
 def log(line: str) -> None:
-    p = _sync_log_path()
-    p.parent.mkdir(parents=True, exist_ok=True)
-    with p.open("a", encoding="utf-8") as fh:
-        fh.write(f"{now()}  {line}\n")
-
-
-def now() -> str:
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    """同步日志（0.9.2 批次 2：实现迁 ops/logging.py，本处仅保留转发兼容）。"""
+    _ops_log(line)
 
 
 def tail_log(n: int = 200) -> str:
-    p = _sync_log_path()
-    if not p.exists():
-        return "（暂无同步日志）"
-    lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
-    return "\n".join(lines[-n:])
+    """同步日志尾部（0.9.2 批次 2：实现迁 ops/logging.py）。"""
+    return _ops_tail_log(n)
+
+
+def now() -> str:
+    """当前时间戳（0.9.2 批次 2：实现迁 ops/logging.py）。"""
+    return _ops_now()
 
 
 # ==================== 定时自动同步 ====================
@@ -1581,10 +1423,21 @@ def stockdb_get(table: str) -> str:
 
 
 # ==================== 运营支撑（Phase 4.5：告警中心 / MCP 调用捕获 / 上游版本探针） ====================
-# 自 test_ops.py 可执行规格迁移（行为基线一致）：仅标准库、不含 apikey、落盘失败静默降级。
-MAX_ALERTS = 200                      # 告警中心滚动上限（保留最新 200 条）
-ALERT_LEVELS = ("info", "warning", "error")   # 合法告警级别（小写）
-ALERT_LEVEL_ALIASES = {"warn": "warning"}     # 级别别名归一化
+# 告警中心（Alerts/notify_alert/_get_alerts/常量）0.9.2 批次 2 已迁 ops/alerts.py，
+# 此处仅保留 import 暴露（app.Alerts 等名字不变，测试与 HTTP 处理器引用无感）。
+from ops.alerts import (  # noqa: E402 - 横切关注点（ops 层）随模块顶部统一装配
+    ALERT_LEVELS,
+    ALERT_LEVEL_ALIASES,
+    MAX_ALERTS,
+    Alerts,
+    _get_alerts,
+    notify_alert,
+)
+from ops.logging import (  # noqa: E402
+    log as _ops_log,
+    now as _ops_now,
+    tail_log as _ops_tail_log,
+)
 
 MCP_CALLS_FILE_MAX_LINES = 2000       # mcp_calls.jsonl 行数上限（超出截断保留尾部）
 MCP_CALLS_DEQUE_MAX = 500             # 内存调用 deque 上限（最新 500 条）
@@ -1599,146 +1452,6 @@ def _now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
-def _warn(msg: str) -> None:
-    """stderr 提示（落盘失败等降级场景；不抛）。"""
-    print(f"ops: {msg}", file=sys.stderr)
-
-
-class Alerts:
-    """面板内告警中心：JSON 持久化 DATA_DIR/alerts.json + 内存镜像。
-
-    文件格式：JSON 数组 [{ts, level, source, message}, ...]，按时间升序存储；
-    list() 返回最新在前。同 (date=ts[:10], source, message) 当日去重：同日重复
-    add 返回既有条目（幂等），跨日允许再次出现。超出 MAX_ALERTS=200 时滚动
-    保留最新。线程安全：读写均持锁；落盘用「临时文件 + os.replace」原子替换，
-    避免并发/崩溃产生半截文件。
-    """
-
-    def __init__(self, path: str):
-        """构造并加载既有告警（文件缺失 / 损坏 → 空列表，不抛）。"""
-        self.path = path
-        self._lock = threading.Lock()
-        self._items: list[dict] = []
-        self._load()
-
-    @classmethod
-    def init(cls, path: str) -> "Alerts":
-        """按路径构造告警中心（等价 __init__，命名与任务简报一致）。"""
-        return cls(path)
-
-    # ---------------- 内部 ----------------
-    def _load(self) -> None:
-        """从 JSON 文件加载既有告警（容错：缺失/损坏/非数组均视为空）。"""
-        try:
-            with open(self.path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except (OSError, ValueError):
-            return
-        if not isinstance(data, list):
-            return
-        items = []
-        for e in data:
-            if isinstance(e, dict) and all(isinstance(e.get(k), str)
-                                           for k in ("ts", "level", "source", "message")):
-                items.append(e)
-        self._items = items[-MAX_ALERTS:]  # 加载即夹到上限（防御外部写入超长）
-
-    def _save(self) -> None:
-        """原子落盘（临时文件 + os.replace）；失败仅 stderr 提示，不影响内存镜像。"""
-        try:
-            parent = os.path.dirname(os.path.abspath(self.path))
-            if parent and not os.path.isdir(parent):
-                os.makedirs(parent, exist_ok=True)
-            tmp = self.path + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(self._items, f, ensure_ascii=False)
-            os.replace(tmp, self.path)
-        except OSError as exc:
-            _warn(f"告警落盘失败：{self.path}（{exc}）")
-
-    @staticmethod
-    def _normalize_level(level) -> str:
-        """级别归一化并校验：小写 + 别名（warn→warning）；非法抛中文 ValueError。"""
-        s = str(level).strip().lower()
-        s = ALERT_LEVEL_ALIASES.get(s, s)
-        if s not in ALERT_LEVELS:
-            raise ValueError(
-                f"告警级别 {level!r} 非法；合法级别：{', '.join(ALERT_LEVELS)}"
-            )
-        return s
-
-    # ---------------- 任务 API ----------------
-    def add(self, level: str, source: str, message: str) -> dict:
-        """新增告警。
-
-        返回告警 dict {ts, level, source, message}（ts=ISO 本地时间）；
-        同 (当日日期, source, message) 去重：重复投递返回既有条目、不新增。
-        级别非法 / source、message 为空 → 中文 ValueError。
-        """
-        level = self._normalize_level(level)
-        source = str(source).strip()
-        message = str(message).strip()
-        if not source:
-            raise ValueError("告警 source 必须为非空字符串")
-        if not message:
-            raise ValueError("告警 message 必须为非空字符串")
-        ts = _now_iso()
-        with self._lock:
-            for e in self._items:  # 当日去重：同 (date, source, message) 幂等
-                if e["ts"][:10] == ts[:10] and e["source"] == source \
-                        and e["message"] == message:
-                    return e
-            entry = {"ts": ts, "level": level, "source": source, "message": message}
-            self._items.append(entry)
-            if len(self._items) > MAX_ALERTS:  # 滚动：保留最新 200 条
-                self._items = self._items[-MAX_ALERTS:]
-            self._save()
-            return entry
-
-    def list(self, limit: int = 50) -> list:
-        """告警列表（最新在前）；limit 缺省 50。"""
-        try:
-            limit = int(limit)
-        except (TypeError, ValueError):
-            limit = 50
-        if limit < 1:
-            limit = 50
-        with self._lock:
-            return [dict(e) for e in reversed(self._items)][:limit]
-
-    def count(self) -> int:
-        """当前告警条数。"""
-        with self._lock:
-            return len(self._items)
-
-    def clear(self) -> None:
-        """清空全部告警并落盘（文件写 '[]'，保持文件存在）。"""
-        with self._lock:
-            self._items = []
-            self._save()
-
-
-# ---- 模块级告警单例（绑定 DATA_DIR，惰性创建） ----
-_alerts_singleton: "Alerts | None" = None
-_alerts_singleton_lock = threading.Lock()
-
-
-def _get_alerts() -> Alerts:
-    """模块级告警单例：首次调用时按 DATA_DIR 惰性创建（进程内复用）。"""
-    global _alerts_singleton
-    with _alerts_singleton_lock:
-        if _alerts_singleton is None:
-            _alerts_singleton = Alerts.init(str(DATA_DIR / "alerts.json"))
-        return _alerts_singleton
-
-
-def notify_alert(level: str, source: str, message: str) -> dict:
-    """模块级告警助手：等价 _get_alerts().add（生产接线点，看门狗/调度侧零配置调用）。
-
-    迁移自 test_ops.py 可执行规格（行为基线一致）：级别校验/当日去重/200 条滚动
-    均由 Alerts.add 承担；不含 apikey 等敏感信息。
-    """
-    return _get_alerts().add(level, source, message)
 
 
 # ---- 数据新鲜度告警（迁移自 test_ops.py 可执行规格，行为基线一致） ----
@@ -2141,48 +1854,29 @@ class Handler(BaseHTTPRequestHandler):
             self._send(500, json.dumps({"error": str(exc)}))
 
     def _route_api_get(self, path: str):
-        """GET /api/* 路由表（与原 do_GET 分支逐一对应，行为不变；新增 /api/overview）。"""
-        if path == "/api/status":
-            self._status()
-        elif path == "/api/history":
-            self._history()
-        elif path == "/api/schedule":
-            self._schedule()
-        elif path == "/api/health":
-            self._health()
-        elif path == "/api/log":
-            self._log()
-        elif path == "/api/query":
-            self._query()
-        elif path == "/api/container/logs":
-            self._container_logs()
-        elif path == "/api/data/tables":
-            self._data_tables()
-        elif path == "/api/data/read":
-            self._data_read()
-        elif path == "/api/hk/sync":
-            self._hk_sync()
-        elif path == "/api/overview":
-            self._overview()
-        elif path == "/api/auction/status":
-            self._send(200, json.dumps({"backfill": _auction_backfill_state,
-                                        "fired": _auction_fired}, ensure_ascii=False))
-        elif path == "/api/diag":
-            self._diag()
-        elif path == "/api/alerts":
-            self._alerts()
-        elif path == "/api/alerts/summary":
-            self._alerts_summary()
-        elif path == "/api/mcp/stats":
-            self._mcp_stats()
-        elif path == "/api/mcp/calls":
-            self._mcp_calls()
-        elif path == "/api/version":
-            self._version()
-        elif path == "/api/version-check":  # /api/version 别名（前端旧路径兼容）
-            self._version()
-        else:
+        """GET /api/* 路由表（0.9.2 批次 6：表外置 web/routes.py，行为不变）。"""
+        handler = _WEB_GET_ROUTES.get(path)
+        if handler is None:
             self._send(404, json.dumps({"error": "not found"}))
+            return
+        getattr(self, handler)()
+
+    def _auction_status(self):
+        """GET /api/auction/status：回填状态 + 日级守卫（0.9.2 批次 6 从内联提取）。"""
+        self._send(200, json.dumps({"backfill": _auction_backfill_state,
+                                    "fired": _auction_fired}, ensure_ascii=False))
+
+    def _auction_daily(self):
+        """GET /api/auction/daily：打板链路日检记录（0.9.2 批次 7 可观测性）。"""
+        from storage.records import recent as _records_recent
+        try:
+            limit = int(self.path.split("limit=")[-1].split("&")[0]) \
+                if "limit=" in self.path else 30
+        except (TypeError, ValueError):
+            limit = 30
+        limit = max(1, min(limit, 100))
+        self._send(200, json.dumps({"records": _records_recent(limit),
+                                    "count": limit}, ensure_ascii=False))
 
     def _serve_static(self, path: str):
         """GET 静态服务：精确命中 static 文件 → 直出（带缓存策略）；
@@ -2211,22 +1905,11 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         path = urlparse(self.path).path
         try:
-            if path == "/api/sync":
-                self._sync()
-            elif path == "/api/container/restart":
-                self._container_restart()
-            elif path == "/api/data/write":
-                self._data_write()
-            elif path == "/api/hk/sync":
-                self._hk_sync()
-            elif path == "/api/alerts/clear":
-                self._alerts_clear()
-            elif path == "/api/auction/run":
-                self._auction_run()
-            elif path == "/mcp":
-                self._mcp()
-            else:
+            handler = _WEB_POST_ROUTES.get(path)
+            if handler is None:
                 self._send(404, json.dumps({"error": "not found"}))
+                return
+            getattr(self, handler)()
         except Exception as exc:
             self._send(500, json.dumps({"error": str(exc)}))
 
@@ -2723,531 +2406,27 @@ class Handler(BaseHTTPRequestHandler):
         }, ensure_ascii=False))
 
 
-# ==================== 打板竞价采集调度（0.7.0 任务D：调度接线） ====================
-# 数据流（设计文档 docs/design/auction-collector.md）：
-#   09:26 采集：读今日清单（昨日 16:30 算好；缺/空 → 前一交易日快照兜底现算）→
-#            fetch_quotes 批量拉竞价价 → 写竞价快照:<今日>:<代码>（state=captured）→
-#            算当日业务值 + 60 日分位 → 写打板指标:<今日>（value_source=auction）；
-#   16:30 收口：校验今日 K 线已同步 → 算明日清单（清单:<明日>:limitup_non_yizi）→
-#            对账回写（state=reconciled / diff_pct，|diff|>0.5% 告警）→
-#            K线权威指标 → 追加打板序列 → 覆盖写打板指标:<今日>（value_source=kline）。
-# 与现有调度并列：独立 2s 轮询线程 auction_scheduler_loop，不侵入 scheduler_loop。
-# 触发点 AUCTION_COLLECT_TIME/AUCTION_CLOSE_TIME 已收敛至 config.py（0.9.1）。
 
-_auction_fired: dict = {}  # 日级防重触发守卫：{date: {"collect": bool, "close": bool}}
-_auction_backfill_state: dict = {"running": False, "started": None, "finished": None,
-                                 "result": None}  # 回填任务状态（0.8.2 异步化 + 单飞防重）
+def _wire_auction_tasks() -> None:
+    """组合根装配（0.9.2 批次 4）：接口层/探针/日历能力绑定到服务层注入点。
 
-# 惰性 import：任务A/B/C（auction_collect/auction_list/auction_metrics）与 MCP 快照
-# 任一缺失 → AUCTION_MODULES_AVAILABLE=False，采集/收口返回 {ok:False}（不拖垮 webui）。
-try:
-    from auction_collect import fetch_quotes as _auction_fetch_quotes
-    from auction_list import compute_limitup_list as _auction_compute_limitup_list
-    from auction_metrics import (
-        METRICS as AUCTION_METRICS,
-        compute_metrics as _auction_compute_metrics,
-        load_series as _auction_load_series,
-        append_series as _auction_append_series,
-        build_metrics_payload as _auction_build_payload,
-        list_key as _auction_list_key,
-        metrics_key as _auction_metrics_key,
-        percentile_rank as _auction_percentile_rank,
-        strength_label as _auction_strength_label,
-        series_key as _auction_series_key,
-    )
-    from mcp.stockdb_mcp_server import query_point_snapshot as _auction_query_snapshot
-    from mcp.board_metrics import rebuild_limit_reference_price as _auction_rebuild_ref
-    AUCTION_MODULES_AVAILABLE = True
-    AUCTION_IMPORT_ERROR = ""
-except Exception as _auction_import_exc:  # noqa: BLE001 - 任一模块缺失时优雅降级
-    AUCTION_MODULES_AVAILABLE = False
-    AUCTION_IMPORT_ERROR = f"{type(_auction_import_exc).__name__}: {_auction_import_exc}"
-
-
-def _auction_apply_reference(points: list[dict], date: str,
-                             lag_close_by_code: dict | None) -> list[dict]:
-    """涨停判定参考价替换（0.8.15，命理档案验收修正版）。
-
-    0.8.14 曾对全部历史行统一套复权因子反推（ref = pre_close × cum_latest/cum_D），
-    验收证实污染不均匀（513/517 条为误删）——废弃。正确口径：
-      - 普通日：参考价 = 上一实际成交日未复权收盘（lag close，date 前一交易日快照）
-      - 除权日（因子表当日有事件）：参考价 = 当日 pre_close（法定除权参考价，可信）
-      - 该股前一交易日无交易（停牌跨日）或 lag 缺失 → 原值兜底
+    在 main() 调用（模块加载完成后），避免前向引用；测试按需直接设置
+    auction_tasks 的注入点（见 test_ops._AuctionBackfillTests）。
     """
-    if not points:
-        return points
-    lag_close_by_code = lag_close_by_code or {}
+    global _auction_query_snapshot
     try:
-        from mcp import pybao_tools as _pt
-        fixed = []
-        for p in points:
-            if not isinstance(p, dict):
-                fixed.append(p)
-                continue
-            code = str(p.get("code") or "")
-            pc = p.get("prev_close")
-            if not code or pc is None:
-                fixed.append(p)
-                continue
-            if _pt.is_fq_event_date(code, date):
-                fixed.append(p)  # 除权日：pre_close = 法定参考价，原样
-                continue
-            lag = lag_close_by_code.get(code)
-            if lag is None:
-                fixed.append(p)  # 停牌跨日/无历史：原值兜底
-                continue
-            fixed.append({**p, "prev_close": float(lag)})
-        return fixed
-    except Exception:  # noqa: BLE001 - 重建失败按原值降级
-        return points
-
-
-def _auction_lag_close(points: list[dict]) -> dict:
-    """前一交易日快照 → {code: 未复权收盘}（仅 TRADED 有效行）。"""
-    out: dict = {}
-    for p in points or []:
-        if not isinstance(p, dict):
-            continue
-        if p.get("status") != "TRADED":
-            continue
-        try:
-            out[str(p["code"])] = float(p["close"])
-        except (TypeError, ValueError, KeyError):
-            continue
-    return out
-
-
-def _auction_series_read(key: str):
-    """打板序列读取封装：read_fn(key) -> 原始存储值|None（JSON 解析交给 load_series）。
-
-    mydb 物理布局：表=打板序列:<metric>、子键="series"；mydb_read(key, "") 列出
-    {子键: 值}，取任一非 None 值返回。读取异常 → None（冷启动空序列，不阻塞采集）。
-    """
-    try:
-        res = mydb_read(key, "")
-        for v in (res.get("values") or {}).values():
-            if v is not None:
-                return v
-    except Exception:  # noqa: BLE001 - 序列缺失/损坏 → 调用方按空序列处理
-        return None
-    return None
-
-
-def _auction_series_write(key: str, value) -> None:
-    """打板序列写入封装：write_fn(key, value)；子键固定 "series"，覆盖写幂等。
-
-    value 可能是 dict（append_series 组装完整载荷）或 str，统一序列化后落库。
-    """
-    mydb_write(key, [("series", value)])  # 0.8.6：pybao 存原生 dict
-
-
-def _auction_load_codes(trade_date: str) -> list[str]:
-    """读 mydb 清单:<date>:limitup_non_yizi 的 codes；缺失/损坏/为空 → []。
-
-    返回 [] 时调用方走兜底现算路径（query_point_snapshot + compute_limitup_list）。
-    """
-    try:
-        res = mydb_read(_auction_list_key(trade_date), "")
-        for v in (res.get("values") or {}).values():
-            if v is None:
-                continue
-            data = json.loads(v) if isinstance(v, str) else v
-            if isinstance(data, dict) and isinstance(data.get("codes"), list):
-                return [str(c) for c in data["codes"]]
-    except Exception:  # noqa: BLE001 - 清单缺失/损坏 → 兜底现算
-        return []
-    return []
-
-
-def _auction_prev_trade_date(d8: str, n: int = 1) -> str:
-    """从 d8 往前找第 n 个交易日（YYYYMMDD），用于清单缺失时的兜底现算。"""
-    d = datetime.strptime(d8, "%Y%m%d").date()
-    found = 0
-    while found < n:
-        d -= timedelta(days=1)
-        if is_trading_day(d):
-            found += 1
-    return d.strftime("%Y%m%d")
-
-
-def auction_run_collect() -> dict:
-    """09:26 打板竞价采集任务（幂等，可手动重跑）。
-
-    步骤：① 读今日清单（缺/空 → query_point_snapshot 前一交易日兜底现算）；
-    ② fetch_quotes 批量采集 → 写竞价快照:<今日>:<代码>（state=captured，含
-       raw/contract/fetched_at/known_at=当日 09:25）；
-    ③ compute_metrics + load_series（读近 59 日序列）→ build_metrics_payload
-       （value_source=auction）→ 写打板指标:<今日>。
-    单块 try/except 降级：任何异常 → {ok:False} + log + 告警，绝不外抛。
-    """
-    if not AUCTION_MODULES_AVAILABLE:
-        return {"ok": False, "reason": f"打板模块未就绪：{AUCTION_IMPORT_ERROR}",
-                "collected": 0, "errors_count": 0, "metrics": None, "rank_60d": None, "strength_60d": None}
-    today = datetime.now().strftime("%Y%m%d")
-    try:
-        # ① 清单：昨日 16:30 已算好落库；缺失/为空 → 前一交易日快照兜底现算
-        codes = _auction_load_codes(today)
-        if not codes:
-            prev = _auction_prev_trade_date(today)
-            snaps = _auction_query_snapshot({"date": prev, "limit": 0})
-            # 0.8.15：判定参考价 = prev 前一交易日未复权收盘；除权日例外
-            prev2 = _auction_prev_trade_date(prev)
-            snaps2 = _auction_query_snapshot({"date": prev2, "limit": 0})
-            pts1 = _auction_apply_reference(snaps.get("points") or [], prev,
-                                            _auction_lag_close(snaps2.get("points") or []))
-            listing = _auction_compute_limitup_list(pts1)
-            codes = listing.get("codes") or []
-            log(f"📊 打板清单缺失，已兜底现算（{prev}）→ {len(codes)} 只")
-        if not codes:
-            return {"ok": False, "reason": "清单为空且兜底现算无结果",
-                    "collected": 0, "errors_count": 0, "metrics": None, "rank_60d": None, "strength_60d": None}
-
-        # ② 采集竞价价（fetch_quotes 内部主源腾讯/备源东财降级）→ 逐条写快照
-        quote = _auction_fetch_quotes(codes)
-        ok_items = quote.get("ok") or []
-        errors = quote.get("errors") or []
-        items = []
-        for snap in ok_items:
-            row = dict(snap)
-            row["state"] = "captured"          # 生命周期中间态：captured → reconciled
-            row["contract"] = quote.get("contract")
-            row["fetched_at"] = quote.get("fetched_at")
-            row["known_at"] = f"{today[:4]}-{today[4:6]}-{today[6:8]}T09:25:00"  # 业务口径：9:25 竞价=开盘
-            row["diff_pct"] = None             # 对账后回填
-            row["reconciled_at"] = None
-            items.append((str(snap["code"]), row))  # 0.8.6：pybao 存原生 dict，不存 JSON 字符串
-        if items:                              # 空 items 时 mydb_write 会抛 ValueError
-            mydb_write(f"竞价快照:{today}", items)
-
-        # ③ 当日业务值 + 60 日分位（竞价版；序列由 16:30 K线权威版追加，此处只读近 59 日）
-        metrics = _auction_compute_metrics(ok_items)
-        series_by = {m: _auction_load_series(_auction_series_read, m) for m in AUCTION_METRICS}
-        payload = _auction_build_payload(ok_items, series_by,
-                                         computed_at=_now_iso(), value_source="auction")
-        mydb_write(_auction_metrics_key(today),
-                   [("metrics", payload)])  # 原生 dict
-        log(f"📊 打板竞价采集（{today}）: {len(ok_items)} 只快照（errors={len(errors)}），"
-            f"premium_mean={metrics.get('premium_mean')}, n={metrics.get('n_samples')}")
-        return {"ok": True, "collected": len(ok_items), "errors_count": len(errors),
-                "metrics": metrics, "rank_60d": payload.get("rank_60d"), "strength_60d": payload.get("strength_60d")}
-    except Exception as exc:  # noqa: BLE001 - 单块降级：采集异常不抛给调度线程/HTTP
-        log(f"⚠️ 打板竞价采集失败（{today}）: {exc}")
-        try:
-            notify_alert("error", "打板采集", f"竞价采集失败（{today}）: {exc}")
-        except Exception:  # noqa: BLE001 - 告警通道异常忽略
-            pass
-        return {"ok": False, "reason": str(exc), "collected": 0, "errors_count": 0,
-                "metrics": None, "rank_60d": None}
-
-
-def auction_run_close() -> dict:
-    """16:30 打板收口对账任务（幂等，可手动重跑）。
-
-    步骤：① data_latest_date(force=True) >= 今日（未就绪 → {ok:False,"当日数据未同步"}）；
-    ② 明日清单：今日 K 线快照 → compute_limitup_list → 写清单:<明日>:limitup_non_yizi；
-    ③ 对账：今日竞价快照 open_price vs K线 open → 逐条回写 state=reconciled /
-       diff_pct / reconciled_at，|diff|>0.5% → log + 告警（长期监测口径偏差）；
-    ④ K线权威指标：清单口径 points（close/open/prev_close）→ compute_metrics →
-       append_series（追加并裁剪 60 日）→ build_metrics_payload（value_source=kline）
-       → 覆盖写打板指标:<今日>。
-    单块 try/except 降级：任何异常 → {ok:False} + log + 告警，绝不外抛。
-    """
-    if not AUCTION_MODULES_AVAILABLE:
-        return {"ok": False, "reason": f"打板模块未就绪：{AUCTION_IMPORT_ERROR}",
-                "list_count": 0, "reconciled": 0, "diff_alerts": 0, "metrics": None}
-    today = datetime.now().strftime("%Y%m%d")
-    try:
-        # ① 当日 K 线已同步校验（force 绕过 8s 缓存，收口口径必须实时）
-        latest = str(data_latest_date(force=True) or "").replace("-", "")
-        if not latest or latest < today:
-            return {"ok": False, "reason": "当日数据未同步",
-                    "list_count": 0, "reconciled": 0, "diff_alerts": 0, "metrics": None,
-                    "latest_date": latest or None}
-
-        # 全市场今日时点快照（K线权威源，②③④ 共用）
-        points = (_auction_query_snapshot({"date": today, "limit": 0}) or {}).get("points") or []
-        points_by_code = {str(p.get("code")): p for p in points}
-
-        # ② 明日清单：今日非一字板涨停（compute_limitup_list 内部已剔除一字板）
-        # 0.8.15：判定参考价 = 昨日未复权收盘（prev_day 快照）；除权日例外
-        prev_day = _auction_prev_trade_date(today)
-        prev_points = (_auction_query_snapshot({"date": prev_day, "limit": 0}) or {}).get("points") or []
-        listing = _auction_compute_limitup_list(
-            _auction_apply_reference(points, today, _auction_lag_close(prev_points)))
-        tomorrow = (datetime.strptime(today, "%Y%m%d").date() + timedelta(days=1)).strftime("%Y%m%d")
-        list_payload = {"codes": listing.get("codes") or [],
-                        "computed_at": _now_iso(),
-                        "contract": "limitup-non-yizi-v1"}
-        mydb_write(_auction_list_key(tomorrow),
-                   [("list", list_payload)])
-
-        # ③ 对账：今日 09:26 竞价快照 vs 今日 K线开盘价（口径偏差长期监测）
-        snap_res = mydb_read(f"竞价快照:{today}", "")
-        reconcile_items: list[tuple] = []
-        reconciled, diff_alerts = 0, 0
-        for code, raw in (snap_res.get("values") or {}).items():
-            try:
-                row = json.loads(raw) if isinstance(raw, str) else raw
-            except (TypeError, ValueError):
-                continue
-            if not isinstance(row, dict):
-                continue
-            pt = points_by_code.get(str(code))
-            kline_open = pt.get("open") if pt else None
-            auction_open = row.get("open_price")
-            diff_pct = None
-            try:
-                if auction_open is not None and kline_open:
-                    diff_pct = (float(auction_open) - float(kline_open)) / float(kline_open)
-            except (TypeError, ValueError, ZeroDivisionError):
-                diff_pct = None
-            row["state"] = "reconciled"            # 生命周期终态：对账结论 + 竞价证据
-            row["diff_pct"] = diff_pct
-            row["reconciled_at"] = _now_iso()
-            reconcile_items.append((str(code), row))  # 原生 dict
-            reconciled += 1
-            if diff_pct is not None and abs(diff_pct) > 0.005:   # ±0.5% 口径偏差阈值
-                diff_alerts += 1
-                msg = (f"竞价/开盘口径偏差 {code}: 竞价 {auction_open} vs K线 {kline_open}"
-                       f"（{diff_pct:+.2%}）")
-                log(f"⚠️ 对账 {msg}")
-                try:
-                    notify_alert("warning", "打板对账", f"{today} {msg}")
-                except Exception:  # noqa: BLE001 - 告警通道异常不阻塞对账
-                    pass
-        if reconcile_items:
-            mydb_write(f"竞价快照:{today}", reconcile_items)  # 一次批量回写
-
-        # ④ K线权威指标：与 09:26 竞价版同一清单口径（保证两版可比）；
-        #    清单缺失 → 当日快照代码 → 全市场（逐级兜底）
-        #    0.8.13：溢价分母 = T-1 收盘价（补拉 T-1 快照；T 日 bar 的 pre_close
-        #    在除权除息日为调整昨收，混入分红会失真）
-        codes = _auction_load_codes(today) or [str(c) for c in (snap_res.get("values") or {})]
-        prev_close_by_code = _auction_lag_close(prev_points)
-        missing_open = 0  # 0.9.0 M1 边界 c：清单股取不到 (open, prev_close) 有效对
-        if codes:
-            code_set = set(codes)
-            snapshots = [{"code": p["code"], "open_price": p.get("open"),
-                          "prev_close": prev_close_by_code.get(str(p.get("code")))}
-                         for p in points if str(p.get("code")) in code_set]
-            # 守恒：候选 = n_samples + missing_open_count（无 bar / open 缺失 /
-            # T-1 无收盘均计 missing_open；0.9.0 之前静默丢弃）
-            missing_open = len(code_set) - sum(
-                1 for s in snapshots
-                if s["open_price"] is not None and s["prev_close"] is not None)
-            snapshots = [s for s in snapshots
-                         if s["open_price"] is not None and s["prev_close"] is not None]
-        else:
-            snapshots = [{"code": p["code"], "open_price": p.get("open"),
-                          "prev_close": prev_close_by_code.get(str(p.get("code")))}
-                         for p in points]
-            # 兜底全市场路径无候选语义：prev_close 缺失防御剔除（0.8.13 语义不变）
-            snapshots = [s for s in snapshots if s["prev_close"] is not None]
-        metrics = _auction_compute_metrics(snapshots)
-        metrics = {**metrics, "missing_open_count": missing_open}
-        series_by = {}
-        for m in AUCTION_METRICS:
-            value = metrics.get(m)
-            if value is None:      # n_samples=0 时指标为 None：不入序列
-                continue
-            series_by[m] = _auction_append_series(
-                _auction_series_read, _auction_series_write, m, value, today)
-        payload = _auction_build_payload(snapshots, series_by,
-                                         computed_at=_now_iso(), value_source="kline")
-        mydb_write(_auction_metrics_key(today),
-                   [("metrics", payload)])  # 原生 dict
-        log(f"📊 打板收口对账（{today}）: 明日清单 {len(listing.get('codes') or [])} 只，"
-            f"对账 {reconciled} 条（偏差告警 {diff_alerts}），"
-            f"premium_mean={metrics.get('premium_mean')}")
-        return {"ok": True, "list_count": len(listing.get("codes") or []),
-                "reconciled": reconciled, "diff_alerts": diff_alerts,
-                "metrics": metrics, "rank_60d": payload.get("rank_60d"), "strength_60d": payload.get("strength_60d")}
-    except Exception as exc:  # noqa: BLE001 - 单块降级：异常不抛给调度线程/HTTP
-        log(f"⚠️ 打板收口对账失败（{today}）: {exc}")
-        try:
-            notify_alert("error", "打板对账", f"收口任务失败（{today}）: {exc}")
-        except Exception:  # noqa: BLE001 - 告警通道异常忽略
-            pass
-        return {"ok": False, "reason": str(exc), "list_count": 0, "reconciled": 0,
-                "diff_alerts": 0, "metrics": None}
-
-
-def _auction_points_for_codes(date: str, codes: list[str]) -> list[dict]:
-    """按 200/批分块拉取指定代码单日点集并合并（MCP 显式清单硬上限 1-200，0.8.9）。
-
-    打板溢价日清单可达 200+ 只（全市场口径修复后实测 256），显式路径一次传超限
-    会 ValueError——分块后逐批拉取、合并去重（by_code dict 天然去重）。
-    """
-    points: list[dict] = []
-    for i in range(0, len(codes), 200):
-        chunk = codes[i:i + 200]
-        points.extend(
-            (_auction_query_snapshot({"date": date, "codes": chunk, "limit": 0}) or {})
-            .get("points") or [])
-    return points
-
-
-def auction_run_backfill(days: int = 60) -> dict:
-    """历史序列回填任务（0.8.1 冷启动修复：首跑前序列为空 → 当日分位无分母）。
-
-    用历史 K 线把过去 `days` 个交易日的业务指标（溢价均值/成功率）逐日重算：
-      - 打板序列:<metric>：滚动序列（分位分母），按时间正序裁剪至 60
-      - 打板指标:<T>：逐日指标 + 当日可得的滚动分位（只用 T 之前的值，无未来函数），
-        value_source="kline"，供研究直接读历史
-    幂等：全量重算覆盖写（确定性，重跑结果一致）。
-
-    流程：以最新已同步交易日 L 为起点，逐日回推：T-1 K线算清单 → T K线算溢价指标。
-    """
-    if not AUCTION_MODULES_AVAILABLE:
-        return {"ok": False, "reason": f"打板模块未就绪：{AUCTION_IMPORT_ERROR}",
-                "backfilled_days": 0, "series": {}}
-    try:
-        latest = str(data_latest_date() or "").replace("-", "")
-        if not latest:
-            return {"ok": False, "reason": "无法确定最新交易日", "backfilled_days": 0, "series": {}}
-
-        # 第一遍：按时间正序收集 (date, metrics)，从最旧到最新
-        rows: list[tuple[str, dict]] = []
-        t = latest
-        for _ in range(days):
-            t1 = _auction_prev_trade_date(t)          # T-1 交易日（涨停判定日）
-            pts1 = (_auction_query_snapshot({"date": t1, "limit": 0}) or {}).get("points") or []
-            # 0.8.15：判定参考价 = 上一实际成交日未复权收盘（拉 t2 快照）；
-            # 除权日例外（当日 pre_close = 法定参考价）
-            t2 = _auction_prev_trade_date(t1)
-            pts2 = (_auction_query_snapshot({"date": t2, "limit": 0}) or {}).get("points") or []
-            pts1 = _auction_apply_reference(pts1, t1, _auction_lag_close(pts2))
-            codes = _auction_compute_limitup_list(pts1).get("codes") or []
-            # T-1 收盘价（0.8.13：溢价分母 = "t-1 日收盘价"——T 日 bar 的 pre_close
-            # 在除权除息日为交易所调整昨收，会混入分红使溢价失真，不可用作分母）
-            prev_close_by_code = {str(p.get("code")): p.get("close") for p in pts1}
-            snaps = []
-            missing_open = 0  # 0.9.0 M1 边界 c：板日涨停但指标日无有效 (open, prev_close)
-            if codes:
-                # 溢价日只查清单股（免全扫）；清单可能 >200 只 → 分块拉取（0.8.9）
-                pts_t = _auction_points_for_codes(t, codes)
-                by_code = {str(p.get("code")): p for p in pts_t}
-                for c in codes:
-                    p = by_code.get(c)
-                    prev_close = prev_close_by_code.get(c)
-                    if p and p.get("open") is not None and prev_close is not None:
-                        snaps.append({"code": c, "open_price": p.get("open"),
-                                      "prev_close": prev_close})
-                    else:
-                        missing_open += 1  # 守恒：候选 = n_samples + missing_open_count
-            m = _auction_compute_metrics(snaps)
-            m = {**m, "missing_open_count": missing_open}
-            if m["n_samples"] > 0:
-                rows.append((t, m))
-            t = t1
-        rows.reverse()  # 最旧 → 最新
-
-        # 第二遍：写逐日指标 + 用"当日之前"的值算滚动分位（无未来函数）
-        # 0.8.11：分位口径改为用户拍板定义——此前 60 个有效观测中严格低于当日值
-        # 的天数/60；不足 60 个观测 → None（历史回填日因此无分位，属预期）
-        all_vals = {metric: [] for metric in AUCTION_METRICS}
-        for (d, m) in rows:
-            rank = {}
-            for metric in AUCTION_METRICS:
-                if m.get(metric) is not None:
-                    rank[metric] = _auction_percentile_rank(m[metric], all_vals[metric][-60:])
-            strength = {metric: _auction_strength_label(rank.get(metric))
-                        for metric in AUCTION_METRICS}
-            payload = {"metrics": m,
-                       "rank_60d": rank,
-                       "strength_60d": strength,
-                       "window": 60, "n_samples": m["n_samples"],
-                       "computed_at": _now_iso(), "value_source": "kline",
-                       "contract": "auction-metric-v1"}
-            mydb_write(_auction_metrics_key(d),
-                       [("metrics", payload)])  # 原生 dict
-            for metric in AUCTION_METRICS:
-                if m.get(metric) is not None:
-                    all_vals[metric].append(m[metric])
-
-        # 写序列（正序、裁剪 60）：周一 09:26 分位的分母
-        series_result = {}
-        for metric in AUCTION_METRICS:
-            vals = all_vals[metric][-60:]
-            seq = {"metric": metric, "values": vals,
-                   "window": 60, "contract": "auction-metric-v1",
-                   "updated_at": _now_iso(), "source": "backfill-kline"}
-            mydb_write(_auction_series_key(metric),
-                       [("series", seq)])  # 原生 dict
-            series_result[metric] = len(vals)
-        return {"ok": True, "backfilled_days": len(rows), "series": series_result}
-    except Exception as exc:  # noqa: BLE001 - 单块降级
-        log(f"⚠️ 打板历史回填失败：{exc}")
-        return {"ok": False, "reason": str(exc), "backfilled_days": 0, "series": {}}
-
-
-def auction_run_backfill_async(days: int = 60) -> dict:
-    """异步触发历史回填（0.8.2）：60 天全市场扫描是分钟级重活，不能占请求线程。
-
-    单飞防重：已在运行 → 返回 {ok:False, reason:"回填已在运行中"}，绝不并发第二份；
-    否则后台线程执行 auction_run_backfill，状态进 _auction_backfill_state
-    （GET /api/auction/status 查询），请求立即返回 {ok:True, async:True}。
-    幂等：重跑覆盖写，结果确定性。
-    """
-    if _auction_backfill_state["running"]:
-        return {"ok": False, "async": True, "reason": "回填已在运行中",
-                "started": _auction_backfill_state["started"]}
-
-    def _worker():
-        _auction_backfill_state.update(running=True, started=_now_iso(),
-                                       finished=None, result=None)
-        try:
-            result = auction_run_backfill(days)
-        except Exception as exc:  # noqa: BLE001 - 状态落库，绝不外抛
-            result = {"ok": False, "reason": str(exc), "backfilled_days": 0, "series": {}}
-        _auction_backfill_state.update(running=False, finished=_now_iso(), result=result)
-        log(f"📊 打板历史回填完成：{result}")
-
-    threading.Thread(target=_worker, daemon=True).start()
-    return {"ok": True, "async": True, "reason": "回填已启动（后台执行，GET /api/auction/status 查进度）"}
-
-
-def auction_scheduler_loop() -> None:
-    """打板竞价调度线程：每 2s 轮询，严格交易日触发采集/收口（独立线程，与现有调度并列）。
-
-    触发语义：now>=AUCTION_COLLECT_TIME（默认 09:26）且当日 collect 未触发 → 线程内
-    同步执行 auction_run_collect；now>=AUCTION_CLOSE_TIME（默认 16:30）且当日 close
-    未触发 → 同步执行 auction_run_close；任务完成后守卫置位（防重复触发）。
-    任务函数内部单块 try/except 降级不抛异常；即便硬异常也经 finally 置位守卫，
-    避免 2s 轮询空转重试。进程重启后内存守卫清空，同日可能再触发一次——采集/收口
-    均按 key 覆盖写/回写覆盖，天然幂等，不产生重复数据。
-    """
-    while True:
-        try:
-            dt_now = datetime.now()
-            if not is_trading_day(dt_now.date()):   # 严格交易日：休市/周末不触发
-                time.sleep(2)
-                continue
-            today = dt_now.strftime("%Y%m%d")
-            now_hm = dt_now.strftime("%H:%M")
-            guard = _auction_fired.setdefault(today, {"collect": False, "close": False})
-            if now_hm >= AUCTION_COLLECT_TIME and not guard["collect"]:
-                try:
-                    res = auction_run_collect()
-                    log(f"📊 打板竞价采集完成（{today}）: ok={res.get('ok')} "
-                        f"collected={res.get('collected')} errors={res.get('errors_count')} "
-                        f"reason={res.get('reason') or ''}")
-                finally:
-                    guard["collect"] = True  # 完成后置位：当日不重复触发
-            elif now_hm >= AUCTION_CLOSE_TIME and not guard["close"]:
-                try:
-                    res = auction_run_close()
-                    log(f"📊 打板收口对账完成（{today}）: ok={res.get('ok')} "
-                        f"list={res.get('list_count')} reconciled={res.get('reconciled')} "
-                        f"diff_alerts={res.get('diff_alerts')} reason={res.get('reason') or ''}")
-                finally:
-                    guard["close"] = True
-        except Exception as exc:  # noqa: BLE001 - 调度线程异常不退出（与 scheduler_loop 同级容错）
-            log(f"📈 打板调度线程异常: {exc}")
-        time.sleep(2)
+        from mcp.stockdb_mcp_server import query_point_snapshot as _auction_query_snapshot
+    except Exception:  # noqa: BLE001 - MCP 缺失时打板用例整体降级
+        _auction_query_snapshot = None
+    _auction_tasks.query_snapshot = _auction_query_snapshot
+    _auction_tasks.data_latest = data_latest_date
+    _auction_tasks.is_fq_event = (pybao_tools.is_fq_event_date
+                                  if pybao_tools is not None else None)
+    _auction_tasks.is_trading_day = is_trading_day
 
 
 def main():
+    _wire_auction_tasks()  # 组合根：服务层依赖注入（0.9.2 批次 4）
     print(f"webui listening on 0.0.0.0:{LISTEN_PORT}", file=sys.stderr)
     print(f"stockdb: {STOCKDB_HOST}:{STOCKDB_PORT}（同容器进程）| data: {DATA_DIR}", file=sys.stderr)
     threading.Thread(target=scheduler_loop, daemon=True).start()
