@@ -60,7 +60,8 @@ emotion-v1：窗口 60、rank∈[0,1] 越小越弱；**分位与强弱标签口�
 
 ```
 打板指标:<YYYYMMDD> → JSON
-{ "metrics": {"premium_mean": .., "success_rate": .., "n_samples": ..},
+{ "metrics": {"premium_mean": .., "success_rate": .., "n_samples": ..,
+              "missing_open_count": ..},
   "rank_60d": {"premium_mean": .., "success_rate": ..},
   "strength_60d": {"premium_mean": "strong|weak|neutral|null", ..},
   "window": 60, "computed_at": ..,
@@ -69,6 +70,16 @@ emotion-v1：窗口 60、rank∈[0,1] 越小越弱；**分位与强弱标签口�
 打板序列:<metric> → JSON   # 分位分母：滚动 60 交易日序列（仅存有效观测）
 { "metric": "premium_mean", "values": [...60..], "dates": [...] }
 ```
+
+**missing_open_count 计数语义（0.9.0 M1 边界 c 修正，2026-08-16 设计定稿）**：
+- 定义：候选清单（T-1 板日涨停、非一字板）中，T 日取不到 `(open, prev_close)` 有效对的
+  股票家数——K线路径为 T 日无 bar（停牌/退市/未上市），竞价路径为无快照或
+  `open_price=None`
+- 守恒检查：`候选数 = 一字板数 + n_samples + missing_open_count`（单测断言，防静默丢弃）
+- **不影响指标值**：n_samples/均值/成功率仅用有效样本；missing_open_count 是审计计数，
+  用于暴露数据缺口（如 002310 类上游缺失会在计数中显形）
+- 0.9.0 之前该语义缺失：板日涨停但指标日无 bar 的股票被静默丢弃（仅 MCP 当日段
+  口径有计数，回填/收口路径未计）
 
 **分位定义**（严格按用户公式，0.8.11 起）：
 ```
