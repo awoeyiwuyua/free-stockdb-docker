@@ -63,6 +63,7 @@ import config                    # 配置单一入口（0.9.1）
 from ops import alerts as ops_alerts  # 告警中心（0.9.2 批次 2 迁 ops/alerts.py）
 from storage.providers import free_stockdb as free_stockdb_mod  # 引擎闸口（批次 3）
 from storage.providers import mydb_store as mydb_store_mod      # mydb 读写（批次 3）
+from services import auction_tasks as auction_tasks_mod          # 打板用例（批次 4）
 
 # 静默 stdlib 无害噪声：urllib 探测非 2xx 时抛出的 HTTPError 内持临时文件，
 # 对象被 GC 时 tempfile 模块发出的 ResourceWarning（本模块主动吞异常是预期行为）。
@@ -187,7 +188,8 @@ class _LimitReferenceTests(_OpsTestCase):
         pts = [{"code": "600000", "name": "X", "open": 4.6, "close": 4.72,
                 "prev_close": 4.207, "high": 4.72, "low": 4.6,
                 "is_st": False, "status": "TRADED"}]
-        with mock.patch("mcp.pybao_tools.is_fq_event_date", return_value=False):
+        # 0.9.2 批次 4：除权判定走服务层注入点 is_fq_event
+        with mock.patch.object(auction_tasks_mod, "is_fq_event", return_value=False):
             fixed = app._auction_apply_reference(pts, "20260507", {"600000": 4.289})
         self.assertAlmostEqual(fixed[0]["prev_close"], 4.289)
         from auction_list import compute_limitup_list
@@ -201,19 +203,19 @@ class _LimitReferenceTests(_OpsTestCase):
         pts = [{"code": "000100", "name": "X", "open": 4.6, "close": 4.72,
                 "prev_close": 4.58, "high": 4.72, "low": 4.6,
                 "is_st": False, "status": "TRADED"}]
-        with mock.patch("mcp.pybao_tools.is_fq_event_date", return_value=True):
+        with mock.patch.object(auction_tasks_mod, "is_fq_event", return_value=True):
             fixed = app._auction_apply_reference(pts, "20260611", {"000100": 9.99})
         self.assertEqual(fixed[0]["prev_close"], 4.58)  # 原样保留
 
     def test_apply_reference_fallback(self):
         """lag 缺失（停牌跨日）/SDK 不可用 → 原值兜底。"""
         pts = [{"code": "600000", "prev_close": 10.0, "close": 11.0}]
-        with mock.patch("mcp.pybao_tools.is_fq_event_date", return_value=False):
+        with mock.patch.object(auction_tasks_mod, "is_fq_event", return_value=False):
             # lag 缺失 → 原值
             self.assertEqual(app._auction_apply_reference(pts, "20260507", {}), pts)
             # SDK 异常 → 原值
-            with mock.patch("mcp.pybao_tools.is_fq_event_date",
-                            side_effect=RuntimeError("boom")):
+            with mock.patch.object(auction_tasks_mod, "is_fq_event",
+                                   side_effect=RuntimeError("boom")):
                 self.assertEqual(app._auction_apply_reference(pts, "20260507",
                                                               {"600000": 9.0}), pts)
 
@@ -1141,17 +1143,23 @@ class _AuctionBackfillTests(_OpsTestCase):
             return {"table": table, "key": key,
                     "values": {str(k): v for k, v in rows.items()}}
 
-        self._patch_snap = mock.patch.object(app, "_auction_query_snapshot", side_effect=fake_snapshot)
+        # 0.9.2 批次 4：打板用例迁 services/auction_tasks.py，patch 服务层注入点
+        # 装配日历注入点（组合根 main() 才装配；测试直接绑定真实交易日历）
+        auction_tasks_mod.is_trading_day = app.is_trading_day
+        self._patch_snap = mock.patch.object(auction_tasks_mod, "query_snapshot",
+                                             side_effect=fake_snapshot)
         self._patch_write = mock.patch.object(app, "mydb_write", side_effect=fake_write)
         self._patch_read = mock.patch.object(app, "mydb_read", side_effect=fake_read)
-        # 0.9.2 批次 3：序列读写经 storage.providers.mydb_store（同函数级替身，
+        # 序列读写经 storage.providers.mydb_store（同函数级替身，
         # 覆盖 storage 内部绑定——打板任务走 app 绑定、序列读写走 storage 绑定）
         self._patch_store_write = mock.patch.object(mydb_store_mod, "mydb_write",
                                                     side_effect=fake_write)
         self._patch_store_read = mock.patch.object(mydb_store_mod, "mydb_read",
                                                    side_effect=fake_read)
-        self._patch_latest = mock.patch.object(app, "data_latest_date", return_value="20260814")
-        self._patch_prev = mock.patch.object(app, "_auction_prev_trade_date", side_effect={
+        self._patch_latest = mock.patch.object(auction_tasks_mod, "data_latest",
+                                               return_value="20260814")
+        self._patch_prev = mock.patch.object(auction_tasks_mod, "_auction_prev_trade_date",
+                                             side_effect={
             "20260814": "20260813", "20260813": "20260812",
             "20260812": "20260811", "20260811": "20260810",
         }.get)
@@ -1226,7 +1234,9 @@ class _AuctionBackfillTests(_OpsTestCase):
     def test_close_missing_open_counted(self):
         """0.9.0 边界 c（收口路径）：清单股指标日无 bar → missing_open_count 守恒。"""
         today = datetime.date.today().strftime("%Y%m%d")
-        prev_day = app._auction_prev_trade_date(today)
+        # 0.9.2 批次 4：prev 日取服务层 patch 面（setUp 已 patch dict.get → 本用例
+        # today 不在映射 → None；与 close 内部调用同一 patch 面，fake 匹配一致）
+        prev_day = auction_tasks_mod._auction_prev_trade_date(today)
 
         def fake_close_snapshot(args):
             d = args.get("date")
@@ -1242,8 +1252,8 @@ class _AuctionBackfillTests(_OpsTestCase):
                 ]}
             return {"points": []}
 
-        with mock.patch.object(app, "data_latest_date", return_value=today), \
-             mock.patch.object(app, "_auction_query_snapshot", side_effect=fake_close_snapshot):
+        with mock.patch.object(auction_tasks_mod, "data_latest", return_value=today), \
+             mock.patch.object(auction_tasks_mod, "query_snapshot", side_effect=fake_close_snapshot):
             # 预置今日清单：候选 = 600004（有溢价点）+ 600005（指标日无 bar）
             self.store[f"清单:{today}:limitup_non_yizi"] = {
                 "list": {"codes": ["600004", "600005"]}}
@@ -1293,7 +1303,7 @@ class _AuctionBackfillTests(_OpsTestCase):
             captured.append(list(args.get("codes") or []))
             return {"points": [{"code": c} for c in (args.get("codes") or [])]}
 
-        with mock.patch.object(app, "_auction_query_snapshot", side_effect=fake_snapshot_capture):
+        with mock.patch.object(auction_tasks_mod, "query_snapshot", side_effect=fake_snapshot_capture):
             pts = app._auction_points_for_codes(
                 "20260814", [f"{600000 + i}" for i in range(250)])
         self.assertEqual(len(captured), 2)
