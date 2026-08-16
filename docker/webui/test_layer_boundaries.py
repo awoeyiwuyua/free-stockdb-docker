@@ -26,7 +26,7 @@ ALLOWED = {
 LAYER_PACKAGES = ("web", "services", "core", "storage", "ops")
 # 接口层 MCP 侧（0.9.2 前领域模块暂住 mcp/，本检查对 mcp/ 暂不设限，批次 5 归位后收紧）
 FORBIDDEN = {
-    "services": {"web", "mcp"},
+    "services": {"web", "mcp", "storage.providers"},  # 0.9.5 M5：服务层只依赖注入的仓储接口
     "storage": {"web", "services", "core", "mcp"},
     "ops": {"web", "services", "core", "mcp"},
     "core": {"web", "services", "storage", "ops", "mcp"},
@@ -34,16 +34,16 @@ FORBIDDEN = {
 
 
 def scan_imports(source: str) -> list[str]:
-    """解析源码 → 顶层 import 的包名列表（绝对导入；相对导入推导目标包）。"""
+    """解析源码 → import 的完整模块名列表（绝对导入；相对导入推导目标包）。"""
     tree = ast.parse(source)
     out: list[str] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
-                out.append(alias.name.split(".")[0])
+                out.append(alias.name)
         elif isinstance(node, ast.ImportFrom) and node.module:
             if node.level == 0:
-                out.append(node.module.split(".")[0])
+                out.append(node.module)
             else:
                 # 相对导入：level=1 指向本包；level=2 指向父包（webui 根，非层）
                 parts = node.module.split(".") if node.module else []
@@ -53,13 +53,19 @@ def scan_imports(source: str) -> list[str]:
 
 
 def check_source(source: str, layer: str) -> list[str]:
-    """单文件依赖检查：返回违规 import 描述列表（空 = 合规）。"""
+    """单文件依赖检查：返回违规 import 描述列表（空 = 合规）。
+
+    匹配规则：先按首段包名查 ALLOWED/FORBIDDEN；完整名命中 FORBIDDEN
+    （如 services 禁 storage.providers）同样违规。
+    """
     violations = []
-    for pkg in scan_imports(source):
+    for full in scan_imports(source):
+        pkg = full.split(".")[0]
         if pkg == layer or pkg in ALLOWED.get(layer, set()):
             continue
-        if pkg in LAYER_PACKAGES or pkg in FORBIDDEN.get(layer, set()):
-            violations.append(f"{layer}/ 越界 import {pkg}")
+        if (pkg in LAYER_PACKAGES or pkg in FORBIDDEN.get(layer, set())
+                or full in FORBIDDEN.get(layer, set())):
+            violations.append(f"{layer}/ 越界 import {full}")
     return violations
 
 

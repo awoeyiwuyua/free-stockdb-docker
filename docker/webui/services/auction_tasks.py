@@ -18,16 +18,18 @@ from datetime import datetime, timedelta
 import config  # 模块引用（打板调度触发点等）
 from ops.alerts import notify_alert
 from ops.logging import log
-from storage.providers import mydb_store as _mydb  # 模块引用（测试 patch storage 生效）
 from storage.records import append as _records_append  # 日检记录（0.9.2 批次 7）
 
-# ---- 依赖注入点（app.py 装配时绑定；避免 services → 接口层 import 违反层纪律） ----
-# 0.9.2 过渡：query_snapshot/is_fq_event/is_trading_day 的实现仍驻 mcp/ 与 app.py，
-# 批次 5（core 归位）与批次 6（web 拆分）后下沉/归位，注入点随之收敛。
+# ---- 依赖注入点（app.py 装配时绑定）----
+# 0.9.2：query_snapshot/data_latest/is_fq_event/is_trading_day（接口层/探针/日历）
+# 0.9.5（M5）：research_store —— 研究成果仓储（SqliteResearchStore 主线 /
+#   MydbResearchStore 回滚，见 storage/research_factory.py）；应用层只依赖接口，
+#   不感知存储实现（D3/D8 兑现）。
 query_snapshot = None   # mcp.stockdb_mcp_server.query_point_snapshot（全市场单日快照）
 data_latest = None      # app.data_latest_date（最新交易日探针）
 is_fq_event = None      # mcp.pybao_tools.is_fq_event_date（除权事件日判定）
 is_trading_day = None   # app.is_trading_day（交易日历判定）
+research_store = None   # storage.research_store.ResearchStore 实现（工厂注入）
 
 
 def _now_iso() -> str:
@@ -117,21 +119,36 @@ def _auction_lag_close(points: list[dict]) -> dict:
 
 
 def _auction_load_codes(trade_date: str) -> list[str]:
-    """读 mydb 清单:<date>:limitup_non_yizi 的 codes；缺失/损坏/为空 → []。
+    """读研究成果清单（research store）的 codes；缺失/损坏/为空 → []。
 
     返回 [] 时调用方走兜底现算路径（query_point_snapshot + compute_limitup_list）。
+    0.9.5（M5）：清单存 research store（SqliteResearchStore 主线 / mydb 回滚适配）。
     """
     try:
-        res = _mydb.mydb_read(_auction_list_key(trade_date), "")
-        for v in (res.get("values") or {}).values():
-            if v is None:
-                continue
-            data = json.loads(v) if isinstance(v, str) else v
-            if isinstance(data, dict) and isinstance(data.get("codes"), list):
-                return [str(c) for c in data["codes"]]
+        if research_store is None:
+            return []
+        data = research_store.read_list(trade_date)
+        if isinstance(data, dict) and isinstance(data.get("codes"), list):
+            return [str(c) for c in data["codes"]]
     except Exception:  # noqa: BLE001 - 清单缺失/损坏 → 兜底现算
         return []
     return []
+
+
+def _research_series_read(key: str):
+    """打板序列读取（0.9.5：research store 接口适配；key=打板序列:<metric>）。"""
+    if research_store is None:
+        return None
+    try:
+        return research_store.read_series(str(key).split(":")[-1])
+    except Exception:  # noqa: BLE001 - 序列缺失/损坏 → 调用方按空序列处理
+        return None
+
+
+def _research_series_write(key: str, value) -> None:
+    """打板序列写入（0.9.5：research store 接口适配；覆盖写幂等）。"""
+    if research_store is not None:
+        research_store.write_series(str(key).split(":")[-1], value)
 
 
 def _auction_prev_trade_date(d8: str, n: int = 1) -> str:
@@ -199,21 +216,21 @@ def auction_run_collect() -> dict:
             row["diff_pct"] = None             # 对账后回填
             row["reconciled_at"] = None
             items.append((str(snap["code"]), row))  # 0.8.6：pybao 存原生 dict，不存 JSON 字符串
-        if items:                              # 空 items 时 _mydb.mydb_write 会抛 ValueError
-            _mydb.mydb_write(f"竞价快照:{today}", items)
+        if items:                              # 空 items 时仓储写会抛 ValueError
+            research_store.write_snapshots(today, dict(items))
 
         # ③ 当日业务值 + 60 日分位（竞价版；序列由 16:30 K线权威版追加，此处只读近 59 日）
         metrics = _auction_compute_metrics(ok_items)
-        series_by = {m: _auction_load_series(_mydb.auction_series_read, m) for m in AUCTION_METRICS}
+        series_by = {m: _auction_load_series(_research_series_read, m) for m in AUCTION_METRICS}
         payload = _auction_build_payload(ok_items, series_by,
                                          computed_at=_now_iso(), value_source="auction")
-        _mydb.mydb_write(_auction_metrics_key(today),
-                   [("metrics", payload)])  # 原生 dict
+        research_store.write_metrics(today, payload)
         log(f"📊 打板竞价采集（{today}）: {len(ok_items)} 只快照（errors={len(errors)}），"
             f"premium_mean={metrics.get('premium_mean')}, n={metrics.get('n_samples')}")
         _records_append({"date": today, "task": "collect", "ok": True,
                          "collected": len(ok_items), "errors": len(errors),
                          "metrics": metrics, "at": _now_iso()})
+        _daily_backup()  # 0.9.5 M5：日检后自动备份研究成果库
         return {"ok": True, "collected": len(ok_items), "errors_count": len(errors),
                 "metrics": metrics, "rank_60d": payload.get("rank_60d"), "strength_60d": payload.get("strength_60d")}
     except Exception as exc:  # noqa: BLE001 - 单块降级：采集异常不抛给调度线程/HTTP
@@ -266,18 +283,15 @@ def auction_run_close() -> dict:
         list_payload = {"codes": listing.get("codes") or [],
                         "computed_at": _now_iso(),
                         "contract": "limitup-non-yizi-v1"}
-        _mydb.mydb_write(_auction_list_key(tomorrow),
-                   [("list", list_payload)])
+        research_store.write_list(tomorrow, list_payload)
 
         # ③ 对账：今日 09:26 竞价快照 vs 今日 K线开盘价（口径偏差长期监测）
-        snap_res = _mydb.mydb_read(f"竞价快照:{today}", "")
+        # 0.9.5（M5）：快照存 research store（read_snapshots 返回 {code: row}）
+        snap_rows = (research_store.read_snapshots(today)
+                     if research_store is not None else {})
         reconcile_items: list[tuple] = []
         reconciled, diff_alerts = 0, 0
-        for code, raw in (snap_res.get("values") or {}).items():
-            try:
-                row = json.loads(raw) if isinstance(raw, str) else raw
-            except (TypeError, ValueError):
-                continue
+        for code, row in snap_rows.items():
             if not isinstance(row, dict):
                 continue
             pt = points_by_code.get(str(code))
@@ -304,13 +318,13 @@ def auction_run_close() -> dict:
                 except Exception:  # noqa: BLE001 - 告警通道异常不阻塞对账
                     pass
         if reconcile_items:
-            _mydb.mydb_write(f"竞价快照:{today}", reconcile_items)  # 一次批量回写
+            research_store.write_snapshots(today, dict(reconcile_items))
 
         # ④ K线权威指标：与 09:26 竞价版同一清单口径（保证两版可比）；
         #    清单缺失 → 当日快照代码 → 全市场（逐级兜底）
         #    0.8.13：溢价分母 = T-1 收盘价（补拉 T-1 快照；T 日 bar 的 pre_close
         #    在除权除息日为调整昨收，混入分红会失真）
-        codes = _auction_load_codes(today) or [str(c) for c in (snap_res.get("values") or {})]
+        codes = _auction_load_codes(today) or list(snap_rows)
         prev_close_by_code = _auction_lag_close(prev_points)
         missing_open = 0  # 0.9.0 M1 边界 c：清单股取不到 (open, prev_close) 有效对
         if codes:
@@ -339,11 +353,10 @@ def auction_run_close() -> dict:
             if value is None:      # n_samples=0 时指标为 None：不入序列
                 continue
             series_by[m] = _auction_append_series(
-                _mydb.auction_series_read, _mydb.auction_series_write, m, value, today)
+                _research_series_read, _research_series_write, m, value, today)
         payload = _auction_build_payload(snapshots, series_by,
                                          computed_at=_now_iso(), value_source="kline")
-        _mydb.mydb_write(_auction_metrics_key(today),
-                   [("metrics", payload)])  # 原生 dict
+        research_store.write_metrics(today, payload)
         log(f"📊 打板收口对账（{today}）: 明日清单 {len(listing.get('codes') or [])} 只，"
             f"对账 {reconciled} 条（偏差告警 {diff_alerts}），"
             f"premium_mean={metrics.get('premium_mean')}")
@@ -351,6 +364,7 @@ def auction_run_close() -> dict:
                          "list_count": len(listing.get("codes") or []),
                          "reconciled": reconciled, "diff_alerts": diff_alerts,
                          "metrics": metrics, "at": _now_iso()})
+        _daily_backup()  # 0.9.5 M5：日检后自动备份研究成果库
         return {"ok": True, "list_count": len(listing.get("codes") or []),
                 "reconciled": reconciled, "diff_alerts": diff_alerts,
                 "metrics": metrics, "rank_60d": payload.get("rank_60d"), "strength_60d": payload.get("strength_60d")}
@@ -453,8 +467,7 @@ def auction_run_backfill(days: int = 60) -> dict:
                        "window": 60, "n_samples": m["n_samples"],
                        "computed_at": _now_iso(), "value_source": "kline",
                        "contract": "auction-metric-v1"}
-            _mydb.mydb_write(_auction_metrics_key(d),
-                       [("metrics", payload)])  # 原生 dict
+            research_store.write_metrics(d, payload)
             for metric in AUCTION_METRICS:
                 if m.get(metric) is not None:
                     all_vals[metric].append(m[metric])
@@ -466,8 +479,7 @@ def auction_run_backfill(days: int = 60) -> dict:
             seq = {"metric": metric, "values": vals,
                    "window": 60, "contract": "auction-metric-v1",
                    "updated_at": _now_iso(), "source": "backfill-kline"}
-            _mydb.mydb_write(_auction_series_key(metric),
-                       [("series", seq)])  # 原生 dict
+            research_store.write_series(metric, seq)
             series_result[metric] = len(vals)
         return {"ok": True, "backfilled_days": len(rows), "series": series_result}
     except Exception as exc:  # noqa: BLE001 - 单块降级
@@ -499,6 +511,15 @@ def auction_run_backfill_async(days: int = 60) -> dict:
 
     threading.Thread(target=_worker, daemon=True).start()
     return {"ok": True, "async": True, "reason": "回填已启动（后台执行，GET /api/auction/status 查进度）"}
+
+
+def _daily_backup() -> None:
+    """日检后自动备份研究成果库（0.9.5 M5；失败静默，不阻塞日检）。"""
+    try:
+        if research_store is not None:
+            research_store.backup()
+    except Exception:  # noqa: BLE001 - 备份失败不影响业务
+        pass
 
 
 def auction_scheduler_loop() -> None:

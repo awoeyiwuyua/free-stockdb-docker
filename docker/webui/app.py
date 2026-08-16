@@ -2426,6 +2426,10 @@ def _wire_auction_tasks() -> None:
     _auction_tasks.is_fq_event = (pybao_tools.is_fq_event_date
                                   if pybao_tools is not None else None)
     _auction_tasks.is_trading_day = is_trading_day
+    # 0.9.5（M5）：研究成果仓储注入（SqliteResearchStore 主线 / mydb 回滚，
+    # RESEARCH_STORE 环境变量切换；应用层只依赖 ResearchStore 接口）
+    from storage.research_factory import get_research_store as _get_research_store
+    _auction_tasks.research_store = _get_research_store()
 
 
 def main():

@@ -1106,6 +1106,53 @@ class _StockdbGateTests(_OpsTestCase):
         self.assertIn("上游闸口", note)
 
 
+class _FakeResearchStore:
+    """ResearchStore 语义接口替身（0.9.5 M5）：内存 dict 存储 + 存值契约断言。"""
+
+    def __init__(self):
+        self.metrics: dict[str, dict] = {}
+        self.series: dict[str, dict] = {}
+        self.lists: dict[str, dict] = {}
+        self.snapshots: dict[str, dict[str, dict]] = {}
+
+    def _check(self, v):
+        if isinstance(v, str):
+            raise AssertionError("research store 契约违反：值不能是 JSON 字符串")
+
+    def write_metrics(self, date, payload):
+        self._check(payload)
+        self.metrics[date] = payload
+
+    def read_metrics(self, date):
+        return self.metrics.get(date)
+
+    def write_series(self, metric, payload):
+        self._check(payload)
+        self.series[metric] = payload
+
+    def read_series(self, metric):
+        return self.series.get(metric)
+
+    def write_list(self, date, payload):
+        self._check(payload)
+        self.lists[date] = payload
+
+    def read_list(self, date):
+        return self.lists.get(date)
+
+    def write_snapshots(self, date, rows):
+        self.snapshots.setdefault(date, {}).update(rows)
+
+    def read_snapshots(self, date):
+        return self.snapshots.get(date, {})
+
+    def migrate_from_engine(self):
+        return {"ok": True, "counts": {}}
+
+    def backup(self):
+        return None
+
+
 class _AuctionBackfillTests(_OpsTestCase):
     """0.8.1 历史序列回填：冷启动修复（首跑前序列为空 → 分位无分母）。
 
@@ -1139,43 +1186,21 @@ class _AuctionBackfillTests(_OpsTestCase):
 
     def setUp(self):
         super().setUp()
-        self.store = {}
         app._auction_backfill_state.update(running=False, started=None,
                                            finished=None, result=None)
 
         def fake_snapshot(args):
             return {"points": self.POINTS.get(args.get("date"), [])}
 
-        # 契约替身（0.8.6 教训）：真实 pybao 只存原生对象——JSON 字符串会被静默存空。
-        # 替身若再收到字符串直接炸，逼测试暴露"存值类型"回归，而不是像真机那样悄悄变 {}。
-        def fake_write(table, items):
-            self.store.setdefault(table, {})
-            for k, v in items:
-                if isinstance(v, str):
-                    raise AssertionError(
-                        f"mydb 契约违反：值不能是 JSON 字符串（{table}/{k}），必须存原生对象")
-                self.store[table][str(k)] = v
-
-        def fake_read(table, key=""):
-            rows = self.store.get(table, {})
-            if key:
-                return {"table": table, "key": key, "value": rows.get(key)}
-            return {"table": table, "key": key,
-                    "values": {str(k): v for k, v in rows.items()}}
-
         # 0.9.2 批次 4：打板用例迁 services/auction_tasks.py，patch 服务层注入点
         # 装配日历注入点（组合根 main() 才装配；测试直接绑定真实交易日历）
         auction_tasks_mod.is_trading_day = app.is_trading_day
+        # 0.9.5（M5）：研究成果仓储注入 fake（语义接口替身；断言存值契约：
+        # 研究产出必须为原生对象，不允许 JSON 字符串形态）
+        self._fake_research = _FakeResearchStore()
+        auction_tasks_mod.research_store = self._fake_research
         self._patch_snap = mock.patch.object(auction_tasks_mod, "query_snapshot",
                                              side_effect=fake_snapshot)
-        self._patch_write = mock.patch.object(app, "mydb_write", side_effect=fake_write)
-        self._patch_read = mock.patch.object(app, "mydb_read", side_effect=fake_read)
-        # 序列读写经 storage.providers.mydb_store（同函数级替身，
-        # 覆盖 storage 内部绑定——打板任务走 app 绑定、序列读写走 storage 绑定）
-        self._patch_store_write = mock.patch.object(mydb_store_mod, "mydb_write",
-                                                    side_effect=fake_write)
-        self._patch_store_read = mock.patch.object(mydb_store_mod, "mydb_read",
-                                                   side_effect=fake_read)
         self._patch_latest = mock.patch.object(auction_tasks_mod, "data_latest",
                                                return_value="20260814")
         self._patch_prev = mock.patch.object(auction_tasks_mod, "_auction_prev_trade_date",
@@ -1183,18 +1208,15 @@ class _AuctionBackfillTests(_OpsTestCase):
             "20260814": "20260813", "20260813": "20260812",
             "20260812": "20260811", "20260811": "20260810",
         }.get)
-        for p in (self._patch_snap, self._patch_write, self._patch_read,
-                  self._patch_store_write, self._patch_store_read,
-                  self._patch_latest, self._patch_prev):
+        for p in (self._patch_snap, self._patch_latest, self._patch_prev):
             p.start()
         self.addCleanup(lambda: [p.stop() for p in (
-            self._patch_snap, self._patch_write, self._patch_read,
-            self._patch_store_write, self._patch_store_read,
-            self._patch_latest, self._patch_prev)])
+            self._patch_snap, self._patch_latest, self._patch_prev)])
+        self.addCleanup(lambda: setattr(auction_tasks_mod, "research_store", None))
 
     def _load_series(self, metric):
-        # round-trip：走真实读取链（app._auction_series_read → mydb_read 契约替身）
-        return app._auction_load_series(app._auction_series_read, metric)
+        # round-trip：走 research store 读取链（0.9.5 M5：打板序列适配函数）
+        return app._auction_load_series(auction_tasks_mod._research_series_read, metric)
 
     def test_backfill_builds_series_and_daily_metrics(self):
         r = app.auction_run_backfill(days=3)
@@ -1223,9 +1245,8 @@ class _AuctionBackfillTests(_OpsTestCase):
         self.assertEqual(self._load_series("success_rate"), [1.0, 0.0, 0.0])
 
     def _metrics(self, d8):
-        # round-trip：走 mydb_read 契约替身（与真实读取语义一致）
-        v = app.mydb_read(f"打板指标:{d8}", "metrics").get("value")
-        return v if isinstance(v, dict) else json.loads(v)
+        # round-trip：走 research store 接口替身（0.9.5 M5）
+        return self._fake_research.read_metrics(d8)
 
     def test_backfill_idempotent(self):
         app.auction_run_backfill(days=3)
@@ -1275,8 +1296,7 @@ class _AuctionBackfillTests(_OpsTestCase):
         with mock.patch.object(auction_tasks_mod, "data_latest", return_value=today), \
              mock.patch.object(auction_tasks_mod, "query_snapshot", side_effect=fake_close_snapshot):
             # 预置今日清单：候选 = 600004（有溢价点）+ 600005（指标日无 bar）
-            self.store[f"清单:{today}:limitup_non_yizi"] = {
-                "list": {"codes": ["600004", "600005"]}}
+            self._fake_research.write_list(today, {"codes": ["600004", "600005"]})
             r = app.auction_run_close()
             self.assertTrue(r["ok"], r)
             metrics = r["metrics"] or {}
