@@ -116,6 +116,12 @@ from services.auction_tasks import (  # noqa: E402
     auction_scheduler_loop,
 )
 
+# ---- 0.9.2 批次 6：HTTP 路由表外置（web/routes.py） ----
+from web.routes import (  # noqa: E402
+    GET_ROUTES as _WEB_GET_ROUTES,
+    POST_ROUTES as _WEB_POST_ROUTES,
+)
+
 SYNC_LOG = DATA_DIR / "sync.log"
 
 # 同步线程状态
@@ -1848,48 +1854,29 @@ class Handler(BaseHTTPRequestHandler):
             self._send(500, json.dumps({"error": str(exc)}))
 
     def _route_api_get(self, path: str):
-        """GET /api/* 路由表（与原 do_GET 分支逐一对应，行为不变；新增 /api/overview）。"""
-        if path == "/api/status":
-            self._status()
-        elif path == "/api/history":
-            self._history()
-        elif path == "/api/schedule":
-            self._schedule()
-        elif path == "/api/health":
-            self._health()
-        elif path == "/api/log":
-            self._log()
-        elif path == "/api/query":
-            self._query()
-        elif path == "/api/container/logs":
-            self._container_logs()
-        elif path == "/api/data/tables":
-            self._data_tables()
-        elif path == "/api/data/read":
-            self._data_read()
-        elif path == "/api/hk/sync":
-            self._hk_sync()
-        elif path == "/api/overview":
-            self._overview()
-        elif path == "/api/auction/status":
-            self._send(200, json.dumps({"backfill": _auction_backfill_state,
-                                        "fired": _auction_fired}, ensure_ascii=False))
-        elif path == "/api/diag":
-            self._diag()
-        elif path == "/api/alerts":
-            self._alerts()
-        elif path == "/api/alerts/summary":
-            self._alerts_summary()
-        elif path == "/api/mcp/stats":
-            self._mcp_stats()
-        elif path == "/api/mcp/calls":
-            self._mcp_calls()
-        elif path == "/api/version":
-            self._version()
-        elif path == "/api/version-check":  # /api/version 别名（前端旧路径兼容）
-            self._version()
-        else:
+        """GET /api/* 路由表（0.9.2 批次 6：表外置 web/routes.py，行为不变）。"""
+        handler = _WEB_GET_ROUTES.get(path)
+        if handler is None:
             self._send(404, json.dumps({"error": "not found"}))
+            return
+        getattr(self, handler)()
+
+    def _auction_status(self):
+        """GET /api/auction/status：回填状态 + 日级守卫（0.9.2 批次 6 从内联提取）。"""
+        self._send(200, json.dumps({"backfill": _auction_backfill_state,
+                                    "fired": _auction_fired}, ensure_ascii=False))
+
+    def _auction_daily(self):
+        """GET /api/auction/daily：打板链路日检记录（0.9.2 批次 7 可观测性）。"""
+        from storage.records import recent as _records_recent
+        try:
+            limit = int(self.path.split("limit=")[-1].split("&")[0]) \
+                if "limit=" in self.path else 30
+        except (TypeError, ValueError):
+            limit = 30
+        limit = max(1, min(limit, 100))
+        self._send(200, json.dumps({"records": _records_recent(limit),
+                                    "count": limit}, ensure_ascii=False))
 
     def _serve_static(self, path: str):
         """GET 静态服务：精确命中 static 文件 → 直出（带缓存策略）；
@@ -1918,22 +1905,11 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         path = urlparse(self.path).path
         try:
-            if path == "/api/sync":
-                self._sync()
-            elif path == "/api/container/restart":
-                self._container_restart()
-            elif path == "/api/data/write":
-                self._data_write()
-            elif path == "/api/hk/sync":
-                self._hk_sync()
-            elif path == "/api/alerts/clear":
-                self._alerts_clear()
-            elif path == "/api/auction/run":
-                self._auction_run()
-            elif path == "/mcp":
-                self._mcp()
-            else:
+            handler = _WEB_POST_ROUTES.get(path)
+            if handler is None:
                 self._send(404, json.dumps({"error": "not found"}))
+                return
+            getattr(self, handler)()
         except Exception as exc:
             self._send(500, json.dumps({"error": str(exc)}))
 

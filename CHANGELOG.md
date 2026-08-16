@@ -4,6 +4,29 @@
 镜像 tag 跟随上游引擎版本。发布纪律见 `docs/webui-spa/release-policy.md`；
 部署记录见 `docs/DEPLOYMENTS.md`；本机目录关系与运行配方见 `docs/DEVELOPMENT-GUIDE.md`。
 
+## [0.9.2] — 2026-08-16（四层搬迁完成 + 可观测性三件套之打板日检）
+
+按 docs/design/application-layer.md 完成 7 批次增量搬迁（每批独立 commit、测试全绿、
+对外契约零变化——HTTP 路径/MCP 工具/信封/错误码一律不动）：
+
+| 批次 | 内容 |
+|---|---|
+| 2 | ops/alerts.py（告警中心）+ ops/logging.py（日志）从 app.py 迁出，app 保留同名转发 |
+| 3 | storage/providers/mydb_store.py（mydb 读写 + 序列薄封装）+ free_stockdb.py（引擎闸口：熔断/信号量）——**多源抽象文件边界**（D3） |
+| 4 | services/auction_tasks.py（打板采集/收口/回填 + 调度线程）——**组合根注入**（app.py 装配 query_snapshot/data_latest/is_fq_event/is_trading_day），服务层不 import 接口层（层纪律）；_auction_prev_trade_date 增 400 日防御上限 |
+| 5 | 领域归位 core/：board_metrics/auction_metrics/auction_list/calendar_xshg（旧位置兼容转发）；修正 auction_list 越界 import（core 内同层引用） |
+| 6 | web/routes.py 路由表外置（GET 18 项 + POST 7 项），Handler 按表分发；/api/auction/status 提取为方法 |
+
+可观测性（三件套之 A 落地）：
+- storage/records.py：打板日检 jsonl 存储（上限滚动/损坏容错）；采集/收口每次执行写
+  结构化日检记录（ok/结果快照/reason）
+- 新增 GET /api/auction/daily（最近 N 条日检，limit 1-100）
+- 测试 +5（records 追加/读取/损坏容错/上限滚动/缺失）；Python 237 全绿
+- 待后续版本：B 调度探活与失败告警补全、C 结构化运行日志全面化（ops/ 已就位）
+
+app.py 3266 → 约 2400 行（告警/日志/mydb/引擎闸口/打板用例/领域/路由全部迁出）；
+层边界检查（test_layer_boundaries）持续守护依赖方向。
+
 ## [0.9.1] — 2026-08-16（应用层四层架构：立框架，不搬代码）
 
 用户拍板：0.9.1 先搭四层框架，0.9.2 搬迁（设计见 docs/design/application-layer.md）：

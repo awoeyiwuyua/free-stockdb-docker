@@ -19,6 +19,7 @@ import config  # 模块引用（打板调度触发点等）
 from ops.alerts import notify_alert
 from ops.logging import log
 from storage.providers import mydb_store as _mydb  # 模块引用（测试 patch storage 生效）
+from storage.records import append as _records_append  # 日检记录（0.9.2 批次 7）
 
 # ---- 依赖注入点（app.py 装配时绑定；避免 services → 接口层 import 违反层纪律） ----
 # 0.9.2 过渡：query_snapshot/is_fq_event/is_trading_day 的实现仍驻 mcp/ 与 app.py，
@@ -210,6 +211,9 @@ def auction_run_collect() -> dict:
                    [("metrics", payload)])  # 原生 dict
         log(f"📊 打板竞价采集（{today}）: {len(ok_items)} 只快照（errors={len(errors)}），"
             f"premium_mean={metrics.get('premium_mean')}, n={metrics.get('n_samples')}")
+        _records_append({"date": today, "task": "collect", "ok": True,
+                         "collected": len(ok_items), "errors": len(errors),
+                         "metrics": metrics, "at": _now_iso()})
         return {"ok": True, "collected": len(ok_items), "errors_count": len(errors),
                 "metrics": metrics, "rank_60d": payload.get("rank_60d"), "strength_60d": payload.get("strength_60d")}
     except Exception as exc:  # noqa: BLE001 - 单块降级：采集异常不抛给调度线程/HTTP
@@ -218,6 +222,8 @@ def auction_run_collect() -> dict:
             notify_alert("error", "打板采集", f"竞价采集失败（{today}）: {exc}")
         except Exception:  # noqa: BLE001 - 告警通道异常忽略
             pass
+        _records_append({"date": today, "task": "collect", "ok": False,
+                         "reason": str(exc), "at": _now_iso()})
         return {"ok": False, "reason": str(exc), "collected": 0, "errors_count": 0,
                 "metrics": None, "rank_60d": None}
 
@@ -341,6 +347,10 @@ def auction_run_close() -> dict:
         log(f"📊 打板收口对账（{today}）: 明日清单 {len(listing.get('codes') or [])} 只，"
             f"对账 {reconciled} 条（偏差告警 {diff_alerts}），"
             f"premium_mean={metrics.get('premium_mean')}")
+        _records_append({"date": today, "task": "close", "ok": True,
+                         "list_count": len(listing.get("codes") or []),
+                         "reconciled": reconciled, "diff_alerts": diff_alerts,
+                         "metrics": metrics, "at": _now_iso()})
         return {"ok": True, "list_count": len(listing.get("codes") or []),
                 "reconciled": reconciled, "diff_alerts": diff_alerts,
                 "metrics": metrics, "rank_60d": payload.get("rank_60d"), "strength_60d": payload.get("strength_60d")}
@@ -350,6 +360,8 @@ def auction_run_close() -> dict:
             notify_alert("error", "打板对账", f"收口任务失败（{today}）: {exc}")
         except Exception:  # noqa: BLE001 - 告警通道异常忽略
             pass
+        _records_append({"date": today, "task": "close", "ok": False,
+                         "reason": str(exc), "at": _now_iso()})
         return {"ok": False, "reason": str(exc), "list_count": 0, "reconciled": 0,
                 "diff_alerts": 0, "metrics": None}
 
