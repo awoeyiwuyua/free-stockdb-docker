@@ -15,9 +15,9 @@ Claude Desktop 等 MCP 客户端通过 stdin/stdout（stdio）或 HTTP（NAS 容
 
 Usage:
     STOCKDB_HOST=100.66.1.1 STOCKDB_PORT=7899 \
-        uv run python mcp/stockdb_mcp_server.py              # stdio（MCP 客户端自动拉起）
-    uv run python mcp/stockdb_mcp_server.py --self-check     # 连通性自检
-    uv run python mcp/stockdb_mcp_server.py --http \
+        uv run python interfaces/mcp/stockdb_mcp_server.py   # stdio（MCP 客户端自动拉起）
+    uv run python interfaces/mcp/stockdb_mcp_server.py --self-check  # 连通性自检
+    uv run python interfaces/mcp/stockdb_mcp_server.py --http \
         --host 0.0.0.0 --port 8080                           # HTTP（NAS 容器部署）
 
 环境变量:
@@ -66,14 +66,17 @@ import time
 import urllib.parse
 import urllib.request
 
-# 保证同目录（mcp/）在 sys.path，使 `from board_metrics import ...` 在两种运行方式下都能找到：
-# 1) 直接 `python mcp/stockdb_mcp_server.py`（sys.path[0] 已是脚本目录）
-# 2) 作为包导入 `from mcp import stockdb_mcp_server`（sys.path 是仓库根，需补 mcp/）
+# 保证同目录（interfaces/mcp/）与仓库根（stockdb-ai/）在 sys.path：
+# 1) 直接 `python interfaces/mcp/stockdb_mcp_server.py`（sys.path[0] 已是脚本目录，
+#    但 core/ 领域层在仓库根，需补 _BASE_DIR）
+# 2) 作为包导入 `from interfaces.mcp import stockdb_mcp_server`（sys.path 是仓库根）
 _MCP_DIR = Path(__file__).resolve().parent
-if str(_MCP_DIR) not in sys.path:
-    sys.path.insert(0, str(_MCP_DIR))
+_BASE_DIR = _MCP_DIR.parent.parent  # stockdb-ai/（core/ 领域层所在）
+for _p in (_MCP_DIR, _BASE_DIR):
+    if str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
 
-from board_metrics import (  # noqa: E402  - 需先插入 sys.path 再导入同目录模块
+from core.board_metrics import (  # noqa: E402 - 领域层（单一真身；0.9.8 去 mcp shim）
     DailyBar,
     is_supported_a_share_code,
     compute_board_open_effect_details,
@@ -86,7 +89,7 @@ from board_metrics import (  # noqa: E402  - 需先插入 sys.path 再导入同�
     BOARD_OPEN_COUNTER_FIELDS,  # 当日段重组审计计数键集合（与日K行同构）
 )
 
-import calendar_xshg  # noqa: E402  - A 股交易日历（同目录模块，休市表与 app.py 保持一致）
+from core import calendar_xshg  # noqa: E402 - A 股交易日历（领域层，休市表与 app.py 一致）
 
 try:  # noqa: E402  - pybao_tools 为同目录模块（_MCP_DIR 已插入 sys.path）
     import pybao_tools

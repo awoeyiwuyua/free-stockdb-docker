@@ -2,7 +2,7 @@
 """test_auction_list — 清单计算单元测试（0.7.0；0.8.12 对齐生产 board_metrics 口径）"""
 import unittest
 
-import auction_list as AL
+from core import auction_list as AL  # 领域层真身（0.9.8 根目录 shim 已删）
 
 
 def _pt(code, o, c, pc, is_st=False, status="TRADED", name="X", high=None, low=None):

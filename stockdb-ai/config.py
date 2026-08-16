@@ -1,6 +1,6 @@
 """config — 应用层配置单一入口（0.9.1 四层架构框架）。
 
-所有环境变量读取收敛于此；各层（web/services/core/storage/ops）只引用本模块，
+所有环境变量读取收敛于此；各层（interfaces/services/core/storage/ops）只引用本模块，
 不直接读 os.environ。本模块零依赖（纯 stdlib），可被任何层导入。
 
 0.9.2 搬迁说明：app.py 中与特定功能耦合的配置（STATIC_DIR/WEBUI_UI/MIRROR_PAGE_URL/
@@ -24,7 +24,7 @@ STOCKDB_PAUSE: Path = Path(os.environ.get("STOCKDB_PAUSE_FLAG", "/data/.stockdb-
 STOCKDB_LOG_FILE: Path = Path(os.environ.get("STOCKDB_LOG_FILE", "/data/log.txt"))
 
 # 版本号（发布物标识，见 docs/webui-spa/release-policy.md）
-WEBUI_VERSION: str = "0.9.7"
+WEBUI_VERSION: str = "0.9.8"
 
 # ---- 打板调度触发点（HH:MM，非法值回退默认） ----
 # 独立函数保留（0.9.2 随调度模块归位）；默认值与历史行为一致

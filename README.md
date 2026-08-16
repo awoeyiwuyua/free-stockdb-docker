@@ -29,8 +29,9 @@ fork 自 [hello245m/free-stockdb](https://github.com/hello245m/free-stockdb) 的
 
 ## 仓库结构（0.9.1 起：四层架构框架）
 
-- `stockdb-ai/` — 应用层（后端主体）：`config.py`（配置单一入口）+ `web/ services/ core/ storage/ ops/`
-  四层骨架（0.9.2 搬迁）+ `mcp/`（MCP 服务器与 SDK 桥）+ 打板模块 + 单测（261）
+- `stockdb-ai/` — 应用层（后端主体）：`config.py`（配置单一入口）+ `interfaces/`（接口层：
+  web/ HTTP + mcp/ MCP）+ `services/ core/ storage/ ops/` 四层（0.9.2 搬迁，0.9.8 严格分层）
+  + 打板模块 + 单测（261）
 - `docker/` — 可选 docker 封装（`Dockerfile`/`docker-compose.yml`/`entrypoint.sh`）
 - `docs/` — 设计文档（`design/`）、验收记录（`acceptance/`、`DEPLOYMENTS.md`）、发布纪律
 - `.github/workflows/` — `test.yml`（PR 门禁）+ `build-image.yml`（镜像构建，仅手动、成熟后启用）

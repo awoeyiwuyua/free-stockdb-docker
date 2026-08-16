@@ -29,7 +29,7 @@ http.server mock + patch urlopen）：
 运行（自测命令，须贴 Ran/OK 与最后几行）：
     cd stockdb-ai && /Users/xiahaihe/Claudecode/stockdb-ai/.venv/bin/python -m unittest test_ops -v
 回归（mcp 不受影响）：
-    cd stockdb-ai && /Users/xiahaihe/Claudecode/stockdb-ai/.venv/bin/python -m unittest mcp.test_stockdb_mcp_server -v
+    cd stockdb-ai && /Users/xiahaihe/Claudecode/stockdb-ai/.venv/bin/python -m unittest interfaces.mcp.test_stockdb_mcp_server -v
 """
 
 from __future__ import annotations
@@ -161,7 +161,7 @@ class _LimitReferenceTests(_OpsTestCase):
 
     def test_rebuild_pure(self):
         """0.8.14 遗留函数保留兼容：反推公式 ref = pre_close × cum_latest/cum_D。"""
-        from mcp.board_metrics import rebuild_limit_reference_price as r
+        from core.board_metrics import rebuild_limit_reference_price as r
         self.assertAlmostEqual(r(4.207, 3.019, 3.079), 4.207 * 3.079 / 3.019, places=3)
         self.assertEqual(r(10.0, 1.0, 1.0), 10.0)
         self.assertEqual(r(10.0, 3.019, 3.019), 10.0)
@@ -170,7 +170,7 @@ class _LimitReferenceTests(_OpsTestCase):
 
     def test_get_fq_cum(self):
         """0.8.14 遗留函数保留兼容：因子表查询。"""
-        import mcp.pybao_tools as pt
+        from interfaces.mcp import pybao_tools as pt
         fake = mock.Mock()
         fake._fq_dates = {"000100": ["20040614", "20260611"], "600000": []}
         fake._fq_cums = {"000100": [1.012, 3.079], "600000": []}
@@ -192,7 +192,7 @@ class _LimitReferenceTests(_OpsTestCase):
         with mock.patch.object(auction_tasks_mod, "is_fq_event", return_value=False):
             fixed = app._auction_apply_reference(pts, "20260507", {"600000": 4.289})
         self.assertAlmostEqual(fixed[0]["prev_close"], 4.289)
-        from auction_list import compute_limitup_list
+        from core.auction_list import compute_limitup_list
         # lag 参考价 4.289 → 涨停价 round(4.289×1.1,2)=4.72 == close → 命中
         self.assertEqual(compute_limitup_list(fixed)["count"], 1)
         # 未替换（污染 pre_close 4.207 → 涨停价 4.63 ≠ close 4.72 → 漏判）

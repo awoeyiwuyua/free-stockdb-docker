@@ -8,8 +8,8 @@ import sys
 import unittest
 from unittest import mock
 
-from mcp import stockdb_mcp_server as server  # noqa: E402 - 先导入（_MCP_DIR 入 path）
-import sdk_bridge  # noqa: E402 - 顶层模块实例（与 server 内部引用同一实例，勿用 mcp.sdk_bridge）
+from interfaces.mcp import stockdb_mcp_server as server  # noqa: E402 - 先导入（_MCP_DIR 入 path）
+import sdk_bridge  # noqa: E402 - 顶层模块实例（与 server 内部引用同一实例，勿用 interfaces.mcp.sdk_bridge）
 
 
 class _FakeMCPModule:

@@ -4,7 +4,7 @@ import time
 import unittest
 from unittest import mock
 
-from mcp import stockdb_mcp_server as server
+from interfaces.mcp import stockdb_mcp_server as server
 import pybao_tools  # noqa: E402  - 与 server 同目录模块（_MCP_DIR 已由 server 插入 sys.path）
 
 

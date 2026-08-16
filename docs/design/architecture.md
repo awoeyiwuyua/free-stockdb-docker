@@ -41,7 +41,7 @@ AI 客户端（Claude 等）               程序/脚本                人
 
 | 层 | 内容 | 关键归属决策 |
 |---|---|---|
-| 接口层 | mcp/（MCP 服务器、契约信封、sdk_bridge）+ web/（HTTP 路由，0.9.2） | **sdk_bridge 归接口层**（提供查询服务与结果契约化）；其引擎连接走数据层 |
+| 接口层 | interfaces/mcp/（MCP 服务器、契约信封、sdk_bridge）+ interfaces/web/（HTTP 路由） | **sdk_bridge 归接口层**（提供查询服务与结果契约化）；其引擎连接走数据层；0.9.8 接口层统一收拢 interfaces/ |
 | 服务层 | services/：打板三用例、同步、日检编排 | **采集编排在服务层**；执行（腾讯/东财抓取）在数据层 |
 | 领域层 | core/：涨停判定/指标/日历（纯规则） | 零外部依赖；验收签字资产 |
 | 数据层 | storage/providers/free_stockdb.py（引擎）、providers/quote_sources.py（腾讯/东财）、providers/mydb_store.py（研究产出）、records.py | **文件边界按 provider 划分**；统一抽象接口随 M5 |
@@ -61,7 +61,7 @@ AI 客户端（Claude 等）               程序/脚本                人
 | D6 | 本机原生为主，docker 可选 | 用户拍板 |
 | D7 | 面板冻结 | ROADMAP 防漂移 |
 | D8 | **研究成果产出自持（M5 提前）**：打板指标/序列/清单等研究产出从引擎 mydb 迁出至自建存储（0.9.3） | 引擎进程内 mydb 是最大架构弱点——引擎死 = 数据不可达；自持后引擎仅是行情 provider |
-| D9 | **单进程两接口**：MCP 与 HTTP 同进程（webui）；代码保持可拆（web/ 与 mcp/ 物理分开） | 本机单人够用；将来独立 MCP 进程只是启动方式变化 |
+| D9 | **单进程两接口**：MCP 与 HTTP 同进程（webui）；代码保持可拆（interfaces/web/ 与 interfaces/mcp/ 物理分开） | 本机单人够用；将来独立 MCP 进程只是启动方式变化 |
 | D10 | **sdk_bridge 归接口层**，引擎连接归数据层 free_stockdb provider | 上游引擎被替换时 sdk_bridge 通过 provider 接口仍可用 |
 | D11 | **采集执行归数据层**（providers/quote_sources.py），编排归服务层 | 采集用例 = 编排"读清单→调源→算→存" |
 
