@@ -114,6 +114,27 @@ class SqliteStoreTest(unittest.TestCase):
         backups = sorted((Path(self.tmp) / "backups").glob("research-*.db"))
         self.assertEqual(len(backups), 2)
 
+    def test_backup_file_independently_readable(self):
+        """备份文件独立可打开且数据读回一致（VACUUM INTO 产物可离线恢复）。"""
+        import sqlite3
+        self.store.write_metrics("20260814", {"n": 1, "label": "before"})
+        b1 = self.store.backup()
+        self.assertIsNotNone(b1)
+        # 写入新数据后再备份：b1 必须保持备份时刻的快照，不受后续写入影响
+        self.store.write_metrics("20260814", {"n": 2, "label": "after"})
+        b2 = self.store.backup()
+        self.assertNotEqual(b1, b2)
+        # 独立连接（不走 store 缓存/锁）直接打开备份文件
+        with sqlite3.connect(b1) as conn:
+            tables = {r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}
+            self.assertIn("metrics", tables)
+            row = conn.execute("SELECT payload FROM metrics WHERE date=?",
+                               ("20260814",)).fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(json.loads(row[0])["n"], 1)
+        self.assertEqual(json.loads(row[0])["label"], "before")
+
     def test_factory_sqlite_default(self):
         store = research_factory.get_research_store()
         self.assertIsInstance(store, SqliteResearchStore)

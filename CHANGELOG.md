@@ -4,6 +4,22 @@
 镜像 tag 跟随上游引擎版本。发布纪律见 `docs/webui-spa/release-policy.md`；
 部署记录见 `docs/DEPLOYMENTS.md`；本机目录关系与运行配方见 `docs/DEVELOPMENT-GUIDE.md`。
 
+## [0.9.6] — 2026-08-16（应用层瘦身一：Handler 迁 web/handlers.py + 备份断言）
+
+用户采纳建议 1a（拆分 app.py）与 3（备份断言）：
+
+- **app.py 拆分**：HTTP Handler 类 + 静态服务辅助（_static_file/_ui_index/
+  version_payload/_process_rss_mb）整体迁 `web/handlers.py`（AST 逐行搬迁，
+  对外契约不变）；app.py 1791 行（拆分前 2412+），组合根职责收敛——
+  依赖方向 app → web.handlers（app 末尾导入打破循环，handlers 顶部 `from app`
+  集中取依赖）
+- **patch 面修复**：DATA_DIR / fetch_upstream_release 改模块引用（app.* 动态
+  解析），测试 patch.object(app, ...) 依旧生效（from-import 会在导入期拷贝
+  引用导致 patch 失效——沿用 ops.DATA_DIR 教训）
+- **备份断言**：新增 test_backup_file_independently_readable——备份文件独立
+  连接打开、数据读回与备份时刻快照一致（VACUUM INTO 产物可离线恢复）
+- 测试 +1；Python 261 全绿
+
 ## [0.9.5] — 2026-08-16（M5 研究成果产出自持：引擎死不影响研究数据）
 
 架构总纲 D8 落地（设计 docs/design/research-store.md，PR #91 评审合并）：
