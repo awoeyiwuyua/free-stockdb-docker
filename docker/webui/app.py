@@ -57,18 +57,24 @@ except ImportError:  # noqa: BLE001 - pybao_tools 缺失时优雅降级
     pybao_tools = None
     print("webui: 未加载 pybao_tools，/mcp SSE 流式退化为 JSON 响应", file=sys.stderr)
 
-STOCKDB_HOST = os.environ.get("STOCKDB_HOST", "127.0.0.1")
-STOCKDB_PORT = int(os.environ.get("STOCKDB_PORT", "7899"))
-DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
-SYNC_LOG = DATA_DIR / "sync.log"
-LISTEN_PORT = int(os.environ.get("WEBUI_PORT", "8080"))
+# ---- 0.9.1 四层架构：配置单一入口（config.py）----
+# 运行配置全部收敛于 config 模块（引擎地址/端口/数据目录/调度触发点/版本号/并发闸门），
+# 本文件不再直接读环境变量定义这些配置（0.9.2 各层迁移后从 config 引用）。
+from config import (  # noqa: E402 - 配置为纯 stdlib，无循环依赖
+    AUCTION_CLOSE_TIME,
+    AUCTION_COLLECT_TIME,
+    DATA_DIR,
+    LISTEN_PORT,
+    STOCKDB_HOST,
+    STOCKDB_LOG_FILE,
+    STOCKDB_MAX_CONCURRENCY,
+    STOCKDB_PAUSE,
+    STOCKDB_PIDFILE,
+    STOCKDB_PORT,
+    WEBUI_VERSION,
+)
 
-# 0.5.0 单镜像：stockdb 与 webui 同容器，进程级控制（不再依赖 docker socket）。
-# entrypoint 后台监督 stockdb 进程存活（读 pidfile，暂停标记存在时不拉起）；
-# webui 通过 pidfile + SIGTERM 停、删除暂停标记让监督器拉起。
-STOCKDB_PIDFILE = Path(os.environ.get("STOCKDB_PIDFILE", "/data/stockdb.pid"))
-STOCKDB_PAUSE = Path(os.environ.get("STOCKDB_PAUSE_FLAG", "/data/.stockdb-paused"))
-STOCKDB_LOG_FILE = Path(os.environ.get("STOCKDB_LOG_FILE", "/data/log.txt"))
+SYNC_LOG = DATA_DIR / "sync.log"
 
 # 同步线程状态
 _sync_lock = threading.Lock()
@@ -79,7 +85,6 @@ _last_verify_result: str | None = None  # 最近一次完整性验证结果（pa
 _scheduler_alive = False             # 定时线程心跳（每次循环更新时间戳）
 _scheduler_heartbeat = 0.0           # 定时线程最近一次心跳时间戳（unix）
 _webui_started = time.time()         # webui 进程启动时间戳
-WEBUI_VERSION = "0.9.0"
 
 HISTORY_FILE = DATA_DIR / "sync_history.json"
 SCHEDULE_FILE = DATA_DIR / "sync_schedule.json"
@@ -526,6 +531,7 @@ _rd_lock = threading.Lock()  # pybao rd 单连接非线程安全：全部 rd 读
 # C 扩展阻塞持 GIL → 全进程冻结。锁保证同一时刻只有一条 rd 请求在线上。
 
 
+
 def _mydb_rd_reset():
     """丢弃缓存的 rd 连接：调用失败后置空，下次调用重新 init（0.8.10 自愈楔死连接）。"""
     _mydb_rd._rd = None
@@ -817,7 +823,7 @@ _container_state_cache: dict = {"at": 0.0, "val": None}  # 5 秒缓存：stockdb
 # 每次探针都等满超时（扇出 3~4 路 × 10s），并发线程无界堆积。
 # 治理原则：探针路径（breaker=True）记仇快败；全部路径过信号量限并发；
 # 控制路径（启动等待/同步校验）只过信号量、不受熔断牵连。
-_stockdb_gate = threading.Semaphore(int(os.environ.get("STOCKDB_MAX_CONCURRENCY", "8")))
+_stockdb_gate = threading.Semaphore(STOCKDB_MAX_CONCURRENCY)  # 并发闸门（0.9.1：config 收敛）
 _stockdb_breaker: dict = {"fails": 0, "open_until": 0.0,
                           "threshold": 3, "cooldown": 300.0}
 
@@ -2726,20 +2732,8 @@ class Handler(BaseHTTPRequestHandler):
 #            对账回写（state=reconciled / diff_pct，|diff|>0.5% 告警）→
 #            K线权威指标 → 追加打板序列 → 覆盖写打板指标:<今日>（value_source=kline）。
 # 与现有调度并列：独立 2s 轮询线程 auction_scheduler_loop，不侵入 scheduler_loop。
+# 触发点 AUCTION_COLLECT_TIME/AUCTION_CLOSE_TIME 已收敛至 config.py（0.9.1）。
 
-
-def _auction_env_time(name: str, default: str) -> str:
-    """环境变量 HH:MM 校验：非法格式回退默认（调度比较依赖字符串字典序）。"""
-    v = os.environ.get(name, default)
-    try:
-        datetime.strptime(v, "%H:%M")
-    except (TypeError, ValueError):
-        return default
-    return v
-
-
-AUCTION_COLLECT_TIME = _auction_env_time("AUCTION_COLLECT_TIME", "09:26")  # 采集触发点
-AUCTION_CLOSE_TIME = _auction_env_time("AUCTION_CLOSE_TIME", "16:30")      # 收口触发点
 _auction_fired: dict = {}  # 日级防重触发守卫：{date: {"collect": bool, "close": bool}}
 _auction_backfill_state: dict = {"running": False, "started": None, "finished": None,
                                  "result": None}  # 回填任务状态（0.8.2 异步化 + 单飞防重）
