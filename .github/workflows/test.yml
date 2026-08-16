@@ -34,10 +34,16 @@ jobs:
         working-directory: docker/webui
         run: |
           python -m unittest test_ops -v > /tmp/ops.log 2>&1 || true
-          python ../../.github/scripts/ci_diagnose.py
           if grep -qE '^(FAIL|ERROR):' /tmp/ops.log; then
             exit 1
           fi
+
+      - name: Upload ops log (diagnostic)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ops-log-diagnose
+          path: /tmp/ops.log
 
       - name: Run auction collector tests
         working-directory: docker/webui
