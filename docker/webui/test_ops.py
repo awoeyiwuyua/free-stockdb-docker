@@ -59,6 +59,8 @@ from pathlib import Path
 from unittest import mock
 
 import app                       # 生产实现（被测对象）
+import config                    # 配置单一入口（0.9.1）
+from ops import alerts as ops_alerts  # 告警中心（0.9.2 批次 2 迁 ops/alerts.py）
 
 # 静默 stdlib 无害噪声：urllib 探测非 2xx 时抛出的 HTTPError 内持临时文件，
 # 对象被 GC 时 tempfile 模块发出的 ResourceWarning（本模块主动吞异常是预期行为）。
@@ -81,16 +83,19 @@ class _OpsTestCase(unittest.TestCase):
         # 回收，必须全局保持屏蔽）。
         warnings.filterwarnings("ignore", category=ResourceWarning)
         self.tmp = tempfile.mkdtemp(prefix="test_ops_")
-        # 打补丁 app.DATA_DIR 到临时目录：被测函数全部读模块全局 DATA_DIR
-        #（Alerts 单例 / mcp jsonl / 审计 / 信号目录），保证离线、无残留、互不影响。
+        # 打补丁 DATA_DIR 到临时目录（app + config 双入口，0.9.2 批次 2 起告警/日志
+        # 实现迁 ops/ 并读 config.DATA_DIR）：被测函数全部隔离，保证离线、无残留。
         self._data_patch = mock.patch.object(app, "DATA_DIR", Path(self.tmp))
+        self._data_patch_config = mock.patch.object(config, "DATA_DIR", Path(self.tmp))
         self._data_patch.start()
+        self._data_patch_config.start()
         self.addCleanup(self._reset)
 
     def _reset(self):
         self._data_patch.stop()
-        # 复位 app 模块全局态：告警单例 / MCP 内存 deque 与加载标记 / 版本探针缓存
-        app._alerts_singleton = None
+        self._data_patch_config.stop()
+        # 复位模块全局态：告警单例（ops.alerts）/ MCP 内存 deque 与加载标记 / 版本探针缓存
+        ops_alerts._alerts_singleton = None
         app._mcp_deque.clear()
         app._mcp_loaded = False
         app._mcp_file_lines = 0
@@ -380,7 +385,8 @@ class AlertsTest(_OpsTestCase):
         """跨日放行：同日去重、跨日允许再次出现（patch _now_iso 控制日期）。"""
         times = iter(["2026-08-03T10:00:00", "2026-08-03T11:00:00",
                       "2026-08-04T10:00:00"])
-        with mock.patch.object(app, "_now_iso", side_effect=lambda: next(times)):
+        # 0.9.2 批次 2：实现迁 ops/alerts.py，_now_iso 在 ops 侧
+        with mock.patch.object(ops_alerts, "_now_iso", side_effect=lambda: next(times)):
             a = self._alerts()
             a.add("info", "系统", "跨日消息")   # 08-03
             a.add("info", "系统", "跨日消息")   # 08-03 同日 → 去重
@@ -461,25 +467,25 @@ class AlertsTest(_OpsTestCase):
 
     def test_notify_alert_lazy_singleton(self):
         """notify_alert 惰性单例：首次调用创建、绑定 DATA_DIR、复用同一实例。"""
-        app._alerts_singleton = None
+        ops_alerts._alerts_singleton = None
         try:
-            self.assertIsNone(app._alerts_singleton)      # 惰性：未调用前为 None
+            self.assertIsNone(ops_alerts._alerts_singleton)  # 惰性：未调用前为 None
             e = app.notify_alert("error", "系统", "单例告警")
-            self.assertIsNotNone(app._alerts_singleton)
-            self.assertIs(app._get_alerts(), app._alerts_singleton)   # 复用
-            self.assertEqual(app._alerts_singleton.path,
+            self.assertIsNotNone(ops_alerts._alerts_singleton)
+            self.assertIs(app._get_alerts(), ops_alerts._alerts_singleton)  # 复用
+            self.assertEqual(ops_alerts._alerts_singleton.path,
                              os.path.join(self.tmp, "alerts.json"))
             self.assertTrue(os.path.isfile(os.path.join(self.tmp, "alerts.json")))
             self.assertEqual(e["level"], "error")
             app.notify_alert("error", "系统", "单例告警")  # 当日去重生效
-            self.assertEqual(app._alerts_singleton.count(), 1)
+            self.assertEqual(ops_alerts._alerts_singleton.count(), 1)
             # env 变更不影响已绑定实例（惰性只绑定首次创建时的 DATA_DIR）
             with mock.patch.dict(os.environ, {"DATA_DIR": "/elsewhere"}):
                 app.notify_alert("info", "系统", "第二条")
-            self.assertEqual(app._alerts_singleton.count(), 2)
+            self.assertEqual(ops_alerts._alerts_singleton.count(), 2)
             self.assertFalse(os.path.isfile("/elsewhere/alerts.json"))
         finally:
-            app._alerts_singleton = None
+            ops_alerts._alerts_singleton = None
 
 
 # =====================================================================
