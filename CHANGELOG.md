@@ -1,7 +1,22 @@
 # CHANGELOG
 
 本项目面板版本号 = `WEBUI_VERSION`（`docker/webui/app.py`），镜像 tag 跟随上游引擎版本。
-发布纪律见 `docs/webui-spa/release-policy.md`；部署记录见 `docs/DEPLOYMENTS.md`。
+发布纪律见 `docs/webui-spa/release-policy.md`；部署记录见 `docs/DEPLOYMENTS.md`；
+本机目录关系与运行配方见 `docs/DEVELOPMENT-GUIDE.md`。
+
+## [0.8.18] — 2026-08-16（仓库治理：只留研究成果 + 原生模式为主线 + docker 降级可选）
+- 方向（用户拍板）：① 明确两个目录关系；② 精简仓库只保留研究成果；③ docker 镜像非主线
+- 新增 `docs/DEVELOPMENT-GUIDE.md`：本机两个目录（原生引擎运行时 vs 研究成果仓库）职责
+  边界、数据流、运行配方（STOCKDB_HOST/PYBAO_DIR/NO_PROXY）、已知坑排查手册
+- 删除上游继承内容（git 历史可找回）：`cpp/`（引擎 C++ 源码）、`pybao/`（扩展拷贝，
+  docker 构建从官方 release 下载不依赖）、`调用方式/`、`数据网页版.html`/`更新运行图.png`/
+  `数据库运行图.png`/`网页版示范.png`/`先看！这个！！使用说明.txt`、顶层 `stockdb.conf`/
+  `sync_url.txt`；保留 LICENSE（上游 MIT，合规必需）与 `docs/DATA_SOURCE.md`（同步源机制说明）
+- README 重写为研究成果仓库定位（native-first）；docker/README 的 `调用方式` 引用改上游链接
+- 发布纪律修订（release-policy.md）：主线 = 本机原生模式验证 + tag；镜像 = 可选发布物
+  （仅成熟版本手动 build-image.yml）
+- 本机验证：206 单测全绿；60 天打板回填在本机引擎重跑，验收基线全命中
+  （08-14 = 47 / 0.012113 / 0.4894、序列 60/60）——Windows 原生模式接续成立
 
 ## [0.8.17] — 2026-08-16（同步链路修复：认证失败识别 + None>0 崩溃）
 - 事故：命理档案触发手动热更新 → 数据源 auth failed（同步器退出码 0）→ webui

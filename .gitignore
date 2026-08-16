@@ -1,5 +1,4 @@
 data/
-cpp/build/
 *.ldb
 *.log
 *.pid
@@ -12,3 +11,10 @@ docker/webui/.dev-data/
 .venv/
 
 .DS_Store
+
+# local dev environment (not part of the repo)
+.env-support/
+.uv-cache/
+.uv-python/
+.tmp-test/
+.probe_*
