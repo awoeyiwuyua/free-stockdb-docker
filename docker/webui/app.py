@@ -74,6 +74,26 @@ from config import (  # noqa: E402 - 配置为纯 stdlib，无循环依赖
     WEBUI_VERSION,
 )
 
+# ---- 0.9.2 批次 3：mydb/引擎访问迁 storage/providers（本文件保留同名引用） ----
+from storage.providers.free_stockdb import (  # noqa: E402
+    _breaker as _stockdb_breaker,
+    _breaker_open as _stockdb_breaker_open,
+    _gate as _stockdb_gate,
+    fetch as stockdb_fetch,
+)
+from storage.providers.mydb_store import (  # noqa: E402
+    _mydb_rd,
+    _mydb_rd_reset,
+    _rd_lock,
+    _rd_to_py,
+    auction_series_read as _auction_series_read,
+    auction_series_write as _auction_series_write,
+    mydb_read,
+    mydb_tables,
+    mydb_write,
+    validate_custom_table,
+)
+
 SYNC_LOG = DATA_DIR / "sync.log"
 
 # 同步线程状态
@@ -484,176 +504,10 @@ def _classify_code(code: str) -> str:
     return "other"
 
 
-# ==================== mydb 私有存储写入（pybao 客户端） ====================
-# 上游 stockdb 内置私有存储 ./mydb：HTTP 层只读，写入须用 pybao 客户端
-# （stockdb.abi3.so + stock_sdk.py，随发行包分发，容器内 PYTHONPATH 注入）。
-# 本机开发若未装 pybao，相关接口优雅降级（A 股功能不受影响）。
-
-# 保留表前缀：禁止覆盖上游同步数据，防止与 A 股行情冲突
-_RESERVED_TABLES = ("日k", "分钟k", "复权", "股票代码", "周k", "月k", "板块", "行业", "概念")
-_HK_TABLE = "hk日k"  # 港股日K自定义表（与上游命名空间隔离）
-
-
-def _is_hk_code(code: str) -> bool:
-    """港股代码识别：5 位数字，或带 hk 前缀（如 00700 / hk00700）。"""
-    c = str(code).strip().lower()
-    if c.startswith("hk"):
-        c = c[2:]
-    return c.isdigit() and len(c) == 5
-
-
-def _normalize_hk_code(code: str) -> str:
-    """规范化为 5 位港股代码（00700）。"""
-    c = str(code).strip().lower()
-    if c.startswith("hk"):
-        c = c[2:]
-    return c.zfill(5)
-
-
-def _mydb_import():
-    """惰性导入 pybao 客户端。未安装/加载失败时抛 ImportError（调用方降级）。
-
-    候选路径：容器内 /opt/stockdb/pybao，本地开发 /tmp/pybao_mac 等。
-    """
-    import importlib
-    candidates = ["/opt/stockdb/pybao", "/tmp/pybao_mac"]
-    for p in candidates:
-        try:
-            sys.path.insert(0, p)
-            return importlib.import_module("stockdb")
-        except ImportError:
-            continue
-    raise ImportError("pybao 写库不可用（PYTHONPATH 未注入或平台不兼容）")
-
-
-_rd_lock = threading.Lock()  # pybao rd 单连接非线程安全：全部 rd 读写持锁串行化（0.8.10）
-# 事故背景 2026-08-16：/api/data/* 与回填线程并发用同一 socket，协议帧交错 →
-# C 扩展阻塞持 GIL → 全进程冻结。锁保证同一时刻只有一条 rd 请求在线上。
-
-
-
-def _mydb_rd_reset():
-    """丢弃缓存的 rd 连接：调用失败后置空，下次调用重新 init（0.8.10 自愈楔死连接）。"""
-    _mydb_rd._rd = None
-
-
-def _mydb_rd():
-    """获取连接 NAS stockdb 的 pybao 客户端（惰性、缓存）。"""
-    if getattr(_mydb_rd, "_rd", None) is None:
-        mod = _mydb_import()
-        _mydb_rd._rd = mod.init(STOCKDB_HOST, int(STOCKDB_PORT), socket_timeout=5)
-    return _mydb_rd._rd
-
-
-def _rd_to_py(v):
-    """pybao 返回值归一化（0.8.10 修复）：dict 原样；JSON 字符串解析；QueryResult 转 dict。
-
-    与 mcp._auction_value_to_dict 语义对齐：任何形态一律转 dict，失败按缺失处理——
-    旧实现转换失败原样返回 QueryResult，json.dumps 直接崩（"Object of type
-    QueryResult is not JSON serializable"，/api/data/read 实证）。
-    """
-    if v is None:
-        return None
-    if isinstance(v, dict):
-        return v
-    if isinstance(v, str):
-        try:
-            parsed = json.loads(v)
-        except ValueError:
-            return None
-        return parsed if isinstance(parsed, dict) else None
-    if hasattr(v, "keys") and hasattr(v, "all"):
-        try:  # pybao QueryResult：dict(value) 即原生数据
-            return dict(v)
-        except Exception:  # noqa: BLE001 - 转换失败按缺失处理
-            return None
-    return None
-
-
-def validate_custom_table(table: str) -> str:
-    """校验自定义表名：禁止覆盖上游保留表，禁止危险字符。返回规范化表名。"""
-    t = str(table or "").strip().strip(":")
-    if not t:
-        raise ValueError("表名不能为空")
-    if not all(ch.isalnum() or ch in "_:-" for ch in t):
-        raise ValueError("表名只能含字母数字与 _:-")
-    for r in _RESERVED_TABLES:
-        if t == r or t.startswith(r + ":"):
-            raise ValueError(f"表名 {t!r} 与上游保留表 {r!r} 冲突，请用自定义命名空间（如 hk日k: / 自定义:）")
-    return t
-
-
-def mydb_write(table: str, items: list[tuple], batch: bool = False) -> dict:
-    """写入 mydb 私有存储。items=[(key, value), ...]。
-
-    注意：pybao 的 rd.set 返回 QueryResult，必须调用 .do() 才真正发送写入
-    （否则只是客户端排队，读不到）。batch 参数保留兼容，统一逐条 .do()。
-    0.8.10：全程持 _rd_lock；任何 rd 异常 → 丢弃缓存连接（下次调用重连自愈）。
-    """
-    table = validate_custom_table(table)
-    if not items:
-        raise ValueError("没有可写入的数据")
-    with _rd_lock:
-        try:
-            rd = _mydb_rd()
-            result = []
-            for key, value in items:
-                result.append(rd.set(table, key, value).do())
-            # 回读校验（QueryResult 转原生）
-            readback = []
-            for key, _ in items:
-                try:
-                    readback.append(_rd_to_py(rd.get(table, key)))
-                except Exception:  # noqa: BLE001 - 单键回读失败按缺失
-                    readback.append(None)
-            return {"table": table, "written": len(items), "readback": readback, "result": result}
-        except Exception:
-            _mydb_rd_reset()
-            raise
-
-
-def mydb_read(table: str, key: str = "") -> dict:
-    """读取 mydb 自定义表。key 为空时列出表内全部键值。
-    0.8.10：持 _rd_lock；值统一 _rd_to_py 归一化；rd 异常 → 丢弃连接自愈。"""
-    table = validate_custom_table(table)
-    with _rd_lock:
-        try:
-            rd = _mydb_rd()
-            if key:
-                val = _rd_to_py(rd.get(table, key))
-                return {"table": table, "key": key, "value": val}
-            keys = rd.keys(table, "*") or []
-            values = {}
-            for k in keys:
-                date_str = str(k).split(":")[-1]
-                try:
-                    values[str(k)] = _rd_to_py(rd.get(table, date_str))
-                except Exception:  # noqa: BLE001 - 单键失败按缺失
-                    values[str(k)] = None
-            return {"table": table, "keys": keys, "values": values}
-        except Exception:
-            _mydb_rd_reset()
-            raise
-
-
-def mydb_tables() -> list[str]:
-    """列出自定义表名（含保留表前缀过滤）。0.8.10：rd.keys 持锁 + 异常自愈。"""
-    with _rd_lock:
-        try:
-            rd = _mydb_rd()
-            keys = rd.keys("*") or []
-        except Exception:
-            _mydb_rd_reset()
-            raise
-    tables = set()
-    for k in keys:
-        table = str(k).split(":")[0] if ":" in str(k) else str(k)
-        if table and not any(table.startswith(r) for r in _RESERVED_TABLES):
-            tables.add(table)
-    return sorted(tables)
 
 
 # ==================== 港股数据（东财 + 腾讯，写入 hk日k: 表） ====================
+_HK_TABLE = "hk日k"  # 港股日K自定义表（与上游命名空间隔离）
 _HK_EM = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
 _HK_QT = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
 
@@ -684,6 +538,22 @@ def _hk_fetch_daily_em(code: str) -> list[dict]:
             "amount": float(parts[6]) if len(parts) > 6 else None,
         })
     return rows
+
+
+def _is_hk_code(code: str) -> bool:
+    """港股代码识别：5 位数字，或带 hk 前缀（如 00700 / hk00700）。"""
+    c = str(code).strip().lower()
+    if c.startswith("hk"):
+        c = c[2:]
+    return c.isdigit() and len(c) == 5
+
+
+def _normalize_hk_code(code: str) -> str:
+    """规范化为 5 位港股代码（00700）。"""
+    c = str(code).strip().lower()
+    if c.startswith("hk"):
+        c = c[2:]
+    return c.zfill(5)
 
 
 def _hk_fetch_daily_qt(code: str) -> list[dict]:
@@ -818,49 +688,6 @@ _latest_date_probe_lock = threading.Lock()  # 单飞锁：并发缓存失效时�
 _code_stats_cache: dict = {"at": 0.0, "val": None}   # 15 秒缓存：全市场代码列表 GET 较贵
 _container_state_cache: dict = {"at": 0.0, "val": None}  # 5 秒缓存：stockdb 进程探测
 
-# ==================== stockdb 上游访问治理（并发卫生三件套之二：熔断 + 信号量） ====================
-# 事故复盘（0.6.x 多标签切页打瘫后端）：stockdb 是全部路径的共享依赖，慢/挂时
-# 每次探针都等满超时（扇出 3~4 路 × 10s），并发线程无界堆积。
-# 治理原则：探针路径（breaker=True）记仇快败；全部路径过信号量限并发；
-# 控制路径（启动等待/同步校验）只过信号量、不受熔断牵连。
-_stockdb_gate = threading.Semaphore(STOCKDB_MAX_CONCURRENCY)  # 并发闸门（0.9.1：config 收敛）
-_stockdb_breaker: dict = {"fails": 0, "open_until": 0.0,
-                          "threshold": 3, "cooldown": 300.0}
-
-
-def _stockdb_breaker_open() -> bool:
-    return time.time() < _stockdb_breaker["open_until"]
-
-
-def stockdb_fetch(path: str, timeout: float = 10.0, breaker: bool = False) -> str:
-    """打 stockdb HTTP 的统一闸口。
-
-    - 信号量（全路径）：并发最多 STOCKDB_MAX_CONCURRENCY（默认 8），超出立即抛
-      RuntimeError 由调用方降级（不阻塞等待——等待会再次堆积线程）。
-    - 熔断器（breaker=True 的探针路径）：连续 threshold 次失败后 open_until 内
-      快速失败，调用方降级取缓存，避免 stockdb 挂/忙时每路都等满超时。
-    """
-    if breaker and _stockdb_breaker_open():
-        raise RuntimeError(
-            f"stockdb 熔断中（连续 {_stockdb_breaker['fails']} 次失败，"
-            f"降级至 {datetime.fromtimestamp(_stockdb_breaker['open_until']).strftime('%H:%M:%S')}）")
-    if not _stockdb_gate.acquire(blocking=False):
-        raise RuntimeError("stockdb 并发已满（信号量限流），本次降级")
-    try:
-        import urllib.request
-        with urllib.request.urlopen(
-                f"http://{STOCKDB_HOST}:{STOCKDB_PORT}{path}", timeout=timeout) as resp:
-            data = resp.read().decode("utf-8", "replace")
-        _stockdb_breaker["fails"] = 0  # 成功即复位
-        return data
-    except Exception:
-        if breaker:
-            _stockdb_breaker["fails"] += 1
-            if _stockdb_breaker["fails"] >= _stockdb_breaker["threshold"]:
-                _stockdb_breaker["open_until"] = time.time() + _stockdb_breaker["cooldown"]
-        raise
-    finally:
-        _stockdb_gate.release()
 
 
 def data_coverage() -> dict | None:
@@ -2674,29 +2501,6 @@ def _auction_lag_close(points: list[dict]) -> dict:
             continue
     return out
 
-
-def _auction_series_read(key: str):
-    """打板序列读取封装：read_fn(key) -> 原始存储值|None（JSON 解析交给 load_series）。
-
-    mydb 物理布局：表=打板序列:<metric>、子键="series"；mydb_read(key, "") 列出
-    {子键: 值}，取任一非 None 值返回。读取异常 → None（冷启动空序列，不阻塞采集）。
-    """
-    try:
-        res = mydb_read(key, "")
-        for v in (res.get("values") or {}).values():
-            if v is not None:
-                return v
-    except Exception:  # noqa: BLE001 - 序列缺失/损坏 → 调用方按空序列处理
-        return None
-    return None
-
-
-def _auction_series_write(key: str, value) -> None:
-    """打板序列写入封装：write_fn(key, value)；子键固定 "series"，覆盖写幂等。
-
-    value 可能是 dict（append_series 组装完整载荷）或 str，统一序列化后落库。
-    """
-    mydb_write(key, [("series", value)])  # 0.8.6：pybao 存原生 dict
 
 
 def _auction_load_codes(trade_date: str) -> list[str]:

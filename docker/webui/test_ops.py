@@ -61,6 +61,8 @@ from unittest import mock
 import app                       # 生产实现（被测对象）
 import config                    # 配置单一入口（0.9.1）
 from ops import alerts as ops_alerts  # 告警中心（0.9.2 批次 2 迁 ops/alerts.py）
+from storage.providers import free_stockdb as free_stockdb_mod  # 引擎闸口（批次 3）
+from storage.providers import mydb_store as mydb_store_mod      # mydb 读写（批次 3）
 
 # 静默 stdlib 无害噪声：urllib 探测非 2xx 时抛出的 HTTPError 内持临时文件，
 # 对象被 GC 时 tempfile 模块发出的 ResourceWarning（本模块主动吞异常是预期行为）。
@@ -324,7 +326,8 @@ class _MydbRdTests(_OpsTestCase):
         self.assertIsNone(app._mydb_rd._rd)  # 缓存已丢弃（自愈前提）
         fake_mod = mock.Mock()
         fake_mod.init.return_value = good
-        with mock.patch.object(app, "_mydb_import", return_value=fake_mod):
+        # 0.9.2 批次 3：实现迁 storage/providers/mydb_store，patch 实现侧
+        with mock.patch.object(mydb_store_mod, "_mydb_import", return_value=fake_mod):
             r = app.mydb_read("t", "k")
         self.assertEqual(r["value"], {"a": 1})
         self.addCleanup(app._mydb_rd_reset)
@@ -1061,8 +1064,9 @@ class _StockdbGateTests(_OpsTestCase):
 
     def test_semaphore_limits_concurrency(self):
         """信号量满 → 立即 RuntimeError（不阻塞等待堆积线程）。"""
-        with mock.patch.object(app, "_stockdb_gate", threading.Semaphore(1)):
-            gate = app._stockdb_gate
+        # 0.9.2 批次 3：闸口实现迁 storage/providers/free_stockdb，patch 实现侧
+        with mock.patch.object(free_stockdb_mod, "_gate", threading.Semaphore(1)):
+            gate = free_stockdb_mod._gate
             gate.acquire()
             try:
                 with self.assertRaises(RuntimeError):
@@ -1140,17 +1144,25 @@ class _AuctionBackfillTests(_OpsTestCase):
         self._patch_snap = mock.patch.object(app, "_auction_query_snapshot", side_effect=fake_snapshot)
         self._patch_write = mock.patch.object(app, "mydb_write", side_effect=fake_write)
         self._patch_read = mock.patch.object(app, "mydb_read", side_effect=fake_read)
+        # 0.9.2 批次 3：序列读写经 storage.providers.mydb_store（同函数级替身，
+        # 覆盖 storage 内部绑定——打板任务走 app 绑定、序列读写走 storage 绑定）
+        self._patch_store_write = mock.patch.object(mydb_store_mod, "mydb_write",
+                                                    side_effect=fake_write)
+        self._patch_store_read = mock.patch.object(mydb_store_mod, "mydb_read",
+                                                   side_effect=fake_read)
         self._patch_latest = mock.patch.object(app, "data_latest_date", return_value="20260814")
         self._patch_prev = mock.patch.object(app, "_auction_prev_trade_date", side_effect={
             "20260814": "20260813", "20260813": "20260812",
             "20260812": "20260811", "20260811": "20260810",
         }.get)
         for p in (self._patch_snap, self._patch_write, self._patch_read,
+                  self._patch_store_write, self._patch_store_read,
                   self._patch_latest, self._patch_prev):
             p.start()
-        self.addCleanup(lambda: [p.stop() for p in (self._patch_snap, self._patch_write,
-                                                    self._patch_read, self._patch_latest,
-                                                    self._patch_prev)])
+        self.addCleanup(lambda: [p.stop() for p in (
+            self._patch_snap, self._patch_write, self._patch_read,
+            self._patch_store_write, self._patch_store_read,
+            self._patch_latest, self._patch_prev)])
 
     def _load_series(self, metric):
         # round-trip：走真实读取链（app._auction_series_read → mydb_read 契约替身）
