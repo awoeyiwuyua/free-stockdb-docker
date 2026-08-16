@@ -63,7 +63,7 @@ AI 客户端（Claude 等）               程序/脚本                人
 | D8 | **研究成果产出自持（M5 提前）**：打板指标/序列/清单等研究产出从引擎 mydb 迁出至自建存储（0.9.3） | 引擎进程内 mydb 是最大架构弱点——引擎死 = 数据不可达；自持后引擎仅是行情 provider |
 | D9 | **单进程两接口**：MCP 与 HTTP 同进程（webui）；代码保持可拆（interfaces/web/ 与 interfaces/mcp/ 物理分开） | 本机单人够用；将来独立 MCP 进程只是启动方式变化 |
 | D10 | **sdk_bridge 归接口层**，引擎连接归数据层 free_stockdb provider | 上游引擎被替换时 sdk_bridge 通过 provider 接口仍可用 |
-| D11 | **采集执行归数据层**（providers/quote_sources.py），编排归服务层 | 采集用例 = 编排"读清单→调源→算→存" |
+| D11 | **采集执行归数据层**（providers/quote_sources.py），编排归服务层 | 0.9.9 落位：auction_collect → storage/providers/quote_sources（git mv，契约不变） |
 
 ## 5. 演进路径（更新）
 

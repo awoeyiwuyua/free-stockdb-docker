@@ -1,7 +1,8 @@
 """services — 应用服务层（用例编排，0.9.1 四层架构框架）。
 
 职责（0.9.2 搬迁目标）：
-  - auction_collect / auction_close / auction_backfill：打板三用例（拉数据→算→存→降级）
+  - 打板三用例（拉数据→算→存→降级）：采集编排（执行在数据层 quote_sources，D11 落位）/
+    收口 / 回填
   - sync：数据同步用例
 
 依赖纪律：本层可依赖 core/、storage/、ops/、config；禁止依赖 interfaces/（接口层）。

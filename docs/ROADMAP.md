@@ -54,9 +54,13 @@
 - **0.9.2（规划）**：四层**搬迁**（7 批次增量搬，每批测试绿）+ 可观测性三件套
   （打板日检/调度探活与失败告警/结构化日志）+ **storage/ 多数据源抽象**
   （上游引擎 = 第一个 provider；mydb 产出自持 = 第二个；文件边界按 provider 划分）
-- **0.9.3 已发布**（2026-08-16）：MCP 工具分组 Gateway（/mcp?group=，6 组 53 工具）+ Trace ID（响应/日志/日检贯穿）；246 测试全绿\n- **0.9.5（规划，M5 产出自持——用户拍板 D8）**：研究成果迁出引擎 mydb → 自建 SQLite（WAL）——ResearchStore Repository 接口 + 工厂切换（sqlite 默认/mydb 回滚）+ 一次性迁移 + 日检后自动备份；设计见 docs/design/research-store.md
+- **0.9.3 已发布**（2026-08-16）：MCP 工具分组 Gateway（/mcp?group=，6 组 53 工具）+ Trace ID（响应/日志/日检贯穿）；246 测试全绿\n- **0.9.5 已发布（M5 产出自持）**：研究成果迁出引擎 mydb → 自建 SQLite（WAL）——ResearchStore Repository 接口 + 工厂切换（sqlite 默认/mydb 回滚）+ 一次性迁移 + 日检后自动备份；设计见 docs/design/research-store.md
   清单等研究产出从引擎 mydb 迁出至自建存储；引擎进程死亡不再影响研究成果可读性；
   mydb 降级为过渡缓存
+- **0.9.8 已发布（2026-08-16）**：严格分层——接口层统一收拢 interfaces/（web/ HTTP + mcp/ MCP），
+  领域 shim 清零（core/ 单一真身），层边界测试升级
+- **0.9.9 已发布（2026-08-16，D11 落位）**：采集执行迁数据层——auction_collect →
+  storage/providers/quote_sources.py（编排在服务层、执行在数据层），契约不变
 - **M2 打板情绪衍生指标**（连板/晋级率/炸板率/情绪温度）、**M3 数据质量看护**
   （缺口检测/突变告警/异源对账）、**M6 行情镜像**（可选）继续延后，等 0.9.x
   应用层稳定后排期

@@ -158,4 +158,4 @@ jobs:
 
       - name: Run ops + auction unit tests
         working-directory: stockdb-ai
-        run: python -m unittest test_ops test_auction_collect test_auction_metrics test_auction_list -v
+        run: python -m unittest test_ops test_quote_sources test_auction_metrics test_auction_list -v

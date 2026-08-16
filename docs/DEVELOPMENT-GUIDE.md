@@ -40,7 +40,7 @@
 ## 3. 开发工作流
 
 1. 数据更新：上游 `数据更新.exe` 保持引擎数据最新（`000001` 最新交易日为探针）
-2. 代码改动：本仓库分支 → 单测（`stockdb-ai/` 下 `python -m unittest test_auction_collect
+2. 代码改动：本仓库分支 → 单测（`stockdb-ai/` 下 `python -m unittest test_quote_sources
    test_auction_metrics test_auction_list test_ops interfaces.mcp.test_stockdb_mcp_server`，261 全绿）
 3. 回填/采集：`auction_run_backfill(days=60)`（app.py）直连引擎写 mydb
 4. 验收：异源签字口径见 `docs/design/auction-collector.md` 与 `docs/acceptance/`

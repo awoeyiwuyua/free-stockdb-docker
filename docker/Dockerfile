@@ -98,7 +98,7 @@ COPY docker/stockdb.conf /etc/stockdb/stockdb.conf
 # ---- webui 运维面板 + 只读 MCP（app.py 的 /mcp 路由复用其 dispatch，纯标准库） ----
 # 0.9.8 严格分层：后端主体按层整体 COPY（interfaces/web + interfaces/mcp 接口层、
 # services/ 服务层、core/ 领域层、storage/ 数据层、ops/ 横切；组合根 app.py/config.py）。
-COPY stockdb-ai/app.py stockdb-ai/config.py stockdb-ai/auction_collect.py stockdb-ai/entrypoint.sh /opt/webui/
+COPY stockdb-ai/app.py stockdb-ai/config.py stockdb-ai/entrypoint.sh /opt/webui/
 COPY stockdb-ai/interfaces/ /opt/webui/interfaces/
 COPY stockdb-ai/services/ /opt/webui/services/
 COPY stockdb-ai/core/ /opt/webui/core/

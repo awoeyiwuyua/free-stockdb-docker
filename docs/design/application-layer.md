@@ -36,7 +36,7 @@ stockdb-ai/
 | **接口层** interfaces/（web/ + mcp/） | 收参数、校验、分发、组装响应（信封/错误码）；不碰业务 | 不写业务规则；不直接碰存储 | interfaces/mcp/stockdb_mcp_server.py（TOOLS/_call_tool/契约）；interfaces/web/handlers.py（Handler：do_GET/do_POST） |
 | **应用服务层** services/ | 用例编排：拉数据→算→存；控制降级与告警触发 | 不写纯规则（公式）；不直接拼 SQL/键 | app.py 的 auction_run_collect/close/backfill、run_sync、auction_scheduler_loop 的任务体 |
 | **领域层** core/ | 纯规则：涨停判定/指标公式/分位/日历；纯函数、可独立测 | **不 import 任何其他层**（接口/服务/存储都不行） | core/board_metrics.py、auction_metrics.py、auction_list.py、calendar_xshg.py（0.9.8 去 mcp/ 兼容转发） |
-| **基础设施层** storage/ | 存取：mydb 读写、文件、外部 HTTP（引擎/腾讯/东财）、pybao 加载 | 不写业务规则；不知道"调用者是谁" | app.py 的 mydb_write/read/tables、stockdb_fetch、_auction_series_*；auction_collect.fetch_quotes；pybao_tools；sdk_bridge（部分） |
+| **基础设施层** storage/ | 存取：mydb 读写、文件、外部 HTTP（引擎/腾讯/东财）、pybao 加载 | 不写业务规则；不知道"调用者是谁" | app.py 的 mydb_write/read/tables、stockdb_fetch、_auction_series_*；quote_sources.fetch_quotes（D11，原 auction_collect）；pybao_tools；sdk_bridge（部分） |
 | **横切 ops/** | 日志/告警/调度/健康——各层可用 | 不承载业务用例 | app.py 的 log/tail_log、Alerts、notify_alert、scheduler_loop、health_status、_diag |
 
 **依赖铁律（单向）**：接口层 → 应用服务层 → 领域层 / 基础设施层；领域层不依赖任何人。

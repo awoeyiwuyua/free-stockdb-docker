@@ -4,6 +4,23 @@
 镜像 tag 跟随上游引擎版本。发布纪律见 `docs/webui-spa/release-policy.md`；
 部署记录见 `docs/DEPLOYMENTS.md`；本机目录关系与运行配方见 `docs/DEVELOPMENT-GUIDE.md`。
 
+## [0.9.9] — 2026-08-16（D11 落位：采集执行迁数据层 storage/providers/quote_sources.py）
+
+架构决策 D11 落地（采集执行归数据层、编排归服务层）：
+
+- **`auction_collect.py` → `storage/providers/quote_sources.py`**（git mv，契约与行为
+  完全不变）：腾讯主源批量 + 东财备源降级采集器归位数据层——文件边界按 provider
+  划分（free_stockdb 引擎 / quote_sources 腾讯东财 / mydb_store 研究产出）
+- **编排侧同步**：services/auction_tasks.py 改从 quote_sources 导入 fetch_quotes
+  （惰性导入降级语义不变）；services/__init__.py 职责描述更新
+- **测试随迁**：test_auction_collect → test_quote_sources（模块名对齐，用例全保留）
+- **Dockerfile**：auction_collect.py 单独 COPY 行移除（storage/ 已整体 COPY，
+  quote_sources.py 随 storage/providers 入镜像）
+- CI：test.yml / build-image.yml unittest 命令 test_auction_collect →
+  test_quote_sources；DEVELOPMENT-GUIDE 配方同步
+- docs：application-layer 归属表、architecture D11 状态、ROADMAP 演进更新
+- Python 261 全绿（D11 落位后重新验证）
+
 ## [0.9.8] — 2026-08-16（严格分层：接口层统一收拢 interfaces/，目录 = 架构图）
 
 用户拍板（学习诉求：目录结构严格按"层"定义）：

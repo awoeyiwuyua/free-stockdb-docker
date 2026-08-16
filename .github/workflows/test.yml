@@ -33,7 +33,7 @@ jobs:
 
       - name: Run auction collector tests
         working-directory: stockdb-ai
-        run: python -m unittest test_auction_collect test_auction_metrics test_auction_list test_records test_layer_boundaries -v
+        run: python -m unittest test_quote_sources test_auction_metrics test_auction_list test_records test_layer_boundaries -v
 
   spa-tests:
     name: SPA 前端（构建 + Vitest）

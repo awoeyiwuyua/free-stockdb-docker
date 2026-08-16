@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""test_auction_collect — 采集器单元测试（0.7.0，离线全 mock）"""
+"""test_quote_sources — 数据层行情源采集器单测（0.7.0 起 test_auction_collect，D11 随迁）"""
 import json
 import unittest
 from unittest import mock
 
-import auction_collect as AC
+from storage.providers import quote_sources as AC
 
 
 def _tencent_line(code: str, name: str, open_: str, prev: str, vol: str = "100",

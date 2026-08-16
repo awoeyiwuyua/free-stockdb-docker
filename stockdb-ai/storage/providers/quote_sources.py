@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""auction_collect — 打板竞价快照采集器（0.7.0 任务A 契约桩）
+"""quote_sources — 数据层行情源 provider：打板竞价快照采集（D11 落位，原 auction_collect）
+
+D11（架构决策）：采集执行归数据层（storage/providers/quote_sources.py），
+编排归服务层（services/auction_tasks.py 调用 fetch_quotes）。本模块是纯数据层
+代码——不知道"调用者是谁"，不承载业务规则。
 
 纯标准库、零依赖；输入股票清单 → 输出开盘竞价快照。
 主源：腾讯 qt.gtimg.cn（一次批量 ≤50 只，零鉴权、不封 IP）；
@@ -9,7 +13,7 @@
 数据口径（用户拍板）：9:25 集合竞价价 = 当日开盘价（open_price）。
 停牌/无竞价 → open_price=None，统计剔除并计入 errors。
 
-本文件为契约桩：只定义接口与常量，函数体由任务A实现（不允许改签名与常量）。
+0.9.9：从 webui 根目录 auction_collect.py 迁入（git mv，契约与行为不变）。
 """
 
 from __future__ import annotations
