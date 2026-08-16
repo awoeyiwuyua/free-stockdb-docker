@@ -27,24 +27,36 @@
 3. 无 pybao / 引擎不可达 → 明确降级（DEPENDENCY_UNAVAILABLE，与现有工具一致）
 4. 与现有 13 工具重叠处**标注口径差异**，不合并、不替代（防口径漂移，0.8.14 教训）
 
-## 3. 架构：SDK 桥（SDK Bridge）
+## 3. 架构：上游函数复用 + 契约外壳（2026-08-16 策略拍板）
+
+> 决策背景（用户问"是否重复造轮子"后拍板）：上游 `stockdb_full_mcp.py` 已实现
+> 41 个工具的调用逻辑——**业务逻辑零重复**，直接复用其 `stockdb_*` 函数；
+> 我们只做**契约外壳**（信封/错误码/截断/注册），契约层是本仓库 0.8.x 验收资产，
+> 不可用上游 raw 形态替代。
 
 ```
-mcp/stockdb_mcp_server.py（现有 dispatch 框架）
-   └─ sdk_bridge.py（新增，纯标准库）
-        ├─ _SDK_TOOLS: {tool_name: ToolSpec}   # 41 个工具的注册表
-        │    ToolSpec = {name, description, params_schema, handler}
-        ├─ 参数校验（逐工具 schema：类型/必填/枚举/日期格式）
-        ├─ 调用封装：sdk 调用 → 错误归一化（远程异常 → 8 错误码）
-        └─ 结果契约化：原生 list/dict → 信封（known_at / source / errors）
+docker/webui/mcp/
+   ├─ stockdb_full_mcp.py   # 上游原文件拷贝（MIT，文件头注明来源与上游版本；
+   │                        #   仅用其 stockdb_* 函数，不启动其服务器）
+   ├─ sdk_bridge.py         # 新增契约外壳（纯标准库，~200 行）
+   │     ├─ _SDK_TOOLS: {tool_name: ToolSpec}   # 41 个工具注册表
+   │     │    ToolSpec = {name, description, params_schema, sdk_fn}
+   │     ├─ 参数校验（逐工具 schema：类型/必填/枚举/日期格式）
+   │     ├─ 调用封装：sdk_fn(**args, df=False) → 错误归一化（→ 8 错误码）
+   │     └─ 结果契约化：原生 list/dict → 信封（known_at / source / errors）
+   └─ stockdb_mcp_server.py # 现有 dispatch：_call_tool 增加 SDK 工具路由
 ```
 
-- **懒加载**：`import stock_sdk` 与 `init(host, port, warm=False)` 仅在首个 SDK 工具
-  被调用时执行（不拖慢服务器启动，无 pybao 环境可导入服务器）
-- **单连接**：复用 `pybao_tools.get_sdk_client()`（现成连接管理），不新建连接池
-- **参数 schema 来源**：上游 MCP 包装函数签名 + 上游接口文档
-  （`调用方式/python/AI策略python开发接口文档.md`）；RemoteProxy 无 introspection，
-  参数表在 `sdk_bridge.py` 中显式维护（41 张表，可评审）
+- **上游文件拷贝策略**：从原生目录 `调用方式/ai_mcp/stockdb_full_mcp.py` 拷贝
+  （docker 镜像无此文件，必须随仓库分发）；文件头注明来源与拷贝时的上游版本；
+  上游升级后重拷 + 冒烟回归（§8）
+- **调用约定**：所有上游函数调用强制 `df=False`（纯 JSON 契约，上游默认 df=True
+  返回 DataFrame 不可序列化）；`panel` 仅显式 true 时返回 {code: rows}
+- **懒加载**：`import stockdb_full_mcp`（→ stock_sdk）仅在首个 SDK 工具被调用时执行；
+  无 pybao 环境可正常导入服务器（DEPENDENCY_UNAVAILABLE 降级）
+- **单连接**：复用 `pybao_tools.get_sdk_client()` 连接管理，不新建连接池
+- **参数 schema 来源**：上游 `stockdb_*` 函数签名 + 上游接口文档；RemoteProxy 无
+  introspection，参数表在 `sdk_bridge.py` 显式维护（41 张表，可评审）
 
 ## 4. 工具全量清单（41 个，上游对齐）
 
@@ -143,9 +155,10 @@ mcp/stockdb_mcp_server.py（现有 dispatch 框架）
 
 | 风险 | 应对 |
 |---|---|
+| 上游 full_mcp.py 依赖 native_mcp 框架（import 副作用） | 实现时验证仅 import 函数不启动服务器；必要时剥离框架依赖（薄包装） |
 | RemoteProxy 无签名 → schema 凭文档维护，可能有偏差 | 41 张参数表进设计评审；冒烟阶段逐个核对 |
 | run_query 大表/深查询拖慢引擎 | 白名单 + limit + 超时（沿用 STOCKDB_TIMEOUT） |
-| 上游 API 行为随引擎版本变化 | 工具封装层与底层隔离，升级引擎后冒烟回归 |
+| 上游 API 行为随引擎版本变化 | 重拷上游文件 + 冒烟回归（§8） |
 | 与现有工具口径混淆 | §5.1 命名与文档标注 + 测试断言"双工具并存" |
 
 ## 10. 关联变更
