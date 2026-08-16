@@ -5,7 +5,7 @@
 每年官方放假安排公布后（通常前一年年底），用本脚本重新提取并更新：
   1. 在本机 venv 安装 exchange_calendars：pip install exchange_calendars
   2. 运行：python extract_xshg_holidays.py [年份...]（默认 2024-2026）
-  3. 把输出的年月日列表替换进 docker/webui/app.py 的 XSHG_HOLIDAYS
+  3. 把输出的年月日列表替换进 stockdb-ai/app.py 的 XSHG_HOLIDAYS
   4. 同步更新 XSHG_HOLIDAYS_THROUGH 截止日期
 
 不随 webui 运行，仅维护期使用。webui 运行时零依赖（纯标准库）。

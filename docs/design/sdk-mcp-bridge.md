@@ -39,7 +39,7 @@
 > 不可用上游 raw 形态替代。
 
 ```
-docker/webui/mcp/
+stockdb-ai/mcp/
    ├─ stockdb_full_mcp.py   # 上游原文件拷贝（MIT，文件头注明来源与上游版本；
    │                        #   仅用其 stockdb_* 函数，不启动其服务器）
    ├─ sdk_bridge.py         # 新增契约外壳（纯标准库，~200 行）

@@ -94,7 +94,7 @@
 ### 4.2 构建时（开发机 / CI，Node 只在此时出现）
 
 ```
-docker/webui/spa/  (Vue 源码)
+stockdb-ai/spa/  (Vue 源码)
    │  npm run dev  → Vite 本地服务器，代理 /api 到本地 webui（学习/开发用，热更新）
    │  npm run build → spa/dist/（纯静态文件）
    │
@@ -108,7 +108,7 @@ Dockerfile 多阶段：
 ## 5. 目录结构（新增/改动一览）
 
 ```
-docker/webui/
+stockdb-ai/
 ├── app.py                      # 改动：删 PAGE 字符串 → 静态服务 + SPA fallback + /legacy + /api/overview
 ├── paper_*.py / mx_client.py   # 不动
 ├── mcp/                        # 不动
@@ -173,14 +173,14 @@ docker/webui/
 # ===== SPA 构建（Node 仅构建期存在，产物进入最终镜像） =====
 FROM node:22-alpine AS spa-build
 WORKDIR /build
-COPY webui/spa/package.json webui/spa/package-lock.json ./
+COPY stockdb-ai/spa/package.json stockdb-ai/spa/package-lock.json ./
 RUN npm ci
-COPY webui/spa/ ./
+COPY stockdb-ai/spa/ ./
 RUN npm run build
 
 # 最终阶段追加：
 COPY --from=spa-build /build/dist /opt/webui/static/
-COPY webui/static/legacy/ /opt/webui/static/legacy/
+COPY stockdb-ai/static/legacy/ /opt/webui/static/legacy/
 ```
 
 多架构：`node:22-alpine` 有官方 amd64+arm64 manifest，双架构构建不受影响。
@@ -249,7 +249,7 @@ COPY webui/static/legacy/ /opt/webui/static/legacy/
 
 ## 12. 你的学习路径（配合实施）
 
-- 你的 Mac 已有 Node v25.8.1 ✓，装依赖后 `cd docker/webui/spa && npm run dev` 即可边看边学。
+- 你的 Mac 已有 Node v25.8.1 ✓，装依赖后 `cd stockdb-ai/spa && npm run dev` 即可边看边学。
 - 每完成一个里程碑，我出一份《导读笔记》：这轮写了什么、每个文件干什么、关键概念对照表、你可以改哪里玩。
 - 推荐外部资料（按里程碑配）：M0 看 Vite 官方文档前 3 节；M1 看 Vue 官方"快速上手+响应式基础"；M2 看 Element Plus 组件页 + ECharts 示例；M3 看"构建与部署"。
 

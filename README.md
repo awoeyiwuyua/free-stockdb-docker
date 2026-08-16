@@ -29,19 +29,19 @@ fork 自 [hello245m/free-stockdb](https://github.com/hello245m/free-stockdb) 的
 
 ## 仓库结构（0.9.1 起：四层架构框架）
 
-- `docker/webui/` — 应用层：`config.py`（配置单一入口）+ `web/ services/ core/ storage/ ops/`
-  四层骨架（0.9.2 搬迁）+ `mcp/`（MCP 服务器与 SDK 桥）+ 打板模块 + 单测（232）
+- `stockdb-ai/` — 应用层（后端主体）：`config.py`（配置单一入口）+ `web/ services/ core/ storage/ ops/`
+  四层骨架（0.9.2 搬迁）+ `mcp/`（MCP 服务器与 SDK 桥）+ 打板模块 + 单测（261）
 - `docker/` — 可选 docker 封装（`Dockerfile`/`docker-compose.yml`/`entrypoint.sh`）
 - `docs/` — 设计文档（`design/`）、验收记录（`acceptance/`、`DEPLOYMENTS.md`）、发布纪律
 - `.github/workflows/` — `test.yml`（PR 门禁）+ `build-image.yml`（镜像构建，仅手动、成熟后启用）
-- `CHANGELOG.md` — 版本记录（版本号 = `docker/webui/config.py` 的 `WEBUI_VERSION`）
+- `CHANGELOG.md` — 版本记录（版本号 = `stockdb-ai/config.py` 的 `WEBUI_VERSION`）
 
 上游内容（`cpp/` 引擎源码、`pybao/` 扩展拷贝、`调用方式/` 文档、演示文件等）已从仓库移除，
 需要时直接看原生目录或上游仓库。
 
 ## 版本
 
-- 面板版本 = `WEBUI_VERSION`（`docker/webui/config.py`），发布流程见
+- 面板版本 = `WEBUI_VERSION`（`stockdb-ai/config.py`），发布流程见
   [`docs/webui-spa/release-policy.md`](docs/webui-spa/release-policy.md)
 - 镜像 tag = 上游发布包版本（`docker/Dockerfile` 的 `ARG VERSION`）；镜像 `ghcr.io/awoeyiwuyua/stockdb-ai` **仅成熟版本发布**
 

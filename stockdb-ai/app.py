@@ -172,7 +172,7 @@ def _default_schedule() -> dict:
 # 来源：exchange_calendars 的 XSHG 日历（https://github.com/gerrymanoim/exchange_calendars）
 # 取值规则：每个年份「周一~周五但非交易日」的日期（官方调休安排：春节/国庆/元旦/清明/五一/端午/中秋，
 # 以及部分周六周日调休补班的 0 个或 1 个非交易日，均已折算进工作日的缺失）。
-# 提取脚本：docker/webui/scripts/extract_xshg_holidays.py（仅维护期使用，不随 webui 运行）。
+# 提取脚本：stockdb-ai/scripts/extract_xshg_holidays.py（仅维护期使用，不随 webui 运行）。
 # 注意：XSHG 日历发布滞后（2027 官方安排通常 2026 年底公布），未收录年份按"工作日=交易日"处理，
 # 数据截至年份后请在日志提示更新。
 XSHG_HOLIDAYS: dict[str, set[str]] = {
@@ -1726,7 +1726,7 @@ def _version_tuple(s) -> tuple | None:
 
 # ==================== HTTP 服务 ====================
 # ==================== 前端静态服务（Phase 5 M0：SPA 外壳 + /legacy 逃生通道） ====================
-# 前端已重构为 Vue SPA（docker/webui/spa/，构建产物在镜像内 /opt/webui/static/）。
+# 前端已重构为 Vue SPA（stockdb-ai/spa/，构建产物在镜像内 /opt/webui/static/）。
 # 旧面板（原 PAGE 字符串）完整保留在 static/legacy/index.html，路由 /legacy 原样渲染，
 # 作为逃生通道；WEBUI_UI=legacy 时根路径改用旧面板（默认 spa；SPA 未构建时自动兜底旧面板）。
 # 安全：静态文件定位一律 realpath 校验必须落在 STATIC_DIR 内，防路径穿越。

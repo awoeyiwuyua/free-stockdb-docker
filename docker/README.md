@@ -12,7 +12,7 @@ NAS 拉取时自动匹配自身 CPU 架构。
 - **镜像 tag = 上游 stockdb 发布包版本号**（当前 `0.3.1`）：workflow 手动触发时不填
   version 输入，就从 `docker/Dockerfile` 的 `ARG VERSION` 打 tag，如
   `ghcr.io/awoeyiwuyua/stockdb-ai:0.3.1` 与 `:latest`。
-- **webui 面板内部版本 = `WEBUI_VERSION`**（当前 0.5.1，见 `docker/webui/app.py`），
+- **webui 面板内部版本 = `WEBUI_VERSION`**（当前 0.5.1，见 `stockdb-ai/app.py`），
   仅用于面板显示，**不是镜像 tag**。二者是两个维度，不要混用。
 - 迭代节奏：上游发新版 → 升 `ARG VERSION`（镜像 tag 跟着变）；webui 面板改动 →
   升 `WEBUI_VERSION`（面板显示）。compose 建议用 `:latest`，无需每次改配置。
@@ -24,7 +24,7 @@ NAS 拉取时自动匹配自身 CPU 架构。
 | `Dockerfile` | 多阶段（0.5.0 起**单镜像**）：下载官方发布包（服务端+同步器+pybao）+ SHA256 校验 + webui 运维面板，一容器含 stockdb(7899)+webui(8080) |
 | `docker-compose.yml` | 单 service `stockdb`（端口 7899 + 8081，挂载 `./data` `./mydb`），不再挂载 docker.sock |
 | `stockdb.conf` | 容器内配置模板：`server.ip: 0.0.0.0`；pidfile `/data/stockdb.pid`、log `/data/log.txt`；首次启动拷到 `/data/stockdb.conf` 供编辑 |
-| `webui/entrypoint.sh` | 容器入口（0.5.0）：数据卷准备 → 可选首次同步（`STOCKDB_SYNC_FIRST=1`）→ 后台监督 stockdb 进程存活 → 前台循环拉起 webui（崩溃自动重启） |
+| `stockdb-ai/entrypoint.sh` | 容器入口（0.5.0）：数据卷准备 → 可选首次同步（`STOCKDB_SYNC_FIRST=1`）→ 后台监督 stockdb 进程存活 → 前台循环拉起 webui（崩溃自动重启） |
 | `.github/workflows/build-image.yml` | GitHub Actions：手动触发，buildx 构建 amd64+arm64 单镜像推 ghcr.io |
 
 ---
@@ -94,13 +94,13 @@ docker build -t ghcr.io/awoeyiwuyua/stockdb-ai:0.3.1 .
 `webui` 是纯 Python 标准库单文件应用，读功能（健康度/状态/查询/港股拉取）可完全在本地开发调试：
 
 ```bash
-docker/webui/dev.sh            # 默认直连 Tailscale 上极空间的 100.66.1.1:7899
-STOCKDB_HOST=192.168.1.5 ./docker/webui/dev.sh   # 指定其他 stockdb 实例
-WEBUI_PORT=18080 ./docker/webui/dev.sh           # 换本地端口
+stockdb-ai/dev.sh            # 默认直连 Tailscale 上极空间的 100.66.1.1:7899
+STOCKDB_HOST=192.168.1.5 ./stockdb-ai/dev.sh   # 指定其他 stockdb 实例
+WEBUI_PORT=18080 ./stockdb-ai/dev.sh           # 换本地端口
 # 浏览器打开 http://127.0.0.1:8080
 ```
 
-- 本地数据（同步历史/日志）落在 `docker/webui/.dev-data/`（已 gitignore），不碰 NAS 数据卷
+- 本地数据（同步历史/日志）落在 `stockdb-ai/.dev-data/`（已 gitignore），不碰 NAS 数据卷
 - 同步依赖容器内 `/opt/stockdb/数据更新`；本地无该二进制时同步接口自动降级为"不可用"提示——这些改动需推到 NAS 重建镜像后验证
 - 改完 `app.py` 后重新构建单镜像（GH Actions / `docker build` 流程，见上文），极空间上 `docker compose up -d stockdb` 拉新镜像重启
 
@@ -132,10 +132,10 @@ WEBUI_PORT=18080 ./docker/webui/dev.sh           # 换本地端口
 > 同步主流程为**热更新**（同步器检测到新数据文件后自动重启 stockdb 加载新快照，
 > 重启窗口约 1-2 秒）；**停服同步**为故障兜底（「更多操作 → 停服同步」）。
 
-> A股休市表（`app.py` 的 `XSHG_HOLIDAYS`）取自 [exchange_calendars](https://github.com/gerrymanoim/exchange_calendars) XSHG 日历，数据截至 2026 年；官方次年放假安排公布后，用 `docker/webui/scripts/extract_xshg_holidays.py` 重新提取更新（webui 运行时零依赖，判定不依赖外部服务）。
+> A股休市表（`app.py` 的 `XSHG_HOLIDAYS`）取自 [exchange_calendars](https://github.com/gerrymanoim/exchange_calendars) XSHG 日历，数据截至 2026 年；官方次年放假安排公布后，用 `stockdb-ai/scripts/extract_xshg_holidays.py` 重新提取更新（webui 运行时零依赖，判定不依赖外部服务）。
 
 ### 4. 本地 ZCode 接入
-只读 MCP server 已迁入本仓库 `docker/webui/mcp/stockdb_mcp_server.py`（纯标准库，连 `STOCKDB_HOST:7899`），
+只读 MCP server 已迁入本仓库 `stockdb-ai/mcp/stockdb_mcp_server.py`（纯标准库，连 `STOCKDB_HOST:7899`），
 随 webui 镜像一起分发，由 webui 的 `POST /mcp` 路由承载（与 stdio 共用同一份 dispatch）。
 
 现共 **12 个只读工具**：
@@ -174,7 +174,7 @@ WEBUI_PORT=18080 ./docker/webui/dev.sh           # 换本地端口
 **A. stdio（本机 ZCode）**
 ```bash
 # 连通性自检（替换为你的 NAS 地址）：
-STOCKDB_HOST=<NAS_IP> uv run python docker/webui/mcp/stockdb_mcp_server.py --self-check
+STOCKDB_HOST=<NAS_IP> uv run python stockdb-ai/mcp/stockdb_mcp_server.py --self-check
 # 通过后，在 ZCode Settings → MCP 加 stockdb-native，command 指向本文件：
 #   "env": {"STOCKDB_HOST": "<NAS_IP>"}
 ```
@@ -246,7 +246,7 @@ docker compose pull && docker compose up -d
 
 - **AI MCP 容器化**：官方 `调用方式/ai_mcp/stockdb_full_mcp.py`（位于上游仓库
   [hello245m/free-stockdb](https://github.com/hello245m/free-stockdb)，需容器带 Python +
-  pybao C 扩展），或继续用本仓库 `docker/webui/mcp/stockdb_mcp_server.py`（HTTP 只读，
+  pybao C 扩展），或继续用本仓库 `stockdb-ai/mcp/stockdb_mcp_server.py`（HTTP 只读，
   已随 webui 容器的 `/mcp` 路由承载，NAS 部署后走 `http://<NAS_IP>:8081/mcp`）
 - **webui 增强**：0.4.0 起 webui 为运维面板（同步/健康/查询/私有存储），行情展示功能已移除；数据接入统一走 stockdb HTTP（7899）与 `/mcp` 路由。
 - **定时同步**：极空间计划任务，或 webui 内加定时（后续版本）

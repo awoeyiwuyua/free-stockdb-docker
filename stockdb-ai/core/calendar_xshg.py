@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """calendar_xshg — A 股交易日历（休市表覆盖 2024-2026，来源 exchange_calendars XSHG）。
 
-本模块把 docker/webui/app.py 第 116-125 行的 XSHG_HOLIDAYS 休市表复制为独立只读
+本模块把 stockdb-ai/app.py 第 116-125 行的 XSHG_HOLIDAYS 休市表复制为独立只读
 日历，供 stockdb_mcp_server 的 get_trading_days / get_data_status / get_kline
 非交易日提示使用。纯标准库（datetime），无第三方依赖。
 
@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from datetime import date, datetime, timedelta
 
-# 与 docker/webui/app.py 第 116-125 行逐项一致（2024 20 项 / 2025 18 项 / 2026 19 项）。
+# 与 stockdb-ai/app.py 第 116-125 行逐项一致（2024 20 项 / 2025 18 项 / 2026 19 项）。
 XSHG_HOLIDAYS: dict[str, set[str]] = {
     "2024": {"01-01", "02-09", "02-12", "02-13", "02-14", "02-15", "02-16",
              "04-04", "04-05", "05-01", "05-02", "05-03", "06-10", "09-16", "09-17",

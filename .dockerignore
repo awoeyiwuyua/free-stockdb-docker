@@ -1,0 +1,13 @@
+# 0.9.7：构建上下文改为仓库根（Dockerfile COPY stockdb-ai/...），排除非镜像物
+.git
+.venv
+.uv-cache
+.uv-python
+.tmp-test
+.env-support
+docs
+CHANGELOG.md
+README.md
+pyproject.toml
+uv.lock
+.python-version

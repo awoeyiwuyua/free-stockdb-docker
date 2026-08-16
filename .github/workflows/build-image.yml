@@ -66,7 +66,7 @@ jobs:
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
-          context: ./docker
+          context: ./
           platforms: linux/amd64,linux/arm64
           file: ./docker/Dockerfile
           build-args: |
@@ -126,18 +126,18 @@ jobs:
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: docker/webui/spa/package-lock.json
+          cache-dependency-path: stockdb-ai/spa/package-lock.json
 
       - name: npm ci
-        working-directory: docker/webui/spa
+        working-directory: stockdb-ai/spa
         run: npm ci --no-audit --no-fund
 
       - name: Vitest 单测
-        working-directory: docker/webui/spa
+        working-directory: stockdb-ai/spa
         run: npm run test
 
       - name: Vite 构建（验证可编译出 dist）
-        working-directory: docker/webui/spa
+        working-directory: stockdb-ai/spa
         run: npm run build
 
   test-mcp:
@@ -153,9 +153,9 @@ jobs:
           python-version: '3.14'
 
       - name: Run MCP unit tests
-        working-directory: docker/webui
+        working-directory: stockdb-ai
         run: python -m unittest mcp.test_stockdb_mcp_server -v
 
       - name: Run ops + auction unit tests
-        working-directory: docker/webui
+        working-directory: stockdb-ai
         run: python -m unittest test_ops test_auction_collect test_auction_metrics test_auction_list -v

@@ -6,8 +6,8 @@
 
 ## 这一轮做了什么
 
-1. **前端源码工程** `docker/webui/spa/`：Vue 3 + Vite 项目，含 9 个路由占位页（M2 逐个实现）。
-2. **后端静态服务**（`docker/webui/app.py`）：删掉了 1300 行的 PAGE 字符串，改为
+1. **前端源码工程** `stockdb-ai/spa/`：Vue 3 + Vite 项目，含 9 个路由占位页（M2 逐个实现）。
+2. **后端静态服务**（`stockdb-ai/app.py`）：删掉了 1300 行的 PAGE 字符串，改为
    - `/` → SPA 的 `index.html`（未构建时自动兜底旧面板）
    - `/legacy` → 旧面板（原样保留，逃生通道）
    - `/assets/*` → 构建产物（带 immutable 缓存）
@@ -45,7 +45,7 @@
 ## 你可以怎么玩
 
 ```bash
-cd docker/webui/spa
+cd stockdb-ai/spa
 npm install                # 装依赖（你自己的电脑上直接跑就行）
 npm run dev                # 打开 http://localhost:5173，改一行代码浏览器立刻变
 npm run test               # 前端单测

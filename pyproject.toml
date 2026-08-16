@@ -13,7 +13,7 @@ webui = "webui.app:main"
 package = false
 
 [tool.uv.sources]
-# 无第三方依赖；pybao 写库通过 PYTHONPATH 注入（见 docker/webui/Dockerfile）
+# 无第三方依赖；pybao 写库通过 PYTHONPATH 注入（见 docker/Dockerfile 的 ENV PYTHONPATH）
 
 [project.optional-dependencies]
 dev = []

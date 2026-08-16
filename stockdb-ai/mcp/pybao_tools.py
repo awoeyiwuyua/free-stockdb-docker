@@ -719,7 +719,7 @@ def query_boards(args: dict) -> dict:
 
 # === mydb 私有库读取 / 条件选股（Phase 2） ===
 # 上游 stockdb 内置私有存储 ./mydb：HTTP 层只读，读取走原始 rd 客户端。
-# 保留表清单与 docker/webui/app.py 的 _RESERVED_TABLES 保持一致（禁止覆盖上游同步数据）。
+# 保留表清单与 stockdb-ai/app.py 的 _RESERVED_TABLES 保持一致（禁止覆盖上游同步数据）。
 
 _RESERVED_TABLES = ("日k", "分钟k", "复权", "股票代码", "周k", "月k", "板块", "行业", "概念")
 
@@ -854,7 +854,7 @@ def _query_research(table: str, key: str, limit: int,
 
 
 def query_mydb(args: dict) -> dict:
-    """只读 mydb 私有库（镜像 docker/webui/app.py 的 mydb_read 语义，纯读不写）。
+    """只读 mydb 私有库（镜像 stockdb-ai/app.py 的 mydb_read 语义，纯读不写）。
 
     参数：
         table  自定义表名（非空、仅字母数字与 _:-、不得与上游保留表冲突）

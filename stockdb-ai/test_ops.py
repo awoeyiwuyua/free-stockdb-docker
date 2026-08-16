@@ -27,9 +27,9 @@ http.server mock + patch urlopen）：
   test_paper.py 一并移除，49 项测试语义与行为基线不变。
 
 运行（自测命令，须贴 Ran/OK 与最后几行）：
-    cd docker/webui && /Users/xiahaihe/Claudecode/stockdb-ai/.venv/bin/python -m unittest test_ops -v
+    cd stockdb-ai && /Users/xiahaihe/Claudecode/stockdb-ai/.venv/bin/python -m unittest test_ops -v
 回归（mcp 不受影响）：
-    cd docker/webui && /Users/xiahaihe/Claudecode/stockdb-ai/.venv/bin/python -m unittest mcp.test_stockdb_mcp_server -v
+    cd stockdb-ai && /Users/xiahaihe/Claudecode/stockdb-ai/.venv/bin/python -m unittest mcp.test_stockdb_mcp_server -v
 """
 
 from __future__ import annotations

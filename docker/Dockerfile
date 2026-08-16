@@ -52,14 +52,14 @@ RUN set -eu; \
     test -d "/out/stockdb/pybao" || { echo "pybao missing" >&2; ls -la /out/stockdb; exit 1; }
 
 # ================= SPA 前端构建（Node 仅构建期存在；产物为纯静态文件进最终镜像） =================
-# Vue 3 + Vite（Phase 5 M0）：编译 docker/webui/spa/ → dist/（index.html + assets/*，
+# Vue 3 + Vite（Phase 5 M0）：编译 stockdb-ai/spa/ → dist/（index.html + assets/*，
 # 文件名带内容哈希可 immutable 缓存）。node:22-alpine 官方 manifest 覆盖 amd64+arm64。
 FROM node:22-alpine AS spa-build
 
 WORKDIR /build
-COPY webui/spa/package.json webui/spa/package-lock.json ./
+COPY stockdb-ai/spa/package.json stockdb-ai/spa/package-lock.json ./
 RUN npm ci --no-audit --no-fund
-COPY webui/spa/ ./
+COPY stockdb-ai/spa/ ./
 RUN npm run test && npm run build && test -f dist/index.html
 
 # ================= 运行时：amd64 用 Debian(glibc)，匹配 manylinux-x64 的 pybao =================
@@ -93,17 +93,17 @@ COPY --from=build /out/stockdb/pybao /opt/stockdb/pybao
 # 容器内统一用 /etc/stockdb/stockdb.conf 模板（0.0.0.0 + 卷内 pidfile/log），
 # 删掉自带的避免混淆。模板由 entrypoint 拷到 /data 卷。
 RUN rm -f /opt/stockdb/stockdb.conf
-COPY stockdb.conf /etc/stockdb/stockdb.conf
+COPY docker/stockdb.conf /etc/stockdb/stockdb.conf
 
 # ---- webui 运维面板 + 只读 MCP（app.py 的 /mcp 路由复用其 dispatch，纯标准库） ----
-COPY webui/app.py webui/entrypoint.sh /opt/webui/
-COPY webui/mcp/ /opt/webui/mcp/
+COPY stockdb-ai/app.py stockdb-ai/entrypoint.sh /opt/webui/
+COPY stockdb-ai/mcp/ /opt/webui/mcp/
 # ---- 打板竞价采集模块（0.7.0：采集器/指标分位/清单，与 app.py 同目录分发） ----
-COPY webui/auction_collect.py webui/auction_metrics.py webui/auction_list.py /opt/webui/
+COPY stockdb-ai/auction_collect.py stockdb-ai/auction_metrics.py stockdb-ai/auction_list.py /opt/webui/
 # ---- 前端静态资源：SPA 构建产物（根路径 /）+ 旧面板逃生通道（/legacy） ----
 # app.py 按 WEBUI_STATIC_DIR（默认 <app.py>/static）服务；legacy 必须落在此目录下。
 COPY --from=spa-build /build/dist /opt/webui/static/
-COPY webui/static/legacy/ /opt/webui/static/legacy/
+COPY stockdb-ai/static/legacy/ /opt/webui/static/legacy/
 
 # pybao 写库客户端路径注入（webui 的 mydb 私有存储 / 港股落盘）
 ENV PYTHONPATH=/opt/stockdb/pybao
