@@ -2042,6 +2042,26 @@ PROMPTS: list[dict] = [
     },
 ]
 
+# === 0.9.0 M4：上游 SDK 41 工具（契约外壳，见 docs/design/sdk-mcp-bridge.md） ===
+# sdk_bridge 懒加载上游，本模块任何环境下均可导入；无上游 → tool_specs() 为空列表，
+# SDK 工具不注册（AI 侧不可见），调用路径返回 DEPENDENCY_UNAVAILABLE（见 _call_tool）。
+try:
+    from sdk_bridge import (  # noqa: E402 - 同目录模块（_MCP_DIR 已插入 sys.path）
+        KNOWN_SDK_TOOL_NAMES as _sdk_known_names,
+        call_tool as _sdk_call_tool,
+        import_error as _sdk_import_error,
+        tool_specs as _sdk_tool_specs,
+    )
+except ImportError:  # 防御：sdk_bridge 缺失时 MCP 服务器仍可用（SDK 工具整体不注册）
+    _sdk_known_names = frozenset()
+    _sdk_call_tool = None
+    _sdk_import_error = lambda: "sdk_bridge 缺失"  # noqa: E731 - 防御降级
+    _sdk_tool_specs = lambda: []  # noqa: E731 - 防御降级
+
+_sdk_tool_specs_ext = _sdk_tool_specs()  # 41 个上游工具规格（无上游 → []）
+if _sdk_tool_specs_ext:
+    TOOLS = TOOLS + _sdk_tool_specs_ext
+
 
 # === 统一错误码：isError content = {"error": str, "code": str}(, "hint") ===
 
@@ -2124,6 +2144,10 @@ _CONTRACT_BY_TOOL: dict[str, tuple[str | None, str]] = {
     "get_point_snapshot": ("http", "snapshot-v1"),
 }
 
+# 0.9.0 M4：SDK 41 工具族统一契约（source="sdk"，上游通道）
+for _sdk_contract_name in _sdk_known_names:
+    _CONTRACT_BY_TOOL.setdefault(_sdk_contract_name, ("sdk", "sdk-bridge-v1"))
+
 
 def _known_at_str(value: object) -> str | None:
     """known_at 归一化：int/str 日期 → str，None/空 → None。"""
@@ -2154,7 +2178,8 @@ def _max_date_in_data(data: object) -> str | None:
         if not isinstance(row, dict):
             continue
         try:
-            day = int(row.get("date"))
+            # 兼容 8 位（20260812）与 ISO（2026-08-12）两种日期形态（SDK 工具为 ISO）
+            day = int(str(row.get("date")).replace("-", ""))
         except (TypeError, ValueError):
             continue
         if max_date is None or day > max_date:
@@ -2169,6 +2194,9 @@ def _derive_known_at(tool_name: str, result: dict) -> str | None:
     （如 "20260817 09:26 竞价采集(source=tencent)"，未合并时 None，历史口径不变）；
     mydb 与其余静态工具 → null。"""
     if tool_name in ("get_kline", "get_indicators"):
+        return _max_date_in_data(result.get("data"))
+    if tool_name in _sdk_known_names:
+        # 0.9.0 M4：SDK 工具 known_at = data 最大日期（无日期字段 → null）
         return _max_date_in_data(result.get("data"))
     if tool_name in ("screen_stocks", "get_market_snapshot", "get_point_snapshot"):
         return _known_at_str(result.get("date"))
@@ -2330,6 +2358,24 @@ def _call_tool(name: str, args: dict) -> dict:
             result = query_point_snapshot(args)
         except ValueError as exc:
             return _value_error_result(exc)
+    elif name in _sdk_known_names:
+        # 0.9.0 M4：上游 SDK 41 工具（sdk_bridge 契约外壳）
+        if _sdk_call_tool is None:
+            return _error_result(f"{name}: sdk_bridge 未加载", ERROR_DEPENDENCY_UNAVAILABLE)
+        sdk_reason = _sdk_import_error()
+        if sdk_reason:
+            # 上游 stockdb_full_mcp 未加载（无 pybao / 缺文件）：工具已知但不可用
+            return _error_result(
+                f"{name}: SDK 工具不可用（{sdk_reason}）",
+                ERROR_DEPENDENCY_UNAVAILABLE,
+                hint="本机需 PYBAO_DIR 指向原生 pybao 目录；容器镜像自动携带",
+            )
+        try:
+            result = _sdk_call_tool(name, args)
+        except ValueError as exc:
+            return _value_error_result(exc)
+        except RuntimeError as exc:
+            return _error_result(str(exc), ERROR_INTERNAL_ERROR)
     else:
         # 未知工具同样按 INVALID_ARGUMENT（契约：未知工具 = 参数非法）
         return _error_result(f"未知工具: {name}", ERROR_INVALID_ARGUMENT)

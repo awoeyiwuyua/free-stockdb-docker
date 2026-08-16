@@ -79,7 +79,7 @@ _last_verify_result: str | None = None  # 最近一次完整性验证结果（pa
 _scheduler_alive = False             # 定时线程心跳（每次循环更新时间戳）
 _scheduler_heartbeat = 0.0           # 定时线程最近一次心跳时间戳（unix）
 _webui_started = time.time()         # webui 进程启动时间戳
-WEBUI_VERSION = "0.8.18"
+WEBUI_VERSION = "0.9.0"
 
 HISTORY_FILE = DATA_DIR / "sync_history.json"
 SCHEDULE_FILE = DATA_DIR / "sync_schedule.json"
@@ -1377,9 +1377,19 @@ def run_sync(hot: bool = True, trigger: str = "manual", retry: bool = False) -> 
         _sync_lock.release()
 
 
+def _sync_log_path() -> "Path":
+    """同步日志路径：动态读 DATA_DIR（测试/部署可 patch，0.9.0 修复——
+
+    旧实现用 import 时求值的模块常量 SYNC_LOG，测试 patch DATA_DIR 后 log() 仍
+    写默认 /data（CI Linux 不可写 → PermissionError 污染被测路径）。
+    """
+    return Path(DATA_DIR) / "sync.log"
+
+
 def log(line: str) -> None:
-    SYNC_LOG.parent.mkdir(parents=True, exist_ok=True)
-    with SYNC_LOG.open("a", encoding="utf-8") as fh:
+    p = _sync_log_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with p.open("a", encoding="utf-8") as fh:
         fh.write(f"{now()}  {line}\n")
 
 
@@ -1388,9 +1398,10 @@ def now() -> str:
 
 
 def tail_log(n: int = 200) -> str:
-    if not SYNC_LOG.exists():
+    p = _sync_log_path()
+    if not p.exists():
         return "（暂无同步日志）"
-    lines = SYNC_LOG.read_text(encoding="utf-8", errors="replace").splitlines()
+    lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
     return "\n".join(lines[-n:])
 
 
@@ -3019,18 +3030,27 @@ def auction_run_close() -> dict:
         #    在除权除息日为调整昨收，混入分红会失真）
         codes = _auction_load_codes(today) or [str(c) for c in (snap_res.get("values") or {})]
         prev_close_by_code = _auction_lag_close(prev_points)
+        missing_open = 0  # 0.9.0 M1 边界 c：清单股取不到 (open, prev_close) 有效对
         if codes:
             code_set = set(codes)
             snapshots = [{"code": p["code"], "open_price": p.get("open"),
                           "prev_close": prev_close_by_code.get(str(p.get("code")))}
                          for p in points if str(p.get("code")) in code_set]
+            # 守恒：候选 = n_samples + missing_open_count（无 bar / open 缺失 /
+            # T-1 无收盘均计 missing_open；0.9.0 之前静默丢弃）
+            missing_open = len(code_set) - sum(
+                1 for s in snapshots
+                if s["open_price"] is not None and s["prev_close"] is not None)
+            snapshots = [s for s in snapshots
+                         if s["open_price"] is not None and s["prev_close"] is not None]
         else:
             snapshots = [{"code": p["code"], "open_price": p.get("open"),
                           "prev_close": prev_close_by_code.get(str(p.get("code")))}
                          for p in points]
-        # 防御：清单股在 T-1 无收盘（异常）→ 剔除，避免 None 分母进指标
-        snapshots = [s for s in snapshots if s["prev_close"] is not None]
+            # 兜底全市场路径无候选语义：prev_close 缺失防御剔除（0.8.13 语义不变）
+            snapshots = [s for s in snapshots if s["prev_close"] is not None]
         metrics = _auction_compute_metrics(snapshots)
+        metrics = {**metrics, "missing_open_count": missing_open}
         series_by = {}
         for m in AUCTION_METRICS:
             value = metrics.get(m)
@@ -3108,6 +3128,7 @@ def auction_run_backfill(days: int = 60) -> dict:
             # 在除权除息日为交易所调整昨收，会混入分红使溢价失真，不可用作分母）
             prev_close_by_code = {str(p.get("code")): p.get("close") for p in pts1}
             snaps = []
+            missing_open = 0  # 0.9.0 M1 边界 c：板日涨停但指标日无有效 (open, prev_close)
             if codes:
                 # 溢价日只查清单股（免全扫）；清单可能 >200 只 → 分块拉取（0.8.9）
                 pts_t = _auction_points_for_codes(t, codes)
@@ -3118,7 +3139,10 @@ def auction_run_backfill(days: int = 60) -> dict:
                     if p and p.get("open") is not None and prev_close is not None:
                         snaps.append({"code": c, "open_price": p.get("open"),
                                       "prev_close": prev_close})
+                    else:
+                        missing_open += 1  # 守恒：候选 = n_samples + missing_open_count
             m = _auction_compute_metrics(snaps)
+            m = {**m, "missing_open_count": missing_open}
             if m["n_samples"] > 0:
                 rows.append((t, m))
             t = t1
