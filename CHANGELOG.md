@@ -3,6 +3,21 @@
 本项目面板版本号 = `WEBUI_VERSION`（`docker/webui/app.py`），镜像 tag 跟随上游引擎版本。
 发布纪律见 `docs/webui-spa/release-policy.md`；部署记录见 `docs/DEPLOYMENTS.md`。
 
+## [0.8.17] — 2026-08-16（同步链路修复：认证失败识别 + None>0 崩溃）
+- 事故：命理档案触发手动热更新 → 数据源 auth failed（同步器退出码 0）→ webui
+  崩溃 "'>' not supported between instances of 'NoneType' and 'int'"（exit_code=-1）
+- 根因一：`counts.get("downloads", 0) > 0`——同步器未打印"待下载资源数"时
+  downloads=None（key 存在），dict.get 默认值不生效 → None > 0 抛异常
+- 根因二：同步器对认证/连接失败返回退出码 0，webui 无失败识别 → 误入验证流程
+- 修复：
+  - `_sync_failure_reason(stdout)`：识别 auth failed / 连接失败 → 明确 fail_reason
+    + 跳过验证与重启（数据保持原状，恢复认证后重试）
+  - downloads=None 比较安全化（None 走保守重启分支）
+- 测试 +4（auth/连接失败识别、正常输出、None 比较回归），Python 206 全绿
+- 待办（上游侧）：数据源 a.123128.xyz 认证恢复后重跑同步；补齐 002310 05-06~05-12
+  缺失历史（命理档案样本外复验 1 条差异的唯一根因）；候选计数语义（板日涨停/
+  指标日无 bar 计入 missing_open）后续修正
+
 ## [0.8.16] — 2026-08-16（验收 CSV 首日边界修正 + MCP server_version 同步）
 - 0.8.15 复验：线上 lag-close 主路径抽查通过（05-25 板日 05-22：候选 114 = 同花顺
   115 - 1 ST - 3 一字板）；验收 CSV 87 条不一致全部集中在窗口首日 05-22
