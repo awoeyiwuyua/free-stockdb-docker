@@ -32,7 +32,10 @@
   回填数据基线已在本机引擎重跑核对（08-14 = 47 / 0.012113 / 0.4894、序列 60/60）
 
 **其他**：修复 PR #81 head 误用导致空 diff 的失误（重新以正确 head 合并 PR #82）；
-上游文件维护约定：升级后重拷 stockdb_full_mcp.py + 冒烟回归（设计文档 §8）
+`log()/tail_log()` 改为动态读 DATA_DIR（原用 import 时求值的 SYNC_LOG 常量——测试
+patch DATA_DIR 后仍写默认 /data，CI Linux 不可写导致收口路径 PermissionError，
+本地 Windows 因 C:\data 可写从未暴露）；上游文件维护约定：升级后重拷
+stockdb_full_mcp.py + 冒烟回归（设计文档 §8）
 
 ## [0.8.18] — 2026-08-16（仓库治理：只留研究成果 + 原生模式为主线 + docker 降级可选）
 - 方向（用户拍板）：① 明确两个目录关系；② 精简仓库只保留研究成果；③ docker 镜像非主线
