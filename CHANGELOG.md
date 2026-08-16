@@ -4,6 +4,29 @@
 镜像 tag 跟随上游引擎版本。发布纪律见 `docs/webui-spa/release-policy.md`；
 部署记录见 `docs/DEPLOYMENTS.md`；本机目录关系与运行配方见 `docs/DEVELOPMENT-GUIDE.md`。
 
+## [0.9.5] — 2026-08-16（M5 研究成果产出自持：引擎死不影响研究数据）
+
+架构总纲 D8 落地（设计 docs/design/research-store.md，PR #91 评审合并）：
+
+- **SqliteResearchStore**（storage/research_store.py）：研究成果迁出引擎 mydb →
+  自建 SQLite（DATA_DIR/research.db，WAL 模式 + busy_timeout 5s）；表：
+  metrics / series / lists / snapshots / meta（迁移记录）；NaN/Inf 写前护栏沿用
+- **ResearchStore 抽象接口**（用户 Repository 模式采纳）：write/read metrics・
+  series・lists・snapshots + migrate_from_engine + backup；两个实现——
+  SqliteResearchStore（主线）+ MydbResearchStore（回滚适配，语义方法映射旧路径）
+- **工厂切换**：RESEARCH_STORE 环境变量（默认 sqlite；mydb = 回滚 0.9.4 行为），
+  组合根注入 services（应用层只依赖接口，零改动感知——层边界测试新增
+  services 禁 import storage.providers 物理规则）
+- **一次性迁移**：migrate_from_engine 前缀枚举引擎 mydb 研究成果表（禁 keys("*")
+  全表扫描）→ SQLite 事务批量；幂等可重跑；引擎数据保留不删（回滚预案）
+- **读兼容**：get_mydb_data 研究成果表路由 research store（打板指标→metrics 等
+  表名映射，返回结构与引擎路径一致——对外契约不变）；未知前缀仍走引擎
+- **自动备份**：日检写盘后 VACUUM INTO backups/（保留 14 份，失败静默）
+- **本机真实迁移验证**：引擎 mydb 60 天回填 → SQLite，读回基线逐位命中
+  （08-14 = 47 / 0.0121129886 / 0.4893617、序列 60/60）；备份生成正常
+- 测试 +11（SQLite CRUD/WAL/NaN 护栏/迁移幂等/备份保留/工厂切换/回滚适配/
+  query_mydb 路由）；Python 260 全绿
+
 ## [0.9.4] — 2026-08-16（存储层优化：日检日度 Rotate + 写前 NaN/Inf 护栏）
 
 用户存储层优化拍板（分级评估：Rotate/护栏做；SQLite WAL + Repository 接口 + 备份

@@ -798,6 +798,61 @@ def get_mydb_rd() -> object | None:
         return None
 
 
+def _query_research(table: str, key: str, limit: int,
+                    cursor: str | None) -> dict:
+    """研究成果表读取（0.9.5 M5）：research store 语义接口 → query_mydb 同构返回。
+
+    表名映射：打板指标:<date>→metrics / 打板序列:<metric>→series /
+    清单:<date>:limitup_non_yizi→lists / 竞价快照:<date>→snapshots。
+    """
+    from storage.research_factory import get_research_store
+
+    store = get_research_store()
+    parts = table.split(":")
+
+    def _single(kind: str, value: dict | None) -> dict:
+        return {
+            "ok": True,
+            "result": {"source": "research", "table": table,
+                       "key": kind, "value": value},
+        }
+
+    def _listing(items: dict[str, dict]) -> dict:
+        keys_sorted = sorted(items.keys())
+        total = len(keys_sorted)
+        kept = keys_sorted if total <= limit else keys_sorted[:limit]
+        values = {k: items[k] for k in kept}
+        return {
+            "ok": True,
+            "result": {"source": "research", "table": table,
+                       "keys": kept, "values": values, "total": total,
+                       "truncated": total > limit,
+                       "next_key": kept[-1] if total > limit else None},
+        }
+
+    try:
+        if table.startswith("打板指标:") and len(parts) == 2:
+            value = store.read_metrics(parts[1])
+            return _single("metrics", value) if key else \
+                _listing({"metrics": value} if value else {})
+        if table.startswith("打板序列:") and len(parts) == 2:
+            value = store.read_series(parts[1])
+            return _single("series", value) if key else \
+                _listing({"series": value} if value else {})
+        if table.startswith("清单:") and len(parts) == 3:
+            value = store.read_list(parts[1])
+            return _single("list", value) if key else \
+                _listing({"list": value} if value else {})
+        if table.startswith("竞价快照:") and len(parts) == 2:
+            rows = store.read_snapshots(parts[1])
+            if key:
+                return _single(key, rows.get(key))
+            return _listing(rows)
+    except Exception as exc:  # noqa: BLE001 - 研究库读取异常 → 降级错误
+        return _internal_error(f"研究库读取失败: {exc}")
+    return _param_error(f"表名 {table!r} 不在研究成果命名空间")
+
+
 def query_mydb(args: dict) -> dict:
     """只读 mydb 私有库（镜像 docker/webui/app.py 的 mydb_read 语义，纯读不写）。
 
@@ -827,6 +882,12 @@ def query_mydb(args: dict) -> dict:
         table = _validate_mydb_table(table)
     except ValueError as exc:
         return _param_error(str(exc))
+
+    # 0.9.5（M5）：研究成果表（打板指标/序列/清单/竞价快照）路由 research store
+    # （SqliteResearchStore 主线 / mydb 回滚），不再经引擎 rd —— 引擎死不影响
+    # 研究成果可读（架构 D8）。返回结构与引擎路径一致（对外契约不变）。
+    if table.startswith(("打板指标:", "打板序列:", "清单:", "竞价快照:")):
+        return _query_research(table, key, limit, cursor)
 
     rd = get_mydb_rd()
     if rd is None:
