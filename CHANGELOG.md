@@ -4,6 +4,23 @@
 镜像 tag 跟随上游引擎版本。发布纪律见 `docs/webui-spa/release-policy.md`；
 部署记录见 `docs/DEPLOYMENTS.md`；本机目录关系与运行配方见 `docs/DEVELOPMENT-GUIDE.md`。
 
+## [0.9.4] — 2026-08-16（存储层优化：日检日度 Rotate + 写前 NaN/Inf 护栏）
+
+用户存储层优化拍板（分级评估：Rotate/护栏做；SQLite WAL + Repository 接口 + 备份
+随 M5；Parquet/DuckDB 明确不做、PostgreSQL 明确否）：
+
+- **定位澄清（用户拍板）**：free-stockdb 引擎本地 LevelDB 即"自建行情存储"——
+  架构红线精确化为"不重造行情获取管线"；Parquet 镜像冗余，M6 降级为纯备胎预案
+  （architecture.md 已更新）
+- **records 日度 Rotate**：日检按天分文件（records/YYYY-MM-DD.jsonl），天然按日期
+  索引（Trace ID 检索友好），保留 90 天自动清理；recent 跨天扫描 + 兼容 0.9.2
+  旧单文件
+- **mydb_write 写前护栏（Pre-Commit Validation）**：递归检测 NaN/Inf 浮点——
+  含脏数值的条目剔除并计数（skipped_invalid），不落盘（拦截污染数据，防 pybao
+  序列化失败）；全部被拦截 → ValueError（调用方告警）；停牌日 open=0/None 属合法
+  形态不误伤
+- 测试：records 重写 7 例（日度/跨天/清理/兼容）+ 护栏 1 例；Python 249 全绿
+
 ## [0.9.3] — 2026-08-16（MCP 工具分组 Gateway + Trace ID 可观测性）
 
 用户优化拍板（四维度评估：1a/4a 做，2a-2b/3a-3b/4b 记候选，Redis/队列不做）：

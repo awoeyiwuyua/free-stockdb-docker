@@ -91,30 +91,55 @@ def validate_custom_table(table: str) -> str:
     return t
 
 
+def _has_nan_inf(value) -> bool:
+    """递归检查 value 中是否含 NaN/Inf 浮点（0.9.4 写前护栏）。
+
+    pybao 存原生 dict 时 NaN/Inf 会导致序列化失败/脏数据——写入前拦截。
+    """
+    import math
+    if isinstance(value, float):
+        return math.isnan(value) or math.isinf(value)
+    if isinstance(value, list):
+        return any(_has_nan_inf(v) for v in value)
+    if isinstance(value, dict):
+        return any(_has_nan_inf(v) for v in value.values())
+    return False
+
+
 def mydb_write(table: str, items: list[tuple], batch: bool = False) -> dict:
     """写入 mydb 私有存储。items=[(key, value), ...]。
 
     注意：pybao 的 rd.set 返回 QueryResult，必须调用 .do() 才真正发送写入
     （否则只是客户端排队，读不到）。batch 参数保留兼容，统一逐条 .do()。
     0.8.10：全程持 _rd_lock；任何 rd 异常 → 丢弃缓存连接（下次调用重连自愈）。
+    0.9.4：写前护栏——含 NaN/Inf 的条目剔除并计数（skipped_invalid），不落盘
+    （拦截脏数据污染研究资产）；全部被拦截 → ValueError（调用方告警）。
     """
     table = validate_custom_table(table)
-    if not items:
-        raise ValueError("没有可写入的数据")
+    clean: list[tuple] = []
+    skipped = 0
+    for key, value in items:
+        if _has_nan_inf(value):
+            skipped += 1
+            continue
+        clean.append((key, value))
+    if not clean:
+        raise ValueError(f"没有可写入的数据（{skipped} 条被 NaN/Inf 护栏拦截）")
     with _rd_lock:
         try:
             rd = _mydb_rd()
             result = []
-            for key, value in items:
+            for key, value in clean:
                 result.append(rd.set(table, key, value).do())
             # 回读校验（QueryResult 转原生）
             readback = []
-            for key, _ in items:
+            for key, _ in clean:
                 try:
                     readback.append(_rd_to_py(rd.get(table, key)))
                 except Exception:  # noqa: BLE001 - 单键回读失败按缺失
                     readback.append(None)
-            return {"table": table, "written": len(items), "readback": readback, "result": result}
+            return {"table": table, "written": len(clean), "skipped_invalid": skipped,
+                    "readback": readback, "result": result}
         except Exception:
             _mydb_rd_reset()
             raise
