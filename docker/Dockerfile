@@ -96,10 +96,14 @@ RUN rm -f /opt/stockdb/stockdb.conf
 COPY docker/stockdb.conf /etc/stockdb/stockdb.conf
 
 # ---- webui 运维面板 + 只读 MCP（app.py 的 /mcp 路由复用其 dispatch，纯标准库） ----
-COPY stockdb-ai/app.py stockdb-ai/entrypoint.sh /opt/webui/
-COPY stockdb-ai/mcp/ /opt/webui/mcp/
-# ---- 打板竞价采集模块（0.7.0：采集器/指标分位/清单，与 app.py 同目录分发） ----
-COPY stockdb-ai/auction_collect.py stockdb-ai/auction_metrics.py stockdb-ai/auction_list.py /opt/webui/
+# 0.9.8 严格分层：后端主体按层整体 COPY（interfaces/web + interfaces/mcp 接口层、
+# services/ 服务层、core/ 领域层、storage/ 数据层、ops/ 横切；组合根 app.py/config.py）。
+COPY stockdb-ai/app.py stockdb-ai/config.py stockdb-ai/auction_collect.py stockdb-ai/entrypoint.sh /opt/webui/
+COPY stockdb-ai/interfaces/ /opt/webui/interfaces/
+COPY stockdb-ai/services/ /opt/webui/services/
+COPY stockdb-ai/core/ /opt/webui/core/
+COPY stockdb-ai/storage/ /opt/webui/storage/
+COPY stockdb-ai/ops/ /opt/webui/ops/
 # ---- 前端静态资源：SPA 构建产物（根路径 /）+ 旧面板逃生通道（/legacy） ----
 # app.py 按 WEBUI_STATIC_DIR（默认 <app.py>/static）服务；legacy 必须落在此目录下。
 COPY --from=spa-build /build/dist /opt/webui/static/

@@ -4,6 +4,25 @@
 镜像 tag 跟随上游引擎版本。发布纪律见 `docs/webui-spa/release-policy.md`；
 部署记录见 `docs/DEPLOYMENTS.md`；本机目录关系与运行配方见 `docs/DEVELOPMENT-GUIDE.md`。
 
+## [0.9.8] — 2026-08-16（严格分层：接口层统一收拢 interfaces/，目录 = 架构图）
+
+用户拍板（学习诉求：目录结构严格按"层"定义）：
+
+- **接口层收拢**：`web/` + `mcp/` → `interfaces/web/`（HTTP）+ `interfaces/mcp/`（MCP）——
+  目录树 = 架构文档 §3 分层表的物理投影（interfaces/services/core/storage/ops）
+- **组合根与测试归位说明**：app.py/config.py（装配+配置，不属于任何层）与 test_*.py
+  （横切验证）保持根目录——这也是分层的一部分（组合根不是层、测试不是层）
+- **领域 shim 清零**：根目录 auction_metrics/auction_list + mcp/board_metrics/
+  calendar_xshg 四个兼容转发删除；interfaces/mcp server 与 services 改 import core.*
+  （领域逻辑单一真身）
+- **sys.path 机制适配**：server 直接运行方式补插仓库根（core/ 可导入），包导入方式不变
+- **层边界测试升级**：FORBIDDEN 集合 {web,mcp} → {interfaces}，接口层整体禁被下层依赖；
+  新增 test_interfaces_clean（接口层可依赖一切下层）
+- **Dockerfile 修正**（顺带发现）：此前只 COPY mcp/，web/services/core/storage/ops 均缺
+  （镜像非主线未暴露）——0.9.8 按层整体 COPY 后端主体
+- CI：unittest 命令 `mcp.test_*` → `interfaces.mcp.test_*`
+- Python 261 全绿（严格分层后重新验证）
+
 ## [0.9.7] — 2026-08-16（目录重组：应用层上提 stockdb-ai/，docker/ 只留部署物）
 
 用户拍板：仓库本质是**后端**（D1 AI 原生数据后端），webui 只是它暴露的 HTTP

@@ -9,33 +9,33 @@
 
 ```
 stockdb-ai/
-├── app.py                    # 入口：装配 + 启动（0.9.2 瘦身目标 ~200 行）
-├── config.py                 # 配置集中解析（0.9.2 从 app.py 抽出）
-├── web/                      # 接口层（HTTP 侧；mcp/ 同为接口层，0.9.2 再定去留）
-│   └── (0.9.2: routes.py / handlers.py)
-├── mcp/                      # 接口层（MCP 侧，现有结构基本不动）
+├── app.py                    # 入口：装配 + 启动（组合根，不属于任何层）
+├── config.py                 # 配置集中解析（各层共享）
+├── interfaces/               # 接口层（0.9.8 统一收拢；web/ HTTP + mcp/ MCP）
+│   ├── web/                  #   HTTP 侧：routes.py（路由表）/ handlers.py（Handler）
+│   └── mcp/                  #   MCP 侧：stockdb_mcp_server / sdk_bridge / pybao_tools
 ├── services/                 # 应用服务层（用例编排）
 │   ├── __init__.py           # 层契约 docstring
-│   └── (0.9.2: auction_collect / auction_close / auction_backfill / sync)
+│   └── auction_tasks.py      # 打板三用例 + 同步/日检（0.9.2 批次 4）
 ├── core/                     # 领域层（纯规则，不依赖任何外部）
 │   ├── __init__.py
-│   └── (0.9.2: board_metrics / auction_metrics / calendar_xshg 归位)
-├── storage/                  # 基础设施层（数据读写）
+│   └── board_metrics / auction_metrics / auction_list / calendar_xshg
+├── storage/                  # 基础设施层（数据读写；providers 多源抽象）
 │   ├── __init__.py
-│   └── (0.9.2: mydb_store / records)
+│   └── providers/（free_stockdb / mydb_store）+ records + research_store
 ├── ops/                      # 横切关注点（各层共用）
 │   ├── __init__.py
-│   └── (0.9.2: alerts / logging / scheduler / health)
-└── tests/                    # 层依赖纪律测试（0.9.1 就位）
+│   └── alerts / logging（0.9.2 批次 2）
+└── test_*.py                 # 层依赖纪律测试（0.9.1 就位；不属于任何层）
 ```
 
 ## 2. 层职责契约（0.9.1 的"图纸"——现有代码归属映射）
 
 | 层 | 职责 | 禁止 | 现有代码归属（0.9.2 搬） |
 |---|---|---|---|
-| **接口层** web/ + mcp/ | 收参数、校验、分发、组装响应（信封/错误码）；不碰业务 | 不写业务规则；不直接碰存储 | mcp/stockdb_mcp_server.py（TOOLS/_call_tool/契约）；app.py Handler（do_GET/do_POST） |
+| **接口层** interfaces/（web/ + mcp/） | 收参数、校验、分发、组装响应（信封/错误码）；不碰业务 | 不写业务规则；不直接碰存储 | interfaces/mcp/stockdb_mcp_server.py（TOOLS/_call_tool/契约）；interfaces/web/handlers.py（Handler：do_GET/do_POST） |
 | **应用服务层** services/ | 用例编排：拉数据→算→存；控制降级与告警触发 | 不写纯规则（公式）；不直接拼 SQL/键 | app.py 的 auction_run_collect/close/backfill、run_sync、auction_scheduler_loop 的任务体 |
-| **领域层** core/ | 纯规则：涨停判定/指标公式/分位/日历；纯函数、可独立测 | **不 import 任何其他层**（接口/服务/存储都不行） | mcp/board_metrics.py、auction_metrics.py、auction_list.py、calendar_xshg.py |
+| **领域层** core/ | 纯规则：涨停判定/指标公式/分位/日历；纯函数、可独立测 | **不 import 任何其他层**（接口/服务/存储都不行） | core/board_metrics.py、auction_metrics.py、auction_list.py、calendar_xshg.py（0.9.8 去 mcp/ 兼容转发） |
 | **基础设施层** storage/ | 存取：mydb 读写、文件、外部 HTTP（引擎/腾讯/东财）、pybao 加载 | 不写业务规则；不知道"调用者是谁" | app.py 的 mydb_write/read/tables、stockdb_fetch、_auction_series_*；auction_collect.fetch_quotes；pybao_tools；sdk_bridge（部分） |
 | **横切 ops/** | 日志/告警/调度/健康——各层可用 | 不承载业务用例 | app.py 的 log/tail_log、Alerts、notify_alert、scheduler_loop、health_status、_diag |
 

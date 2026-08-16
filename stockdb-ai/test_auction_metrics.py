@@ -3,7 +3,7 @@
 import json
 import unittest
 
-import auction_metrics as AM
+from core import auction_metrics as AM  # 领域层真身（0.9.8 根目录 shim 已删）
 
 
 class ComputeMetricsTests(unittest.TestCase):

@@ -24,7 +24,7 @@
 
 ## 2. 目标
 
-1. 41 个上游工具全量注册进本仓库 MCP（`mcp/stockdb_mcp_server.py`），工具名对齐上游
+1. 41 个上游工具全量注册进本仓库 MCP（`interfaces/mcp/stockdb_mcp_server.py`），工具名对齐上游
    （`get_bars` 等，去掉 stockdb_ 前缀以符合本仓库命名习惯？——**决策见 §5**）
 2. 统一契约：`{envelope, data}` 信封 + 8 错误码 + 参数校验（沿用 `_call_tool` /
    `_apply_contract` 机制）
@@ -39,7 +39,7 @@
 > 不可用上游 raw 形态替代。
 
 ```
-stockdb-ai/mcp/
+stockdb-ai/interfaces/mcp/
    ├─ stockdb_full_mcp.py   # 上游原文件拷贝（MIT，文件头注明来源与上游版本；
    │                        #   仅用其 stockdb_* 函数，不启动其服务器）
    ├─ sdk_bridge.py         # 新增契约外壳（纯标准库，~200 行）

@@ -39,10 +39,11 @@ def _now_iso() -> str:
 
 # 惰性 import：任务A/B/C（auction_collect/auction_list/auction_metrics）与 MCP 快照
 # 任一缺失 → AUCTION_MODULES_AVAILABLE=False，采集/收口返回 {ok:False}（不拖垮 webui）。
+# 0.9.8 严格分层：auction_list/auction_metrics 领域真身在 core/（根目录 shim 已删）。
 try:
-    from auction_collect import fetch_quotes as _auction_fetch_quotes
-    from auction_list import compute_limitup_list as _auction_compute_limitup_list
-    from auction_metrics import (
+    from auction_collect import fetch_quotes as _auction_fetch_quotes  # 数据层执行（D11 待迁 quote_sources）
+    from core.auction_list import compute_limitup_list as _auction_compute_limitup_list
+    from core.auction_metrics import (
         METRICS as AUCTION_METRICS,
         compute_metrics as _auction_compute_metrics,
         load_series as _auction_load_series,

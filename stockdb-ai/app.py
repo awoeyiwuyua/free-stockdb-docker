@@ -37,19 +37,20 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs, unquote
 
-# 只读 MCP（stockdb-native）dispatch：HTTP POST /mcp 复用（纯标准库，随 webui 同目录 mcp/ 分发）。
+# 只读 MCP（stockdb-native）dispatch：HTTP POST /mcp 复用（纯标准库，随 webui 同目录
+# interfaces/mcp/ 分发；0.9.8 严格分层：MCP 归接口层）。
 # 缺失/加载失败时 webui 其余功能不受影响，/mcp 路由返回 500。
 try:
-    from mcp.stockdb_mcp_server import dispatch as mcp_dispatch
+    from interfaces.mcp.stockdb_mcp_server import dispatch as mcp_dispatch
 except Exception:  # noqa: BLE001 - MCP 模块缺失时优雅降级
     mcp_dispatch = None
 
 # /mcp SSE 流式进度推送依赖 pybao_tools 的线程级 progress hook
 # （set_progress_hook/clear_progress_hook，见 pybao_tools 模块）；
-# 注意：必须用顶层 `import pybao_tools`（而非 `from mcp import pybao_tools`），
-# 与 mcp.stockdb_mcp_server 内的 `import pybao_tools` 共用同一模块实例——
+# 注意：必须用顶层 `import pybao_tools`（而非 `from interfaces.mcp import pybao_tools`），
+# 与 interfaces.mcp.stockdb_mcp_server 内的 `import pybao_tools` 共用同一模块实例——
 # 否则 threading.local 进度钩子分属两个模块对象，SSE 进度帧永不触发
-# （mcp_dispatch 已在上方导入，server 已将 mcp/ 插入 sys.path，身份一致）。
+# （mcp_dispatch 已在上方导入，server 已将 interfaces/mcp/ 插入 sys.path，身份一致）。
 # 缺失/加载失败时 webui 其余功能不受影响，SSE 流式请求退化为现有 JSON 响应。
 try:
     import pybao_tools
@@ -116,8 +117,8 @@ from services.auction_tasks import (  # noqa: E402
     auction_scheduler_loop,
 )
 
-# ---- 0.9.2 批次 6：HTTP 路由表外置（web/routes.py） ----
-from web.routes import (  # noqa: E402
+# ---- 0.9.2 批次 6：HTTP 路由表外置（interfaces/web/routes.py，0.9.8 收拢接口层） ----
+from interfaces.web.routes import (  # noqa: E402
     GET_ROUTES as _WEB_GET_ROUTES,
     POST_ROUTES as _WEB_POST_ROUTES,
 )
@@ -1752,8 +1753,8 @@ _MIME = {
 _CACHEABLE_EXT = {".js", ".css", ".svg", ".png", ".ico", ".woff", ".woff2", ".map"}
 
 
-# ---- 0.9.6：HTTP Handler 迁 web/handlers.py（app 完整后装配，环打破） ----
-from web.handlers import Handler  # noqa: E402 - 组合根装配
+# ---- 0.9.6：HTTP Handler 迁 interfaces/web/handlers.py（app 完整后装配，环打破） ----
+from interfaces.web.handlers import Handler  # noqa: E402 - 组合根装配
 
 def _wire_auction_tasks() -> None:
     """组合根装配（0.9.2 批次 4）：接口层/探针/日历能力绑定到服务层注入点。
@@ -1763,7 +1764,7 @@ def _wire_auction_tasks() -> None:
     """
     global _auction_query_snapshot
     try:
-        from mcp.stockdb_mcp_server import query_point_snapshot as _auction_query_snapshot
+        from interfaces.mcp.stockdb_mcp_server import query_point_snapshot as _auction_query_snapshot
     except Exception:  # noqa: BLE001 - MCP 缺失时打板用例整体降级
         _auction_query_snapshot = None
     _auction_tasks.query_snapshot = _auction_query_snapshot

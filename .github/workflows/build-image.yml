@@ -154,7 +154,7 @@ jobs:
 
       - name: Run MCP unit tests
         working-directory: stockdb-ai
-        run: python -m unittest mcp.test_stockdb_mcp_server -v
+        run: python -m unittest interfaces.mcp.test_stockdb_mcp_server -v
 
       - name: Run ops + auction unit tests
         working-directory: stockdb-ai

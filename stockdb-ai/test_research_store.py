@@ -173,7 +173,7 @@ class QueryMydbResearchRouteTest(unittest.TestCase):
 
     def test_query_metrics_by_key(self):
         self.store.write_metrics("20260814", {"metrics": {"n_samples": 47}})
-        from mcp import pybao_tools as pt
+        from interfaces.mcp import pybao_tools as pt
         out = pt.query_mydb({"table": "打板指标:20260814", "key": "metrics"})
         self.assertTrue(out["ok"])
         self.assertEqual(out["result"]["source"], "research")
@@ -181,7 +181,7 @@ class QueryMydbResearchRouteTest(unittest.TestCase):
 
     def test_query_snapshots_listing(self):
         self.store.write_snapshots("20260814", {"600004": {"open": 11.0}})
-        from mcp import pybao_tools as pt
+        from interfaces.mcp import pybao_tools as pt
         out = pt.query_mydb({"table": "竞价快照:20260814"})
         self.assertTrue(out["ok"])
         self.assertEqual(out["result"]["values"]["600004"]["open"], 11.0)
@@ -189,7 +189,7 @@ class QueryMydbResearchRouteTest(unittest.TestCase):
 
     def test_query_unknown_prefix_still_engine(self):
         """非研究表前缀仍走引擎路径（兼容）。"""
-        from mcp import pybao_tools as pt
+        from interfaces.mcp import pybao_tools as pt
         with mock.patch.object(pt, "get_mydb_rd", return_value=None):
             out = pt.query_mydb({"table": "hk日k:00700"})
         self.assertFalse(out["ok"])  # 引擎不可用 → pybao 降级错误（非 research 路由）

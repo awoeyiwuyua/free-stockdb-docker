@@ -1,13 +1,15 @@
-"""test_layer_boundaries — 四层架构依赖纪律物理检查（0.9.1 框架核心交付）。
+"""test_layer_boundaries — 四层架构依赖纪律物理检查（0.9.1 框架核心交付；0.9.8 接口层收拢）。
 
 用 ast 静态扫描各层包内 import，断言依赖方向（设计文档 docs/design/application-layer.md §3）：
   - core/（领域层）：只允许 config 与 stdlib —— 不依赖任何其他层
-  - services/：禁止依赖接口层（web/ mcp/）
-  - storage/：禁止依赖 services/ core/ mcp/
-  - ops/：禁止依赖 web/ services/ core/
+  - services/：禁止依赖接口层（interfaces/）
+  - storage/：禁止依赖 services/ core/ interfaces/
+  - ops/：禁止依赖 interfaces/ services/ core/
+  - interfaces/（接口层）：允许依赖一切下层（services/core/storage/ops/config）
   - config：所有层可用（纯 stdlib）
 
-违规即测试红——"墙"的物理保证，防止未来代码越界。
+0.9.8 严格分层：接口层统一收拢为 interfaces/（web/ HTTP + mcp/ MCP），
+依赖铁律按接口层整体检查。违规即测试红——"墙"的物理保证，防止未来代码越界。
 """
 import ast
 import pathlib
@@ -17,19 +19,19 @@ WEBUI = pathlib.Path(__file__).resolve().parent
 
 # 层 → 允许 import 的层（含 config；stdlib 天然允许）
 ALLOWED = {
-    "web": {"web", "services", "core", "storage", "ops", "config"},
+    "interfaces": {"interfaces", "services", "core", "storage", "ops", "config"},
     "services": {"services", "core", "storage", "ops", "config"},
     "core": {"core", "config"},  # 领域层最严：纯规则，零外部依赖
     "storage": {"storage", "ops", "config"},
     "ops": {"ops", "storage", "config"},
 }
-LAYER_PACKAGES = ("web", "services", "core", "storage", "ops")
-# 接口层 MCP 侧（0.9.2 前领域模块暂住 mcp/，本检查对 mcp/ 暂不设限，批次 5 归位后收紧）
+LAYER_PACKAGES = ("interfaces", "services", "core", "storage", "ops")
+# 0.9.8：接口层整体禁止被下层依赖（web/mcp 已收拢 interfaces/，无需再单列）
 FORBIDDEN = {
-    "services": {"web", "mcp", "storage.providers"},  # 0.9.5 M5：服务层只依赖注入的仓储接口
-    "storage": {"web", "services", "core", "mcp"},
-    "ops": {"web", "services", "core", "mcp"},
-    "core": {"web", "services", "storage", "ops", "mcp"},
+    "services": {"interfaces", "storage.providers"},  # 0.9.5 M5：服务层只依赖注入的仓储接口
+    "storage": {"interfaces", "services", "core"},
+    "ops": {"interfaces", "services", "core"},
+    "core": {"interfaces", "services", "storage", "ops"},
 }
 
 
@@ -93,8 +95,8 @@ class LayerBoundaryTest(unittest.TestCase):
         violations = check_package(pkg, layer)
         self.assertEqual(violations, [], "\n".join(violations))
 
-    def test_web_clean(self):
-        self._assert_layer_clean("web")
+    def test_interfaces_clean(self):
+        self._assert_layer_clean("interfaces")
 
     def test_services_clean(self):
         self._assert_layer_clean("services")
@@ -116,11 +118,12 @@ class LayerBoundaryTest(unittest.TestCase):
         self.assertIn("core/ 越界 import storage", v)
         self.assertNotIn("config", " ".join(v))  # config 允许
 
-    def test_services_cannot_import_web(self):
-        src = "from web import routes\nfrom mcp import stockdb_mcp_server\nimport ops"
+    def test_services_cannot_import_interfaces(self):
+        src = ("from interfaces.web import routes\n"
+               "from interfaces.mcp import stockdb_mcp_server\nimport ops")
         v = check_source(src, "services")
-        self.assertIn("services/ 越界 import web", v)
-        self.assertIn("services/ 越界 import mcp", v)
+        self.assertIn("services/ 越界 import interfaces.web", v)
+        self.assertIn("services/ 越界 import interfaces.mcp", v)
         self.assertNotIn("ops", " ".join(v))
 
     def test_storage_cannot_import_core(self):

@@ -8,7 +8,7 @@ import sys
 import unittest
 from unittest import mock
 
-from mcp import stockdb_mcp_server as server
+from interfaces.mcp import stockdb_mcp_server as server
 
 
 def _dispatch(method, params=None, group=None):

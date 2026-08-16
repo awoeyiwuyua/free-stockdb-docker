@@ -41,7 +41,7 @@
 
 1. 数据更新：上游 `数据更新.exe` 保持引擎数据最新（`000001` 最新交易日为探针）
 2. 代码改动：本仓库分支 → 单测（`stockdb-ai/` 下 `python -m unittest test_auction_collect
-   test_auction_metrics test_auction_list test_ops mcp.test_stockdb_mcp_server`，206 全绿）
+   test_auction_metrics test_auction_list test_ops interfaces.mcp.test_stockdb_mcp_server`，261 全绿）
 3. 回填/采集：`auction_run_backfill(days=60)`（app.py）直连引擎写 mydb
 4. 验收：异源签字口径见 `docs/design/auction-collector.md` 与 `docs/acceptance/`
 5. 发布：CHANGELOG → 分支 → PR → 合并 → tag `vX.Y.Z`；docker 镜像仅成熟后手动触发
