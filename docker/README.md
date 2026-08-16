@@ -4,14 +4,14 @@ free-stockdb 官方发行包是**静态链接的独立二进制**（服务端 `s
 本目录把它容器化到 Linux Docker（极空间 Q4），多架构镜像（amd64 + arm64）一次构建，
 NAS 拉取时自动匹配自身 CPU 架构。
 
-- 上游：https://github.com/hello245m/free-stockdb （MIT，fork 于 `awoeyiwuyua/free-stockdb-docker`）
+- 上游：https://github.com/hello245m/free-stockdb （MIT，原 fork 于 `awoeyiwuyua/free-stockdb-docker`，2026-08-16 更名 `stockdb-ai`）
 - 本仓库定位：**只做 docker 化封装，不改上游 C++ 源码**，Sync fork 与上游零冲突
 
 ## 版本约定（重要）
 
 - **镜像 tag = 上游 stockdb 发布包版本号**（当前 `0.3.1`）：workflow 手动触发时不填
   version 输入，就从 `docker/Dockerfile` 的 `ARG VERSION` 打 tag，如
-  `ghcr.io/awoeyiwuyua/free-stockdb:0.3.1` 与 `:latest`。
+  `ghcr.io/awoeyiwuyua/stockdb-ai:0.3.1` 与 `:latest`。
 - **webui 面板内部版本 = `WEBUI_VERSION`**（当前 0.5.1，见 `docker/webui/app.py`），
   仅用于面板显示，**不是镜像 tag**。二者是两个维度，不要混用。
 - 迭代节奏：上游发新版 → 升 `ARG VERSION`（镜像 tag 跟着变）；webui 面板改动 →
@@ -42,12 +42,12 @@ NAS 拉取时自动匹配自身 CPU 架构。
 **A. GitHub Actions（推荐，需一次性配置）**
 1. 生成 GitHub PAT（权限勾选 `write:packages`）→ 本 fork 仓库 `Settings → Secrets and variables → Actions` → 新增 Secret，名字 `GH_PAT`，粘贴 token
 2. 仓库 `Actions` 页 → 左侧 `Build & Push stockdb image` → `Run workflow`（手动触发）
-3. 等构建完成（约 5–10 分钟），镜像出现在 `ghcr.io/awoeyiwuyua/free-stockdb:0.3.1`
+3. 等构建完成（约 5–10 分钟），镜像出现在 `ghcr.io/awoeyiwuyua/stockdb-ai:0.3.1`
 
 **B. 本机/极空间构建（备选）**
 ```bash
 # Mac（已装 Docker Desktop）或极空间 Docker 内，在 docker/ 目录：
-docker build -t ghcr.io/awoeyiwuyua/free-stockdb:0.3.1 .
+docker build -t ghcr.io/awoeyiwuyua/stockdb-ai:0.3.1 .
 # 极空间导入镜像：docker save ... | 极空间导入 tar
 ```
 
@@ -60,7 +60,7 @@ docker build -t ghcr.io/awoeyiwuyua/free-stockdb:0.3.1 .
    ```bash
    # 首次：先同步再启动（服务未起，天然满足「同步须停服务」）
    docker run --rm -v "$PWD/data:/data" -v "$PWD/mydb:/mydb" \
-     ghcr.io/awoeyiwuyua/free-stockdb:0.3.1 /bin/sh -c \
+     ghcr.io/awoeyiwuyua/stockdb-ai:0.3.1 /bin/sh -c \
      "cd /data && /opt/stockdb/数据更新"
    ```
    （或直接跳过：启动后用网页一键热更新同步）
@@ -216,7 +216,7 @@ webui 容器已内嵌 `/mcp` 路由（无需单独 mcp 容器），走 8081：
 # 停 stockdb 进程 → 增量同步（断点续传，可反复运行直到无新文件）→ 重启进程
 docker compose stop stockdb
 docker run --rm -v "$PWD/data:/data" -v "$PWD/mydb:/mydb" \
-  ghcr.io/awoeyiwuyua/free-stockdb:0.3.1 /bin/sh -c "cd /data && /opt/stockdb/数据更新"
+  ghcr.io/awoeyiwuyua/stockdb-ai:0.3.1 /bin/sh -c "cd /data && /opt/stockdb/数据更新"
 docker compose start stockdb
 ```
 > 同步源在 `/data/sync_url.txt`（一行一个镜像根目录；`always` 后缀 = 每次都强制校验该源）。

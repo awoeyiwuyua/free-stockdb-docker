@@ -1,5 +1,5 @@
 [project]
-name = "free-stockdb-docker"
+name = "stockdb-ai"
 version = "0.3.1"
 description = "free-stockdb 本地量化数据引擎的 Docker 部署 + webui 运维控制台"
 requires-python = ">=3.14"
