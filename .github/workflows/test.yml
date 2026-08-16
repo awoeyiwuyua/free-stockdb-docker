@@ -29,7 +29,31 @@ jobs:
 
       - name: Run ops unit tests
         working-directory: docker/webui
-        run: python -m unittest test_ops -v
+        run: |
+          python -m unittest test_ops -v > /tmp/ops.log 2>&1 || true
+          if grep -qE '^(FAIL|ERROR):' /tmp/ops.log; then
+            python - <<'PYEOF'
+import json, os, urllib.request
+with open("/tmp/ops.log", encoding="utf-8", errors="replace") as f:
+    log = f.read()
+tail = "\n".join(log.splitlines()[-120:])
+body = "**test_ops CI 失败详情（诊断）**\n```\n" + tail[:6000] + "\n```"
+data = json.dumps({"body": body}).encode()
+pr = os.environ.get("GITHUB_REF", "").replace("refs/pull/", "").split("/")[0]
+if pr:
+    url = f"https://api.github.com/repos/{os.environ['GITHUB_REPOSITORY']}/issues/{pr}/comments"
+    req = urllib.request.Request(url, data=data, method="POST", headers={
+        "Authorization": f"Bearer {os.environ['GITHUB_TOKEN']}",
+        "Accept": "application/vnd.github+json", "User-Agent": "ci-diagnose",
+        "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            print("comment posted:", r.status)
+    except Exception as e:
+        print("comment failed:", e)
+PYEOF
+            exit 1
+          fi
 
       - name: Run auction collector tests
         working-directory: docker/webui
