@@ -4,6 +4,36 @@
 发布纪律见 `docs/webui-spa/release-policy.md`；部署记录见 `docs/DEPLOYMENTS.md`；
 本机目录关系与运行配方见 `docs/DEVELOPMENT-GUIDE.md`。
 
+## [0.9.0] — 2026-08-16（功能里程碑：SDK 41 工具整合 MCP + 打板链路语义修正）
+
+**M4：上游 stock_sdk 41 工具全量整合进本仓库 MCP**（用户拍板核心需求，设计见
+`docs/design/sdk-mcp-bridge.md`）：
+- 策略（用户拍板"不造轮子"）：拷贝上游 `stockdb_full_mcp.py` 进 `docker/webui/mcp/`
+  （MIT，文件头注明来源与版本），复用其 `stockdb_*` 函数；新增 `sdk_bridge.py`
+  契约外壳（纯标准库）：参数 schema 自动生成（inspect.signature + docstring）、
+  df/panel 强制 JSON 形态、三级结果解析（json → literal_eval → 原文）、大结果
+  截断 + truncated、8 错误码映射、无 pybao 时 DEPENDENCY_UNAVAILABLE 降级
+- 工具清单：行情/竞价（get_bars/get_price/get_ticks/get_call_auction 等 10 个）、
+  融资融券/龙虎榜/板块（5 个）、基本面/估值/解禁（11 个）、因子/alpha/MACD/指标
+  （9 个）、期货/指数（4 个）、财务/债券/期权表查询（run_query 白名单安全边界，
+  2 个）——MCP 注册数 12 → **53**
+- 契约：SDK 工具族信封 source="sdk" / contract="sdk-bridge-v1"；known_at 兼容
+  ISO/8 位日期；`_CONTRACT_BY_TOOL` 自动注册
+- 验收：**本机引擎 41/41 全量冒烟通过**（安全参数表，含 get_call_auction 返回
+  [{code,time}] 形态确认——引擎内置历史竞价 = 打板链路潜在第三异源，三方对账
+  待 08-17 采集首跑后执行）；单测 +16（降级/schema/调用封装/错误映射/信封/
+  集成）；Python 224 全绿
+
+**M1：打板链路语义修正（边界 c）+ 采集/收口就绪**
+- missing_open_count 计数语义落地：板日涨停但指标日无 (open, prev_close) 有效对
+  的股票计入计数（0.9.0 前静默丢弃）；守恒检查 `候选 = n_samples + missing_open_count`
+  （回填 + 收口两路径）；不影响指标值；单测 +2（回填/收口守恒）
+- 08-17 周一起 09:26 采集 / 16:30 收口将在本机原生模式真实首跑（含对账偏差监测）；
+  回填数据基线已在本机引擎重跑核对（08-14 = 47 / 0.012113 / 0.4894、序列 60/60）
+
+**其他**：修复 PR #81 head 误用导致空 diff 的失误（重新以正确 head 合并 PR #82）；
+上游文件维护约定：升级后重拷 stockdb_full_mcp.py + 冒烟回归（设计文档 §8）
+
 ## [0.8.18] — 2026-08-16（仓库治理：只留研究成果 + 原生模式为主线 + docker 降级可选）
 - 方向（用户拍板）：① 明确两个目录关系；② 精简仓库只保留研究成果；③ docker 镜像非主线
 - 新增 `docs/DEVELOPMENT-GUIDE.md`：本机两个目录（原生引擎运行时 vs 研究成果仓库）职责
