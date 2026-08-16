@@ -37,11 +37,11 @@ def _now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
-# 惰性 import：任务A/B/C（auction_collect/auction_list/auction_metrics）与 MCP 快照
+# 惰性 import：任务A/B/C（quote_sources/auction_list/auction_metrics）与 MCP 快照
 # 任一缺失 → AUCTION_MODULES_AVAILABLE=False，采集/收口返回 {ok:False}（不拖垮 webui）。
-# 0.9.8 严格分层：auction_list/auction_metrics 领域真身在 core/（根目录 shim 已删）。
+# D11（0.9.9）：采集执行在数据层 storage/providers/quote_sources（编排在本层，执行归数据层）。
 try:
-    from auction_collect import fetch_quotes as _auction_fetch_quotes  # 数据层执行（D11 待迁 quote_sources）
+    from storage.providers.quote_sources import fetch_quotes as _auction_fetch_quotes
     from core.auction_list import compute_limitup_list as _auction_compute_limitup_list
     from core.auction_metrics import (
         METRICS as AUCTION_METRICS,
