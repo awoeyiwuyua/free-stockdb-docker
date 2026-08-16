@@ -923,6 +923,38 @@ class _DiagTests(_OpsTestCase):
         self.assertIsInstance(py["ok"], bool)
 
 
+class _SyncFailureTests(_OpsTestCase):
+    """0.8.17：同步器认证/连接失败识别（退出码 0 但失败 → 不再掩盖成 None>0 崩溃）。"""
+
+    def test_auth_failed_recognized(self):
+        """auth failed 输出 → 明确失败原因。"""
+        out = ("[log] 正在验证设备状态...\n"
+               "[log] 状态:连接失败\n"
+               "[log] error: auth failed, 状态:连接失败\n"
+               "client finished.\n")
+        self.assertIn("认证失败", app._sync_failure_reason(out))
+
+    def test_connect_failed_recognized(self):
+        self.assertIn("连接失败", app._sync_failure_reason("[log] 状态:连接失败"))
+
+    def test_normal_sync_no_failure(self):
+        """正常同步输出（下载进度等）→ None。"""
+        out = "[progress] 83.4% 233.68/280.20 MB ... [file] 16/16 ok"
+        self.assertIsNone(app._sync_failure_reason(out))
+        self.assertIsNone(app._sync_failure_reason(""))
+
+    def test_downloads_none_comparison_safe(self):
+        """downloads=None（未打印数量）不再参与 > 比较（0.8.16 事故回归）。"""
+        counts = {"downloads": None, "deletes": None}
+        dl = counts.get("downloads")
+        # 旧写法崩溃点：counts.get("downloads", 0) > 0
+        self.assertRaises(TypeError, lambda: counts.get("downloads", 0) > 0)
+        # 新写法安全：None 走"保守重启"分支
+        self.assertTrue(dl is None or dl > 0)
+        # _sync_effective 对 None downloads 安全（短路）
+        self.assertTrue(app._sync_effective("20260813", "20260814", counts))
+
+
 class _DataLatestDateTests(_OpsTestCase):
     """Phase 5.1 稳定性：data_latest_date 失败缓存 + 并发单飞（防多标签切换打瘫后端）。"""
 

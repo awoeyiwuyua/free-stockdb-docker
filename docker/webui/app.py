@@ -79,7 +79,7 @@ _last_verify_result: str | None = None  # 最近一次完整性验证结果（pa
 _scheduler_alive = False             # 定时线程心跳（每次循环更新时间戳）
 _scheduler_heartbeat = 0.0           # 定时线程最近一次心跳时间戳（unix）
 _webui_started = time.time()         # webui 进程启动时间戳
-WEBUI_VERSION = "0.8.16"
+WEBUI_VERSION = "0.8.17"
 
 HISTORY_FILE = DATA_DIR / "sync_history.json"
 SCHEDULE_FILE = DATA_DIR / "sync_schedule.json"
@@ -384,6 +384,22 @@ def parse_sync_counts(stdout: str) -> dict:
             except Exception:
                 pass
     return {"downloads": d, "deletes": r}
+
+
+def _sync_failure_reason(stdout: str) -> str | None:
+    """从同步器输出识别数据源失败（0.8.17）。
+
+    同步器（数据更新）对认证/连接失败也返回退出码 0——若不识别，会把
+    "auth failed" 当成成功进入验证，并因未打印下载数量触发 None>0 崩溃
+    （2026-08-16 事故：认证失败被掩盖成"同步异常：'>' not supported..."）。
+    返回失败原因文本；无失败迹象 → None。
+    """
+    text = stdout or ""
+    if "auth failed" in text:
+        return "认证失败（auth failed），请检查数据源授权"
+    if "状态:连接失败" in text or "连接失败" in text:
+        return "数据源连接失败，请检查网络/数据源可用性"
+    return None
 
 
 def _sync_effective(before_date, after_date, counts) -> bool:
@@ -1238,13 +1254,29 @@ def run_sync(hot: bool = True, trigger: str = "manual", retry: bool = False) -> 
         if hot:
             if proc.returncode == 0:
                 _sync_state["phase"] = "verifying"
-                log("→ 热更新完成，验证数据完整性 ...")
+                # 0.8.17：同步器对认证/连接失败也返回 0——先识别失败输出，
+                # 避免把"auth failed"当成成功进入验证（并触发 None>0 崩溃）
+                failure = _sync_failure_reason(_last_sync_stdout)
+                if failure:
+                    _sync_state["fail_reason"] = f"数据源失败：{failure}"
+                    _last_verify_result = "skipped"
+                    log(f"  ⚠️ 数据源失败（{failure}），跳过完整性验证")
+                    log("  → 同步未执行，数据保持原状（恢复认证后重试）")
+                else:
+                    log("→ 热更新完成，验证数据完整性 ...")
                 # 上游新架构（多点数据源）下增量下载进 data1/LevelDB，
                 # 运行中的 stockdb 进程仍持旧快照。优先用上游 reload 命令热重载
                 # （零中断）；reload 不可用（老版本/连接失败）则降级重启。
                 # 无新文件（downloads=0）时数据未变，跳过加载。
                 counts = parse_sync_counts(_last_sync_stdout)
-                if counts.get("downloads", 0) > 0 or counts.get("downloads") is None:
+                downloads = counts.get("downloads")
+                # 0.8.17 修复：downloads=None（同步器未打印数量）时禁止比较——
+                # 旧写法 counts.get("downloads", 0) > 0 在 key 存在值为 None 时
+                # 抛 "'>' not supported between instances of 'NoneType' and 'int'"
+                # （2026-08-16 auth failed 事故：认证失败被掩盖成同步异常）
+                if failure:
+                    pass  # 数据源失败：不重启不验证（fail_reason 已置，_last_verify_result=skipped）
+                elif downloads is None or downloads > 0:
                     _sync_state["phase"] = "restarting"
                     reloaded = reload_stockdb()
                     if reloaded:
@@ -1260,19 +1292,22 @@ def run_sync(hot: bool = True, trigger: str = "manual", retry: bool = False) -> 
                         except Exception as exc:
                             log(f"  ❌ 重启失败：{exc}")
                         _sync_state["phase"] = "verifying"
-                problems = _verify_data(before_date)
-                if problems:
-                    _last_verify_result = "fail"
-                    _sync_state["fail_reason"] = "数据完整性验证未通过"
-                    log(f"  ⚠️ 完整性验证未通过：{problems}")
-                    log("  → 数据异常，自动重启 stockdb 止损 ...")
-                    try:
-                        container_restart()
-                        log("  ✅ stockdb 已重启")
-                    except Exception as exc:
-                        log(f"  ❌ 重启失败：{exc}")
+                if failure:
+                    pass  # 数据源失败：跳过完整性验证
                 else:
-                    _last_verify_result = "pass"
+                    problems = _verify_data(before_date)
+                    if problems:
+                        _last_verify_result = "fail"
+                        _sync_state["fail_reason"] = "数据完整性验证未通过"
+                        log(f"  ⚠️ 完整性验证未通过：{problems}")
+                        log("  → 数据异常，自动重启 stockdb 止损 ...")
+                        try:
+                            container_restart()
+                            log("  ✅ stockdb 已重启")
+                        except Exception as exc:
+                            log(f"  ❌ 重启失败：{exc}")
+                    else:
+                        _last_verify_result = "pass"
                     log("  ✅ 数据完整性验证通过（股票代码 + 抽样日K/复权/分钟K）")
             else:
                 _last_verify_result = "skipped"
