@@ -4,6 +4,25 @@
 镜像 tag 跟随上游引擎版本。发布纪律见 `docs/webui-spa/release-policy.md`；
 部署记录见 `docs/DEPLOYMENTS.md`；本机目录关系与运行配方见 `docs/DEVELOPMENT-GUIDE.md`。
 
+## [0.9.3] — 2026-08-16（MCP 工具分组 Gateway + Trace ID 可观测性）
+
+用户优化拍板（四维度评估：1a/4a 做，2a-2b/3a-3b/4b 记候选，Redis/队列不做）：
+
+**1a MCP 工具分组（Gateway Pattern）**——解决 53 工具占满 LLM 上下文（约 5 万 tokens）：
+- 全部工具带 `group` 元数据，6 组：market_data(20) / fundamental(11) / factor_analysis(10) /
+  market_structure(7) / system_health(3) / research(2)（组名与描述见 TOOL_GROUPS）
+- `/mcp?group=<组名>` 接入 = 只注册该组工具（tools/list 过滤）；不传 = 全量（向后兼容）
+- dispatch/_handle_request 支持 group 参数（stdio 无分组）；sdk_bridge.SDK_TOOL_GROUPS
+  维护 41 个 SDK 工具分组；HTTP 端点解析 query 传参
+
+**4a Trace ID**——异常可按键诊断：
+- tools/call 每次生成 trace_id（uuid4 前 12 位），贯穿 JSON-RPC result（顶层附加键，
+  信封 8 键不动——对外契约未破坏）、工具调用日志（jsonl 加 trace_id 字段）
+- 日检记录（storage/records）自动附加 trace_id——AI 可凭响应中的 trace_id 在
+  /api/auction/daily 定位同一次执行上下文
+
+验证：246 全绿（237 + 9 分组/Trace）；本机引擎冒烟（53 工具 6 组 + 分组过滤 + trace_id）
+
 ## [0.9.2] — 2026-08-16（四层搬迁完成 + 可观测性三件套之打板日检）
 
 按 docs/design/application-layer.md 完成 7 批次增量搬迁（每批独立 commit、测试全绿、

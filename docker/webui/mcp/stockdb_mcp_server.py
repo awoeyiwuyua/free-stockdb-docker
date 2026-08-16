@@ -2062,6 +2062,30 @@ _sdk_tool_specs_ext = _sdk_tool_specs()  # 41 个上游工具规格（无上游 
 if _sdk_tool_specs_ext:
     TOOLS = TOOLS + _sdk_tool_specs_ext
 
+# === 0.9.3：MCP 工具分组（Gateway）——按业务域分组注册，缓解 LLM 上下文占用 ===
+# 每个工具带 group 元数据；客户端以 /mcp?group=<组名> 接入即只注册该组工具。
+# 不传 group = 全量注册（向后兼容）。
+BASE_TOOL_GROUPS: dict[str, str] = {
+    "get_kline": "market_data", "get_stock_list": "market_data",
+    "get_adjust_factors": "market_data", "get_market_snapshot": "market_data",
+    "get_point_snapshot": "market_data", "get_trading_days": "market_data",
+    "get_board_open_effect_history": "research", "get_mydb_data": "research",
+    "get_indicators": "factor_analysis", "get_board_members": "factor_analysis",
+    "screen_stocks": "factor_analysis", "get_data_status": "system_health",
+}
+
+TOOL_GROUPS: dict[str, str] = {
+    "market_data": "行情数据：K线/竞价/tick/资金流/日历",
+    "fundamental": "基本面：财务/估值/解禁/龙虎榜",
+    "factor_analysis": "因子与指标：alpha/因子看板/技术指标/选股",
+    "market_structure": "市场结构：板块/指数/期货",
+    "research": "研究成果：mydb 私有存储/打板情绪指标",
+    "system_health": "系统：数据状态/表查询",
+}
+
+for _tool_spec in TOOLS:
+    _tool_spec.setdefault("group", BASE_TOOL_GROUPS.get(_tool_spec["name"], "system_health"))
+
 
 # === 统一错误码：isError content = {"error": str, "code": str}(, "hint") ===
 
@@ -2387,10 +2411,12 @@ def _call_tool(name: str, args: dict) -> dict:
     }
 
 
-def _log_tool_call(tool: str, result: dict, elapsed_ms: int) -> None:
+def _log_tool_call(tool: str, result: dict, elapsed_ms: int,
+                   trace_id: str | None = None) -> None:
     """tools/call 调用日志（stderr 一行 JSON，flush）：事件/工具/成败/耗时/返回字节数。
 
     仅用于可观测性，不改变任何返回行为；ok = 无 isError。bytes = 序列化 result 的字节数。
+    trace_id（0.9.3）：请求级追踪，与响应/日检记录关联。
     """
     is_error = bool(result.get("isError"))
     log_line = json.dumps({
@@ -2400,6 +2426,7 @@ def _log_tool_call(tool: str, result: dict, elapsed_ms: int) -> None:
         "is_error": is_error,
         "elapsed_ms": int(elapsed_ms),
         "bytes": len(json.dumps(result, default=str)),
+        "trace_id": trace_id,
     }, ensure_ascii=False, default=str)
     sys.stderr.write(log_line + "\n")
     sys.stderr.flush()
@@ -2413,8 +2440,25 @@ def _write_message(msg: dict) -> None:
     sys.stdout.flush()
 
 
-def _handle_request(msg: dict) -> dict:
-    """核心分发：把一条带 id 的 JSON-RPC 请求映射为响应 dict（id/result 或 id/error）。"""
+def _new_trace_id() -> str:
+    """请求级 Trace ID（0.9.3）：uuid4 前 12 位，贯穿日志/响应/日检诊断。"""
+    import uuid
+    return uuid.uuid4().hex[:12]
+
+
+def _tools_for_group(group: str | None) -> list[dict]:
+    """按工具分组过滤 TOOLS（0.9.3 Gateway）；group 为 None → 全量（向后兼容）。"""
+    if not group:
+        return TOOLS
+    return [t for t in TOOLS if t.get("group") == group]
+
+
+def _handle_request(msg: dict, group: str | None = None) -> dict:
+    """核心分发：把一条带 id 的 JSON-RPC 请求映射为响应 dict（id/result 或 id/error）。
+
+    group（0.9.3）：tools/list 按业务域过滤（/mcp?group= 接入）；None = 全量。
+    trace_id（0.9.3）：tools/call 生成并贯穿 result/日志，供日检按 ID 诊断。
+    """
     method = msg.get("method")
     request_id = msg.get("id")
     params = msg.get("params") or {}
@@ -2433,7 +2477,8 @@ def _handle_request(msg: dict) -> dict:
     elif method == "ping":
         return {"jsonrpc": "2.0", "id": request_id, "result": {}}
     elif method == "tools/list":
-        return {"jsonrpc": "2.0", "id": request_id, "result": {"tools": TOOLS}}
+        return {"jsonrpc": "2.0", "id": request_id,
+                "result": {"tools": _tools_for_group(group)}}
     elif method == "prompts/list":
         return {"jsonrpc": "2.0", "id": request_id, "result": {"prompts": PROMPTS}}
     elif method == "prompts/get":
@@ -2462,12 +2507,15 @@ def _handle_request(msg: dict) -> dict:
                 "jsonrpc": "2.0", "id": request_id,
                 "error": {"code": -32602, "message": "Invalid params: arguments must be an object"},
             }
+        trace_id = _new_trace_id()  # 0.9.3：请求级 Trace ID
         started = time.monotonic()
         try:
             result = _call_tool(str(tool_name), arguments)
         except Exception as exc:  # noqa: BLE001 - 工具异常转为 MCP 错误响应
             result = _error_result(str(exc), ERROR_INTERNAL_ERROR)
-        _log_tool_call(str(tool_name), result, int((time.monotonic() - started) * 1000))
+        result.setdefault("trace_id", trace_id)  # JSON-RPC result 顶层附加键（不破坏信封）
+        _log_tool_call(str(tool_name), result, int((time.monotonic() - started) * 1000),
+                       trace_id=trace_id)
         return {"jsonrpc": "2.0", "id": request_id, "result": result}
     else:
         # Speculative/unknown request methods get a JSON-RPC method-not-found error.
@@ -2477,10 +2525,11 @@ def _handle_request(msg: dict) -> dict:
         }
 
 
-def dispatch(msg: dict) -> dict | None:
+def dispatch(msg: dict, group: str | None = None) -> dict | None:
     """JSON-RPC 分发纯函数：通知（无 id 或已知通知方法）返回 None，否则返回响应 dict。
 
     stdio 与 HTTP 共用：请求返回 dict 写回；notification 返回 None 不回写。
+    group（0.9.3）：tools/list 业务域过滤（HTTP 端 /mcp?group= 传入；stdio 无分组）。
     """
     if not isinstance(msg, dict):
         return None
@@ -2490,7 +2539,7 @@ def dispatch(msg: dict) -> dict | None:
     if "id" not in msg:
         # 无 id 的未知消息按 JSON-RPC 通知处理（不期待响应）
         return None
-    return _handle_request(msg)
+    return _handle_request(msg, group)
 
 
 def run_stdio() -> None:

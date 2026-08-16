@@ -1929,7 +1929,10 @@ class Handler(BaseHTTPRequestHandler):
         Accept 含 text/event-stream 时切换 SSE 流式响应（向后兼容：非流式客户端
         行为完全不变）：先发进度通知帧（pybao_tools 线程级 hook），再发结果帧；
         通知（无 id）不写结束帧直接返回。
+        0.9.3：?group=<组名> 限定 tools/list 返回该业务域工具集（MCP Gateway）；
+        不传 = 全量（向后兼容）。
         """
+        group = (parse_qs(urlparse(self.path).query).get("group") or [None])[0]
         accept = self.headers.get("Accept", "")
         if "text/event-stream" not in accept or pybao_tools is None:
             # ===== 非流式（或 pybao_tools 缺失的流式退化）：现有 JSON 返回路径，行为不变 =====
@@ -1960,7 +1963,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             start = time.time()
             try:
-                response = mcp_dispatch(msg)
+                response = mcp_dispatch(msg, group=group)
             except Exception as exc:  # noqa: BLE001 - 分发异常转为 JSON-RPC internal error
                 body = json.dumps({
                     "jsonrpc": "2.0", "id": msg.get("id"),
@@ -2050,7 +2053,7 @@ class Handler(BaseHTTPRequestHandler):
             )
             start = time.time()
             try:
-                response = mcp_dispatch(msg)
+                response = mcp_dispatch(msg, group=group)
             except Exception as exc:  # noqa: BLE001 - 分发异常转为 JSON-RPC internal error
                 err = {
                     "jsonrpc": "2.0", "id": msg.get("id"),

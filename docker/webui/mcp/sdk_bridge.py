@@ -23,6 +23,38 @@ _IMPORT_ERROR: str | None = None
 
 RESULT_CAP = 2000  # 列表结果硬上限（行），超出截断 + truncated 标记
 
+# 工具分组（0.9.3：MCP Gateway——按业务域分组注册，缓解 53 工具占满 LLM 上下文）。
+# 组名与 stockdb_mcp_server._BASE_TOOL_GROUPS 共用同一枚举。
+SDK_TOOL_GROUPS: dict[str, str] = {
+    # 行情数据（K线/竞价/tick/资金流/日历）
+    "get_bars": "market_data", "get_price": "market_data", "get_ticks": "market_data",
+    "get_last_tick": "market_data", "get_call_auction": "market_data",
+    "get_data": "market_data", "get_all_securities": "market_data",
+    "get_security_info": "market_data", "get_trade_days": "market_data",
+    "get_money_flow": "market_data", "get_mtss": "market_data", "get_extras": "market_data",
+    "get_marginsec_stocks": "market_data", "get_margincash_stocks": "market_data",
+    # 基本面（财务/估值/解禁/龙虎榜）
+    "get_fundamentals": "fundamental", "get_fundamentals_valuation_legacy": "fundamental",
+    "get_fundamentals_income_legacy": "fundamental", "get_fundamentals_generic_legacy": "fundamental",
+    "get_fundamentals_cash_flow_legacy": "fundamental",
+    "get_fundamentals_indicator_legacy": "fundamental",
+    "get_fundamentals_continuously": "fundamental", "get_history_fundamentals": "fundamental",
+    "get_valuation": "fundamental", "get_locked_shares": "fundamental",
+    "get_billboard_list": "fundamental",
+    # 因子/指标（alpha/因子看板/技术指标）
+    "get_factor_values": "factor_analysis", "get_factor_values_legacy": "factor_analysis",
+    "get_factor_kanban_values": "factor_analysis", "get_all_alpha_101": "factor_analysis",
+    "get_all_alpha_191": "factor_analysis", "alpha": "factor_analysis",
+    "MACD": "factor_analysis",
+    # 市场结构（板块/指数/期货）
+    "bk_get": "market_structure", "get_industry": "market_structure",
+    "get_index_stocks": "market_structure", "get_index_weights": "market_structure",
+    "get_index_style_exposure": "market_structure",
+    "get_future_contracts": "market_structure", "get_dominant_future": "market_structure",
+    # 系统（表查询）
+    "list_query_tables": "system_health", "run_query": "system_health",
+}
+
 # 上游 41 个 SDK 工具的静态全名清单（与 stockdb_full_mcp.py 的 @mcp.tool() 一一对应）。
 # 即使上游模块未加载（无 pybao / 缺文件）也保持已知，用于 DEPENDENCY_UNAVAILABLE 降级。
 KNOWN_SDK_TOOL_NAMES: frozenset[str] = frozenset({
@@ -229,6 +261,7 @@ def tool_specs() -> list[dict]:
             "name": tool_name,
             "description": _tool_description(fn),
             "inputSchema": _build_schema(fn),
+            "group": SDK_TOOL_GROUPS.get(tool_name, "market_data"),  # 0.9.3 分组
         })
     return specs
 

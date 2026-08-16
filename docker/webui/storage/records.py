@@ -20,8 +20,14 @@ def _path() -> Path:
 
 
 def append(record: dict) -> None:
-    """追加一条日检记录（jsonl）；目录缺失自动创建；失败静默（不阻塞业务）。"""
+    """追加一条日检记录（jsonl）；目录缺失自动创建；失败静默（不阻塞业务）。
+
+    0.9.3：自动附加 trace_id（uuid4 前 12 位）——AI 客户端可凭响应/日志中的
+    trace_id 在日检记录中定位同一次执行。
+    """
     try:
+        import uuid
+        record.setdefault("trace_id", uuid.uuid4().hex[:12])
         p = _path()
         p.parent.mkdir(parents=True, exist_ok=True)
         with p.open("a", encoding="utf-8") as fh:
