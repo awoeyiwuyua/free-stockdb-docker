@@ -1,34 +1,46 @@
-# free-stockdb-docker
+# stockdb-private（free-stockdb 研究成果仓库）
 
-[free-stockdb](https://github.com/hello245m/free-stockdb) 的 Docker 容器化封装。
+fork 自 [hello245m/free-stockdb](https://github.com/hello245m/free-stockdb) 的
+**私有研究成果仓库**（原名 free-stockdb-docker）。开发主线 = **本机 Windows 原生引擎模式**，
+docker 镜像封装为可选发布物（版本成熟后才构建）。
 
-**定位（2026-08 定稿）**：本地量化数据基座。核心产品是 **HTTP + MCP 数据接口**（只读、
-可信契约、可审计），研究/回测/画图在用户本地 Mac 进行；webui 面板是辅助驾驶舱（冻结）。
-定位与路线图见 [`docs/ROADMAP.md`](docs/ROADMAP.md)。
+## 定位（2026-08 定稿）
 
-## 架构（单镜像，一容器两端口）
+本地量化数据基座。核心产品 = **HTTP + MCP 数据接口**（只读、可信契约、可审计）
++ **打板情绪指标**（涨停池 → 开盘溢价 → 60 日分位 → 强弱标签，异源验收签字）。
+webui 运维面板为辅助驾驶舱。定位与路线图见 [`docs/ROADMAP.md`](docs/ROADMAP.md)。
 
-- `stockdb` 服务端（7899 行情 HTTP API）+ `数据更新` 同步器 + pybao + webui 运维面板（8080）
-- **MCP 数据接口**（webui `/mcp` 路由，12 个只读工具：行情/复权/快照/指标/板块/选股/私有库/交易日历/状态/时点快照，统一契约信封 + 8 错误码）
-- 进程级控制（pidfile + SIGTERM），**不挂载 docker.sock**；webui 崩溃自动重启不影响数据服务
-- 镜像 `ghcr.io/awoeyiwuyua/free-stockdb:latest`
+## 目录关系（本机）
 
-## webui 运维面板（`http://<NAS_IP>:8081`）
+| 目录 | 角色 |
+|---|---|
+| `C:\Users\75393\Desktop\stockdb` | 上游原生引擎运行时（`stockdb.exe` + LevelDB 行情 + pybao 扩展），**只读数据源**，不 git 化 |
+| 本仓库 | 全部研究成果代码与文档，唯一版本化对象（分支 + PR） |
 
-- 前端为 **Vue 3 SPA**（0.6.1 起：LuCI 风格菜单树——总览驾驶舱 / 系统运维 7 子页（数据同步、私有存储、系统健康、诊断中心、日志中心、通知中心、MCP 观测），每页一职责；源码 `docker/webui/spa/`，构建产物随镜像分发，Node 仅构建期存在）
-- 旧面板完整保留在 `/legacy`（逃生通道）；环境变量 `WEBUI_UI=legacy` 可把根路径整体切回旧面板，`spa`（默认）为新面板
-- 数据同步：网页一键「立即热更新」（reload 零中断）/「停服同步」（故障兜底）+ 定时计划 + 趋势图
-- 系统健康：数据最新日期 / stockdb 进程 / 存储 / 容器日志与重启；诊断中心一键体检（上游 GitHub/stockdb 服务/pybao/磁盘/交易日历）
-- mydb 私有存储：港股日K 拉取（东财/腾讯）、AI 写入接口
-- 查询台：直查任意表；`/mcp` 路由 = AI 取数入口（12 个只读工具：行情/复权/快照/指标/板块/选股/私有库/交易日历/状态/时点快照）
+数据流：`私有代码 → pybao 扩展 → 引擎 127.0.0.1:7899 → LevelDB（data/ 行情 + mydb/ 私有存储）`。
+两个目录互不写文件。详见 [`docs/DEVELOPMENT-GUIDE.md`](docs/DEVELOPMENT-GUIDE.md)（运行配方 + 排查手册）。
+
+## 仓库结构（0.8.18 精简后：只保留研究成果）
+
+- `docker/webui/` — webui 运维面板（`app.py`）+ 打板模块（`auction_collect/metrics/list`）+ MCP 服务（`mcp/`）+ 单测
+- `docker/` — 可选 docker 封装（`Dockerfile`/`docker-compose.yml`/`entrypoint.sh`，构建从官方 release 下载引擎，不依赖仓库内上游源码）
+- `docs/` — 设计文档（`design/auction-collector.md` 终定口径）、验收记录（`acceptance/`、`DEPLOYMENTS.md`）、发布纪律、SPA 指南
+- `.github/workflows/` — `test.yml`（PR 门禁）+ `build-image.yml`（镜像构建，仅手动、成熟后启用）
+- `CHANGELOG.md` — 版本记录（版本号 = `docker/webui/app.py` 的 `WEBUI_VERSION`）
+
+上游内容（`cpp/` 引擎源码、`pybao/` 扩展拷贝、`调用方式/` 文档、演示文件等）已从仓库移除，
+需要时直接看原生目录或上游仓库。
 
 ## 版本
 
-- 镜像 tag = 上游发布包版本（`docker/Dockerfile` 的 `ARG VERSION`），面板版本 = `WEBUI_VERSION`（`docker/webui/app.py`），compose 用 `:latest`
+- 面板版本 = `WEBUI_VERSION`（`docker/webui/app.py`），发布流程见
+  [`docs/webui-spa/release-policy.md`](docs/webui-spa/release-policy.md)
+- 镜像 tag = 上游发布包版本（`docker/Dockerfile` 的 `ARG VERSION`）；镜像 `ghcr.io/awoeyiwuyua/free-stockdb` **仅成熟版本发布**
 
 ## 文档
 
-- 部署 / 日常更新 / 升级 / 回滚：[`docker/README.md`](docker/README.md)
-- 前端重构方案（Phase 5 架构与实施路径）：[`docs/phase5-spa-plan.md`](docs/phase5-spa-plan.md)
-- SPA 开发与学习导读（M0 起逐里程碑更新）：[`docs/webui-spa/guide-m0.md`](docs/webui-spa/guide-m0.md)
-- 上游引擎能力（本地量化引擎 / 39 指标 / 五种调用方式）：[hello245m/free-stockdb](https://github.com/hello245m/free-stockdb)
+- 开发指南（目录关系 / 运行配方 / 排查手册）：[`docs/DEVELOPMENT-GUIDE.md`](docs/DEVELOPMENT-GUIDE.md)
+- 打板采集设计（含涨停判定终定口径）：[`docs/design/auction-collector.md`](docs/design/auction-collector.md)
+- 部署台账：[`docs/DEPLOYMENTS.md`](docs/DEPLOYMENTS.md)
+- docker 部署细节：[`docker/README.md`](docker/README.md)
+- 上游引擎能力：[hello245m/free-stockdb](https://github.com/hello245m/free-stockdb)

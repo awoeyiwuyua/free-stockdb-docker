@@ -244,7 +244,10 @@ docker compose pull && docker compose up -d
 
 ## 后续扩展（本版不启用，需求浮现后再加）
 
-- **AI MCP 容器化**：官方 `调用方式/ai_mcp/stockdb_full_mcp.py`（需容器带 Python + pybao C 扩展），或继续用本仓库 `docker/webui/mcp/stockdb_mcp_server.py`（HTTP 只读，已随 webui 容器的 `/mcp` 路由承载，NAS 部署后走 `http://<NAS_IP>:8081/mcp`）
+- **AI MCP 容器化**：官方 `调用方式/ai_mcp/stockdb_full_mcp.py`（位于上游仓库
+  [hello245m/free-stockdb](https://github.com/hello245m/free-stockdb)，需容器带 Python +
+  pybao C 扩展），或继续用本仓库 `docker/webui/mcp/stockdb_mcp_server.py`（HTTP 只读，
+  已随 webui 容器的 `/mcp` 路由承载，NAS 部署后走 `http://<NAS_IP>:8081/mcp`）
 - **webui 增强**：0.4.0 起 webui 为运维面板（同步/健康/查询/私有存储），行情展示功能已移除；数据接入统一走 stockdb HTTP（7899）与 `/mcp` 路由。
 - **定时同步**：极空间计划任务，或 webui 内加定时（后续版本）
 
