@@ -115,7 +115,7 @@ api/ 四域模块 (src/api/*.js)      ← 后端路径只写在这里
 ## 你可以怎么玩
 
 ```bash
-cd docker/webui/spa
+cd stockdb-ai/spa
 npm run dev        # 打开 http://localhost:5173，热更新（/api 已代理到本地 webui 8080）
 npm run test       # 前端单测（当前 56 例全绿）
 npm run build      # 编译出 dist/

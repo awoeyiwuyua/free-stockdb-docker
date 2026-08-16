@@ -11,7 +11,7 @@
 - `0.6.x`：补丁——修 bug / 小加固；**攒批发布**，不随 commit 走
 - `0.7.0`：功能里程碑——新增一个完整能力（如回测引擎、备份/恢复）
 - `1.0.0`：正式版——60 天模拟盘验收通过 + 数据契约冻结评审通过
-- 版本号 `docker/webui/app.py` 的 `WEBUI_VERSION`；tag `vX.Y.Z` 打在本仓库（原生模式
+- 版本号 `stockdb-ai/config.py` 的 `WEBUI_VERSION`；tag `vX.Y.Z` 打在本仓库（原生模式
   下 tag 即发布物，无需镜像）
 
 ## 2. 发布节奏
@@ -36,7 +36,7 @@
 
 | 发布物 | 位置 | 说明 |
 |---|---|---|
-| 版本号 | `docker/webui/app.py` 的 WEBUI_VERSION | 每版必更 |
+| 版本号 | `stockdb-ai/config.py` 的 WEBUI_VERSION | 每版必更 |
 | 变更说明 | CHANGELOG.md | 每版必更 |
 | Git 标记 | tag `vX.Y.Z` | 每版必打（原生模式下即最终发布物） |
 | 镜像 | `ghcr.io/awoeyiwuyua/stockdb-ai` | **可选**：仅成熟版本手动构建（+ 上游版本 tag） |

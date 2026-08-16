@@ -54,7 +54,7 @@
 ## 你可以怎么玩
 
 ```bash
-cd docker/webui/spa
+cd stockdb-ai/spa
 npm install        # 装依赖（第一次或换机器后）
 npm run dev        # 打开 http://localhost:5173，热更新
 npm run test       # 前端单测

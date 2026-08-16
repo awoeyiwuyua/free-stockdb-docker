@@ -1,7 +1,7 @@
 """webui 运维面板（瘦身后）模块单元测试。
 
-运行：cd docker/webui && python3 -m unittest test_research -v
-或：  python3 -m unittest discover -s docker/webui -p 'test*.py' -v
+运行：cd stockdb-ai && python3 -m unittest test_research -v
+或：  python3 -m unittest discover -s stockdb-ai -p 'test*.py' -v
 
 覆盖：心跳 TTL 缓存、同步生效判定（_sync_effective）、reload 重载、
 港股代码识别/mydb 写入与保留表拦截。

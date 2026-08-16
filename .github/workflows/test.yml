@@ -7,7 +7,7 @@ on:
     branches: [main]
   pull_request:
     paths:
-      - 'docker/**'
+      - 'stockdb-ai/**'
       - '.github/workflows/test.yml'
 
 jobs:
@@ -24,15 +24,15 @@ jobs:
           python-version: '3.14'
 
       - name: Run MCP unit tests
-        working-directory: docker/webui
+        working-directory: stockdb-ai
         run: python -m unittest mcp.test_stockdb_mcp_server -v
 
       - name: Run ops unit tests
-        working-directory: docker/webui
+        working-directory: stockdb-ai
         run: python -m unittest test_ops -v
 
       - name: Run auction collector tests
-        working-directory: docker/webui
+        working-directory: stockdb-ai
         run: python -m unittest test_auction_collect test_auction_metrics test_auction_list test_records test_layer_boundaries -v
 
   spa-tests:
@@ -47,16 +47,16 @@ jobs:
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: docker/webui/spa/package-lock.json
+          cache-dependency-path: stockdb-ai/spa/package-lock.json
 
       - name: npm ci
-        working-directory: docker/webui/spa
+        working-directory: stockdb-ai/spa
         run: npm ci --no-audit --no-fund
 
       - name: Vitest 单测
-        working-directory: docker/webui/spa
+        working-directory: stockdb-ai/spa
         run: npm run test
 
       - name: Vite 构建
-        working-directory: docker/webui/spa
+        working-directory: stockdb-ai/spa
         run: npm run build

@@ -101,7 +101,7 @@
 | `src/layout/nav.test.js` | 菜单树与重定向契约（10 例）：分组条数/path 唯一/badge/重定向合法性 | 测试当守门员 |
 | `src/api/diag.test.js` | `/api/diag` 契约（3 例）：GET、无 body、payload 解析 | 契约测试 |
 
-> 后端对应：`docker/webui/app.py` 新增 `GET /api/diag` handler（六检查 + env，单块降级不 500），
+> 后端对应：`stockdb-ai/app.py` 新增 `GET /api/diag` handler（六检查 + env，单块降级不 500），
 > `test_ops.py` 补了对应契约断言——前端字段以它实际返回为准。
 
 ## 关键概念对照表
@@ -121,7 +121,7 @@
 ## 你可以怎么玩
 
 ```bash
-cd docker/webui/spa
+cd stockdb-ai/spa
 npm run dev        # 打开 http://localhost:5173，热更新（/api 已代理到本地 webui 8080）
 npm run test       # 前端单测（当前 63 例全绿）
 npm run build      # 编译出 dist/

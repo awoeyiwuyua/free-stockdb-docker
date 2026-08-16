@@ -6,7 +6,7 @@ data/
 __pycache__/
 *.pyc
 .zcode/
-docker/webui/.dev-data/
+stockdb-ai/.dev-data/
 .npm-cache/
 .venv/
 

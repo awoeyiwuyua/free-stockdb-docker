@@ -8,7 +8,7 @@
 | 目录 | 角色 | 允许操作 |
 |---|---|---|
 | `C:\Users\75393\Desktop\stockdb` | **原生引擎运行时**：`stockdb.exe`（127.0.0.1:7899）+ `data/*.ldb`（全市场行情 LevelDB）+ `data1/` + `pybao/`（Python 扩展）+ `mydb/`（私有存储 LevelDB） | 只读。引擎由上游 `数据更新.exe` 同步维护，私有代码**不写文件**进此目录 |
-| `C:\Users\75393\Desktop\stockdb-private` | **研究成果仓库**（本仓库，唯一版本化对象）：`docker/webui/`（app.py + 打板模块 + MCP）+ `docs/` | 全部代码改动在此，走分支 + PR |
+| `C:\Users\75393\Desktop\stockdb-private` | **研究成果仓库**（本仓库，唯一版本化对象）：`stockdb-ai/`（app.py + 打板模块 + MCP）+ `docs/` | 全部代码改动在此，走分支 + PR |
 
 **硬性禁止**（原任务书约定，维持有效）：
 - 禁止改动/删除原生目录任何文件（`*.ldb` / `data*` / `*.pyd` / `stockdb.exe` 等）
@@ -26,7 +26,7 @@
 | `STOCKDB_HOST` | `127.0.0.1` | MCP 模块默认 host 是 NAS 内网 IP（`100.66.1.1`），不设会打到失效通道 |
 | `STOCKDB_PORT` | `7899` | 引擎配置端口（原生目录 `stockdb.conf`） |
 | `PYBAO_DIR` | `C:\Users\75393\Desktop\stockdb\pybao` | pybao 扩展实际位置（任务书原约定 D:\stockdb 在本机为 C:\Users\75393\Desktop\stockdb） |
-| `PYTHONPATH` | 追加 `C:\Users\75393\Desktop\stockdb\pybao`（+ `docker\webui` 视脚本位置） | app.py `_mydb_import` 与 mcp 需要 `import stockdb` |
+| `PYTHONPATH` | 追加 `C:\Users\75393\Desktop\stockdb\pybao`（+ `stockdb-ai` 视脚本位置） | app.py `_mydb_import` 与 mcp 需要 `import stockdb` |
 | `NO_PROXY` / `no_proxy` | `127.0.0.1,localhost` | 系统代理（127.0.0.1:7890）会被 python urllib 拾取，把引擎请求转发到代理 → 间歇 502/5s 超时；必须直连 |
 
 **Python 解释器**：项目声明 3.14（`.python-version`），扩展为 3.14 非 free-threaded ABI
@@ -40,7 +40,7 @@
 ## 3. 开发工作流
 
 1. 数据更新：上游 `数据更新.exe` 保持引擎数据最新（`000001` 最新交易日为探针）
-2. 代码改动：本仓库分支 → 单测（`docker/webui/` 下 `python -m unittest test_auction_collect
+2. 代码改动：本仓库分支 → 单测（`stockdb-ai/` 下 `python -m unittest test_auction_collect
    test_auction_metrics test_auction_list test_ops mcp.test_stockdb_mcp_server`，206 全绿）
 3. 回填/采集：`auction_run_backfill(days=60)`（app.py）直连引擎写 mydb
 4. 验收：异源签字口径见 `docs/design/auction-collector.md` 与 `docs/acceptance/`

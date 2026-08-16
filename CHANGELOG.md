@@ -1,8 +1,25 @@
 # CHANGELOG
 
-本项目面板版本号 = `WEBUI_VERSION`（`docker/webui/config.py`，0.9.1 起收敛至 config），
+本项目面板版本号 = `WEBUI_VERSION`（`stockdb-ai/config.py`，0.9.1 起收敛至 config），
 镜像 tag 跟随上游引擎版本。发布纪律见 `docs/webui-spa/release-policy.md`；
 部署记录见 `docs/DEPLOYMENTS.md`；本机目录关系与运行配方见 `docs/DEVELOPMENT-GUIDE.md`。
+
+## [0.9.7] — 2026-08-16（目录重组：应用层上提 stockdb-ai/，docker/ 只留部署物）
+
+用户拍板：仓库本质是**后端**（D1 AI 原生数据后端），webui 只是它暴露的 HTTP
+面板接口之一——目录名与项目名一致，不再用局部视角的 webui 命名：
+
+- **`docker/webui/` → `stockdb-ai/`**（git mv，历史保留）：app.py + 四层
+  （web/services/core/storage/ops）+ mcp + spa + static + 全部单测，即后端主体
+- **`docker/` 只留部署物**：Dockerfile / docker-compose.yml / entrypoint.sh /
+  stockdb.conf / README
+- **Docker 构建适配**：build context 改为仓库根（`COPY stockdb-ai/...`），
+  新增根 `.dockerignore`（排除 .git/.venv/docs 等非镜像物）
+- **引用全量同步**：43 处 `docker/webui` → `stockdb-ai`（README/docs/CHANGELOG/
+  pyproject/CI/代码注释/测试头注释），grep 清零
+- CI：test.yml working-directory 与触发路径、build-image.yml context 与
+  cache-dependency-path 同步；release-policy 版本号位置更正（config.py）
+- Python 261 全绿（路径搬迁后重新验证）
 
 ## [0.9.6] — 2026-08-16（应用层瘦身一：Handler 迁 web/handlers.py + 备份断言）
 
@@ -122,7 +139,7 @@ app.py 3266 → 约 2400 行（告警/日志/mydb/引擎闸口/打板用例/领�
 
 **M4：上游 stock_sdk 41 工具全量整合进本仓库 MCP**（用户拍板核心需求，设计见
 `docs/design/sdk-mcp-bridge.md`）：
-- 策略（用户拍板"不造轮子"）：拷贝上游 `stockdb_full_mcp.py` 进 `docker/webui/mcp/`
+- 策略（用户拍板"不造轮子"）：拷贝上游 `stockdb_full_mcp.py` 进 `stockdb-ai/mcp/`
   （MIT，文件头注明来源与版本），复用其 `stockdb_*` 函数；新增 `sdk_bridge.py`
   契约外壳（纯标准库）：参数 schema 自动生成（inspect.signature + docstring）、
   df/panel 强制 JSON 形态、三级结果解析（json → literal_eval → 原文）、大结果
