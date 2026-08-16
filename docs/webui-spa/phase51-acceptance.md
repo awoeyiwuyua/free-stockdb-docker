@@ -56,4 +56,4 @@ docker compose logs --tail=20   # 确认 webui 无报错启动
 `up -d` 后根路径整体回到旧面板；移除变量即回新面板。
 
 **镜像级回滚**：`docker compose` 把镜像 tag 改回上一个已知良好的
-`ghcr.io/awoeyiwuyua/free-stockdb:latest@<旧 digest>` 或重打上一个版本 tag。
+`ghcr.io/awoeyiwuyua/stockdb-ai:latest@<旧 digest>` 或重打上一个版本 tag。

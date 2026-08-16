@@ -39,7 +39,7 @@
 | 版本号 | `docker/webui/app.py` 的 WEBUI_VERSION | 每版必更 |
 | 变更说明 | CHANGELOG.md | 每版必更 |
 | Git 标记 | tag `vX.Y.Z` | 每版必打（原生模式下即最终发布物） |
-| 镜像 | `ghcr.io/awoeyiwuyua/free-stockdb` | **可选**：仅成熟版本手动构建（+ 上游版本 tag） |
+| 镜像 | `ghcr.io/awoeyiwuyua/stockdb-ai` | **可选**：仅成熟版本手动构建（+ 上游版本 tag） |
 | 部署记录 | docs/DEPLOYMENTS.md | 镜像部署时更新
 
 ## 5. 回滚约定

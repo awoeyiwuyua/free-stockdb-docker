@@ -65,7 +65,7 @@ docker/webui/
 |---|---|---|
 | 1 | config.py 完成装配接入（app.py 用 config） | 224 绿 |
 | 2 | ops/：Alerts + notify_alert + log/tail_log 搬入 | 224 绿 |
-| 3 | storage/：mydb_write/read/tables + _auction_series_* + stockdb_fetch 搬入 | 224 绿 |
+| 3 | storage/：mydb_write/read/tables + _auction_series_* + stockdb_fetch 搬入（**含多源抽象，见 §4.1**） | 224 绿 |
 | 4 | services/：auction_run_collect/close/backfill + run_sync 任务体搬入（app.py 留薄壳转发） | 224 绿 |
 | 5 | core/：board_metrics/auction_metrics/auction_list/calendar_xshg 归位（mcp/ 留兼容转发或改 import） | 224 绿 |
 | 6 | web/：Handler 路由表拆分 routes.py/handlers.py | 224 绿 |
@@ -73,6 +73,26 @@ docker/webui/
 
 每批独立 PR、独立可回滚；**不改变任何对外契约**（HTTP 路径/MCP 工具名/信封/错误码
 一律不动——它们是"对外承诺"）。
+
+## 4.1 storage/ 多数据源抽象（2026-08-16 用户拍板：上游只是数据层的一部分）
+
+**原则**：应用层（services/）不感知数据从哪来——数据访问统一走 storage/ 的 provider
+接口；上游 free-stockdb 引擎是第一个（当前唯一）行情 provider，mydb 自持存储是第二个。
+
+```
+storage/
+├── providers/            # 数据源适配器（每个 provider 一个模块）
+│   ├── free_stockdb.py   # 上游引擎（引擎 HTTP + pybao 扩展）——当前唯一行情源
+│   └── mydb_store.py     # mydb 读写（研究成果自持：打板指标/序列/清单/快照）
+├── __init__.py           # 对外统一入口（0.9.2 先保持函数直调，抽象接口随 M5 引入）
+└── records.py            # 日检/运行记录（可观测性落点）
+```
+
+**0.9.2 落地范围（克制）**：搬迁期**只做目录归位 + 模块拆分**，不引入 provider 抽象
+接口（那是 M5 的活）；但**文件边界按 provider 划分**——mydb 相关函数进
+`mydb_store.py`、引擎访问进 `free_stockdb.py`，为 M5 的抽象接口留好墙。
+M5（排期待定）再定义统一数据访问接口（如 `quote_provider` / `research_store`），
+应用层切换数据源零改动。
 
 ## 5. 可观测性三件套（0.9.1 延后，随 0.9.2 落地）
 

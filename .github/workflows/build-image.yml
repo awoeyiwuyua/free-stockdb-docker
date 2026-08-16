@@ -5,8 +5,8 @@
 #      权限勾选 write:packages）
 #   2. 仓库 Actions 页 → 本 workflow → Run workflow（手动触发）
 #   3. 产物（amd64 + arm64 双架构单镜像，0.5.0 起 stockdb+webui 合一）：
-#        ghcr.io/awoeyiwuyua/free-stockdb:<version>
-#        ghcr.io/awoeyiwuyua/free-stockdb:latest
+#        ghcr.io/awoeyiwuyua/stockdb-ai:<version>
+#        ghcr.io/awoeyiwuyua/stockdb-ai:latest
 #
 # 版本升级：上游发新版 → Sync fork → 改 docker/Dockerfile 的 ARG VERSION
 #（及对应 SHA256 / GH_TAG_ENCODED）→ 重新 Run workflow
