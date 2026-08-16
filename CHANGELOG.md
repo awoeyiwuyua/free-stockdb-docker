@@ -1,8 +1,24 @@
 # CHANGELOG
 
-本项目面板版本号 = `WEBUI_VERSION`（`docker/webui/app.py`），镜像 tag 跟随上游引擎版本。
-发布纪律见 `docs/webui-spa/release-policy.md`；部署记录见 `docs/DEPLOYMENTS.md`；
-本机目录关系与运行配方见 `docs/DEVELOPMENT-GUIDE.md`。
+本项目面板版本号 = `WEBUI_VERSION`（`docker/webui/config.py`，0.9.1 起收敛至 config），
+镜像 tag 跟随上游引擎版本。发布纪律见 `docs/webui-spa/release-policy.md`；
+部署记录见 `docs/DEPLOYMENTS.md`；本机目录关系与运行配方见 `docs/DEVELOPMENT-GUIDE.md`。
+
+## [0.9.1] — 2026-08-16（应用层四层架构：立框架，不搬代码）
+
+用户拍板：0.9.1 先搭四层框架，0.9.2 搬迁（设计见 docs/design/application-layer.md）：
+- **五层包骨架**：web/（接口层）/ services/（应用服务层）/ core/（领域层）/
+  storage/（基础设施层）/ ops/（横切关注点）——每包 `__init__.py` 载明层职责、
+  依赖纪律与 0.9.2 搬迁目标（现有代码归属映射）
+- **依赖纪律物理检查**（框架核心）：`test_layer_boundaries.py` 用 ast 静态扫描各层
+  import——core/ 零外部依赖、services/ 禁依赖接口层、storage/ 禁依赖业务层、
+  ops/ 禁依赖用例层；违规即测试红（防未来越界）；含检查器有效性样例
+- **config.py 配置单一入口**（唯一代码搬迁）：STOCKDB_HOST/PORT、DATA_DIR、
+  LISTEN_PORT、STOCKDB_PIDFILE/PAUSE/LOG_FILE、WEBUI_VERSION、打板调度触发点、
+  并发闸门从 app.py 收敛至 config.py；app.py 改为引用 config，行为不变
+- 版本号 WEBUI_VERSION 收敛到 config.py（0.9.0 → 0.9.1）；CI 测试命令加入层边界检查
+- 验证：Python 232 全绿（224 + 8 层边界）；本机引擎冒烟（MCP 53 工具可用）
+- 0.9.2 计划：7 批次增量搬迁（ops→storage→services→core→web）+ 可观测性三件套
 
 ## [0.9.0] — 2026-08-16（功能里程碑：SDK 41 工具整合 MCP + 打板链路语义修正）
 
