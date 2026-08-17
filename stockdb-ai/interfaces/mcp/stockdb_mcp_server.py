@@ -124,7 +124,7 @@ _WAREHOUSE_HINT = (
 PROTOCOL_VERSION = "2025-06-18"
 SERVER_NAME = "stockdb-native"
 # 与 WEBUI_VERSION 同步（stockdb-ai/config.py；0.9.10 起手工对齐）
-SERVER_VERSION = "0.10.0"
+SERVER_VERSION = "0.10.1"
 
 DEFAULT_HOST = "100.66.1.1"
 DEFAULT_PORT = 7899
@@ -139,6 +139,9 @@ _KLINE_CODES_MAX = 50  # 批量 codes 上限
 # 重型工具串行化锁：query_board_open_effect_history 内部会嵌套调用
 # query_fullmarket_daily_snapshot（两者都会开线程池拉全市场），用 RLock 避免同线程二次获取死锁。
 _HEAVY_LOCK = threading.RLock()
+# 0.9.14：慢路径排队上限——全市场重算 37s+ 且构建大快照，多个请求排队时线程与
+# 内存峰值叠加（OOM 重启循环实证）。等待超限快速失败（客户端重试），不排队。
+_HEAVY_LOCK_WAIT_SECONDS = 5.0
 
 # === 统一错误码契约（本批全局：8 码体系） ===
 # server.py isError content 统一为 {"error": str, "code": str}（DEPENDENCY_UNAVAILABLE 附加
@@ -1594,71 +1597,98 @@ def query_board_open_effect_history(
         fast = _fast_path_result(start_iso, end_iso, include_distribution)
         if fast is not None:
             return fast
-    with _HEAVY_LOCK:
-        _notify_progress("snapshot_start")
-        full_a_share_request = codes is None
-        if full_a_share_request:
-            raw_universe = query_stock_list()
-            codes = [
-                code for code in (raw_universe.get("codes") or [])
-                if is_supported_a_share_code(str(code))
-            ]
+    # 0.9.14：慢路径忙时快速失败——全市场重算 37s+ 且每次构建约 5000 只×20 天
+    # 大快照，多个请求排队时线程+内存峰值叠加（实测 OOM 重启循环）。等待超过
+    # _HEAVY_LOCK_WAIT_SECONDS 直接降级返回（客户端稍后重试），不排队。
+    if not _HEAVY_LOCK.acquire(timeout=_HEAVY_LOCK_WAIT_SECONDS):
+        raise _ToolError(
+            "全市场重算队列繁忙（已有重查询在跑，正常查询请稍后重试；"
+            "预计算直读路径不受影响）",
+            ERROR_RATE_LIMITED,
+        )
+    try:
+        return _query_board_open_effect_history_slow(
+            start, end, codes, limit, workers, start_iso, end_iso, include_distribution,
+        )
+    finally:
+        _HEAVY_LOCK.release()
 
-        snapshot, metadata = query_fullmarket_daily_snapshot(
-            start,
-            end,
-            codes=codes,
-            limit=limit,
-            workers=workers,
-            warmup_days=20,
-        )
-        _notify_progress("snapshot_done")
-        details = compute_board_open_effect_details(snapshot)
-        days = []
-        for trade_date, row in sorted(details.items()):
-            if not start_iso <= trade_date <= end_iso:
-                continue
-            item = dict(row)
-            if not include_distribution:
-                item.pop("distribution", None)
-            days.append(item)
-        # 0.7.0：研究成果预计算 / 竞价快照双源合并（当日段用预计算或采集表，历史段仍日K）
-        auction_known_at, auction_error, merge_stats = _merge_auction_days(
-            snapshot, days, start_iso, end_iso, include_distribution
-        )
-        precomputed_dates = merge_stats.get("precomputed_dates") or []
-        result = {
-            "source_name": "free-stockdb",
-            "source_contract_version": "board-open-effect-stockdb-v4.2",
-            "start": start_iso,
-            "end": end_iso,
-            **metadata,
-            "load_path": "mydb+overlay" if precomputed_dates else "kline",
-            "cache_hit": False,
-            "precomputed_days": len(precomputed_dates),
-            "fallback_reason": (
-                None
-                if precomputed_dates
-                else "区间交易日无预计算结果，已全市场重算"
-            ),
-            "methodology": {
-                "sample": "T-1沪深非ST、非一字板收盘涨停股",
-                "one_word": "T-1 open=high=low=close=涨停价",
-                "limit_price": "前收×(1+10%/20%)，0.01元 ROUND_HALF_UP",
-                "value": "(T日开盘价/T-1收盘价-1)×100%",
-            },
-            "known_limitations": [
-                "stockdb 当前未提供可直接校验的上市日期/无涨跌幅限制标记；"
-                "新股无涨跌幅限制期内若收盘价恰好等于理论涨停价，日K单源无法完全识别",
-            ],
-            "days": days,
-        }
-        if auction_known_at is not None:
-            # 当日段合并成功：信封 known_at 标注当日来源（_derive_known_at 读取）
-            result["known_at"] = auction_known_at
-        if auction_error is not None:
-            result["errors"] = [auction_error]  # 降级提示，不改变 ok 语义
-        return result
+
+def _query_board_open_effect_history_slow(
+    start: str,
+    end: str,
+    codes: list[str] | None,
+    limit: int,
+    workers: int,
+    start_iso: str,
+    end_iso: str,
+    include_distribution: bool,
+) -> dict:
+    """慢路径实现（调用方已持 _HEAVY_LOCK）：全市场日K 重算 + 预计算/快照覆盖。"""
+    _notify_progress("snapshot_start")
+    full_a_share_request = codes is None
+    if full_a_share_request:
+        raw_universe = query_stock_list()
+        codes = [
+            code for code in (raw_universe.get("codes") or [])
+            if is_supported_a_share_code(str(code))
+        ]
+
+    snapshot, metadata = query_fullmarket_daily_snapshot(
+        start,
+        end,
+        codes=codes,
+        limit=limit,
+        workers=workers,
+        warmup_days=20,
+    )
+    _notify_progress("snapshot_done")
+    details = compute_board_open_effect_details(snapshot)
+    days = []
+    for trade_date, row in sorted(details.items()):
+        if not start_iso <= trade_date <= end_iso:
+            continue
+        item = dict(row)
+        if not include_distribution:
+            item.pop("distribution", None)
+        days.append(item)
+    # 0.7.0：研究成果预计算 / 竞价快照双源合并（当日段用预计算或采集表，历史段仍日K）
+    auction_known_at, auction_error, merge_stats = _merge_auction_days(
+        snapshot, days, start_iso, end_iso, include_distribution
+    )
+    precomputed_dates = merge_stats.get("precomputed_dates") or []
+    result = {
+        "source_name": "free-stockdb",
+        "source_contract_version": "board-open-effect-stockdb-v4.2",
+        "start": start_iso,
+        "end": end_iso,
+        **metadata,
+        "load_path": "mydb+overlay" if precomputed_dates else "kline",
+        "cache_hit": False,
+        "precomputed_days": len(precomputed_dates),
+        "fallback_reason": (
+            None
+            if precomputed_dates
+            else "区间交易日无预计算结果，已全市场重算"
+        ),
+        "methodology": {
+            "sample": "T-1沪深非ST、非一字板收盘涨停股",
+            "one_word": "T-1 open=high=low=close=涨停价",
+            "limit_price": "前收×(1+10%/20%)，0.01元 ROUND_HALF_UP",
+            "value": "(T日开盘价/T-1收盘价-1)×100%",
+        },
+        "known_limitations": [
+            "stockdb 当前未提供可直接校验的上市日期/无涨跌幅限制标记；"
+            "新股无涨跌幅限制期内若收盘价恰好等于理论涨停价，日K单源无法完全识别",
+        ],
+        "days": days,
+    }
+    if auction_known_at is not None:
+        # 当日段合并成功：信封 known_at 标注当日来源（_derive_known_at 读取）
+        result["known_at"] = auction_known_at
+    if auction_error is not None:
+        result["errors"] = [auction_error]  # 降级提示，不改变 ok 语义
+    return result
 
 
 def get_trading_days(args: dict) -> dict:
