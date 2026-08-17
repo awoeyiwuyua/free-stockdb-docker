@@ -4,6 +4,29 @@
 镜像 tag 跟随上游引擎版本。发布纪律见 `docs/webui-spa/release-policy.md`；
 部署记录见 `docs/DEPLOYMENTS.md`；本机目录关系与运行配方见 `docs/DEVELOPMENT-GUIDE.md`。
 
+## [0.9.12] — 2026-08-17（webui 并发风暴修复：有界 HTTP 并发 + 备份/SQLite 锁收口）
+
+0.9.11 部署实证：点击多了 webui 全站请求超时（进程活着、无错误日志，请求排队/
+阻塞累积而非崩溃）。三个确定性病灶：
+
+- **HTTP 并发无上限**：ThreadingHTTPServer 每请求一线程，慢操作排队时线程无限
+  堆积（最终新请求挂起、全站"无法访问"）→ 新增 `_BoundedHTTPServer`（信号量限
+  并发 64，超限快速断开保活；`daemon_threads=True`；listen backlog 64），点击/
+  客户端风暴不再拖死 webui
+- **backup VACUUM INTO 持业务锁**：主连接 `self._lock` 内复制全库（NAS 磁盘慢时
+  数十秒），期间 MCP 快速通道等全部 SQLite 访问阻塞排队 → 备份改独立连接执行
+  （WAL 模式在线备份由文件级锁保证一致性，不占业务锁）
+- **mydb_read 全表列取连续持锁**：500 键逐键 get 持 `_rd_lock` 全程（引擎慢时
+  25s+），MCP 快速通道/打板任务等全部 rd 访问排队 → 改细粒度持锁（keys 一次、
+  逐键各一次），面板展示对中间态不敏感
+- **旧研究成果导入**：0.9.5 存储迁移（引擎 mydb → /data/research.db）后旧数据
+  不自动导入，打板序列（60 日分位分母）从零积累约 60 个交易日——
+  `migrate_from_engine` 改**仅补缺失**（不覆盖 0.9.11+ 新采集含 daily 的载荷），
+  新增 `POST /api/research/migrate` 入口（幂等可重跑）
+
+本地压力实测：100 并发 /api/status 全部 200 快速完成、0 tracebacks。
+Python 295 全绿。
+
 ## [0.9.11] — 2026-08-17（整体迭代：循环导入致命修复 + 常见 bug 类型扫描收口）
 
 0.9.10 部署实证 webui 启动即崩（循环导入），本轮整体迭代修复 + 按 14 类常见 bug

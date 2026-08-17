@@ -207,6 +207,17 @@ class SqliteResearchStore(ResearchStore):
                 parts = table_full.split(":")
                 if len(parts) < 3:
                     continue
+                # 0.9.12：仅补缺失——SQLite 已存在的键（0.9.11+ 新采集，payload 含
+                # daily 子载荷等新字段）不覆盖；此前 INSERT OR REPLACE 会把新数据
+                # 覆盖回旧载荷，daily/覆盖率字段永久丢失
+                if kind == "metrics" and self.read_metrics(parts[1]) is not None:
+                    continue
+                if kind == "series" and self.read_series(parts[1]) is not None:
+                    continue
+                if kind == "lists" and self.read_list(parts[1]) is not None:
+                    continue
+                if kind == "snapshots" and parts[2] in self.read_snapshots(parts[1]):
+                    continue
                 try:
                     # 0.9.11：持 _rd_lock 访问（与 _mydb_rd_keys 同语义）
                     with _mydb._rd_lock:
@@ -261,11 +272,18 @@ class SqliteResearchStore(ResearchStore):
             # 已存在 → VACUUM 失败被静默吞掉）；追加 uuid 后缀保证唯一
             unique = uuid4().hex[:8]
             target = backup_dir / f"research-{stamp}-{unique}.db"
-            conn = self._connect()
-            with self._lock:
-                # 0.9.11：路径经单引号转义后拼 SQL（DATA_DIR 含引号不再破坏语句）
+            # 0.9.12：独立连接执行 VACUUM INTO——此前在主连接 self._lock 内执行，
+            # 复制全库期间（NAS 磁盘慢时数十秒）全部 SQLite 业务（MCP 快速通道
+            # read_metrics/read_snapshots 等）被锁阻塞 → 请求排队 → webui 假死。
+            # 独立连接由 SQLite 文件级锁（WAL 模式在线备份）保证一致性，不占业务锁。
+            conn = sqlite3.connect(str(self._path), timeout=5.0)
+            try:
+                conn.execute("PRAGMA busy_timeout=5000")
+                # 路径经单引号转义后拼 SQL（DATA_DIR 含引号不再破坏语句）
                 sql = f"VACUUM INTO '{str(target).replace(chr(39), chr(39) * 2)}'"
                 conn.execute(sql)
+            finally:
+                conn.close()
             # 保留最近 BACKUP_KEEP 份
             backups = sorted(backup_dir.glob("research-*.db"))
             for old in backups[:-BACKUP_KEEP]:

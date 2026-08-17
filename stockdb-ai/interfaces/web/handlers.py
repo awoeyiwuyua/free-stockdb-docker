@@ -596,6 +596,26 @@ class Handler(BaseHTTPRequestHandler):
                 {"error": f"非法 task {task!r}；合法值：collect / close / backfill"},
                 ensure_ascii=False))
 
+    def _research_migrate(self):
+        """POST /api/research/migrate：引擎 mydb 旧研究成果导入 SQLite（0.9.12）。
+
+        0.9.5 存储迁移（引擎 mydb → /data/research.db）后旧数据不自动导入；
+        仅补缺失（已存在于 SQLite 的键不覆盖），幂等可重跑。
+        """
+        try:
+            from storage.research_factory import get_research_store as _get_store
+            store = _get_store()
+            migrate = getattr(store, "migrate_from_engine", None)
+            if migrate is None:
+                self._send(400, json.dumps(
+                    {"error": "当前存储模式不支持迁移（MydbResearchStore 回滚模式无需迁移）"},
+                    ensure_ascii=False))
+                return
+            result = migrate()
+            self._send(200, json.dumps(result, ensure_ascii=False))
+        except Exception as exc:  # noqa: BLE001 - 迁移失败可观测
+            print(f"webui: 研究成果迁移失败: {type(exc).__name__}: {exc}", file=sys.stderr)
+            self._send(500, json.dumps({"error": f"迁移失败: {exc}"}, ensure_ascii=False))
 
     # ==================== 运营支撑 API（Phase 4.5：通知中心 / MCP 观测 / 版本检查） ====================
     # 隐私：告警/MCP 记录不含 apikey；版本接口只回显版本号与 release 链接。

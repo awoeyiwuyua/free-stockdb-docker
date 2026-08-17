@@ -106,7 +106,7 @@ except ImportError:  # 防御：与 pybao_tools=None 同语义，相关工具返
 PROTOCOL_VERSION = "2025-06-18"
 SERVER_NAME = "stockdb-native"
 # 与 WEBUI_VERSION 同步（stockdb-ai/config.py；0.9.10 起手工对齐）
-SERVER_VERSION = "0.9.10"
+SERVER_VERSION = "0.9.12"
 
 DEFAULT_HOST = "100.66.1.1"
 DEFAULT_PORT = 7899

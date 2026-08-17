@@ -156,31 +156,41 @@ def mydb_write(table: str, items: list[tuple], batch: bool = False) -> dict:
 
 def mydb_read(table: str, key: str = "") -> dict:
     """读取 mydb 自定义表。key 为空时列出表内全部键值。
-    0.8.10：持 _rd_lock；值统一 _rd_to_py 归一化；rd 异常 → 丢弃连接自愈。"""
+    0.8.10：持 _rd_lock；值统一 _rd_to_py 归一化；rd 异常 → 丢弃连接自愈。
+    0.9.12：全表列取改细粒度持锁——keys 枚举一次持锁，逐键 get 每次独立持锁。
+    此前 500 键连续持锁（引擎慢时 25s+），MCP 快速通道/打板任务等全部 rd 访问
+    排队 → 点击多时 webui 假死。面板展示对中间态不敏感，可接受。"""
     table = validate_custom_table(table)
+    if key:
+        with _rd_lock:
+            try:
+                rd = _mydb_rd()
+                val = _rd_to_py(rd.get(table, key))
+                return {"table": table, "key": key, "value": val}
+            except Exception:
+                _mydb_rd_reset()
+                raise
     with _rd_lock:
         try:
             rd = _mydb_rd()
-            if key:
-                val = _rd_to_py(rd.get(table, key))
-                return {"table": table, "key": key, "value": val}
             keys = rd.keys(table, "*") or []
-            values = {}
-            for k in keys:
-                # 0.9.11：复合键解析（split(":", 1) 保留代码段）——键形如
-                # "hk日k:00700:20250425"，此前 split(":")[-1] 只取日期段，
-                # 同一日期多只股票时读出错误记录/读不到（pybao_tools.query_mydb
-                # 已修同款，app 侧同步）
-                full = str(k)
-                lookup_key = full.split(":", 1)[-1] if ":" in full else full
-                try:
-                    values[full] = _rd_to_py(rd.get(table, lookup_key))
-                except Exception:  # noqa: BLE001 - 单键失败按缺失
-                    values[full] = None
-            return {"table": table, "keys": keys, "values": values}
         except Exception:
             _mydb_rd_reset()
             raise
+    values = {}
+    for k in keys:
+        # 0.9.11：复合键解析（split(":", 1) 保留代码段）——键形如
+        # "hk日k:00700:20250425"，此前 split(":")[-1] 只取日期段，
+        # 同一日期多只股票时读出错误记录/读不到（pybao_tools.query_mydb
+        # 已修同款，app 侧同步）
+        full = str(k)
+        lookup_key = full.split(":", 1)[-1] if ":" in full else full
+        try:
+            with _rd_lock:  # 0.9.12：逐键独立持锁（细粒度，见函数注释）
+                values[full] = _rd_to_py(_mydb_rd().get(table, lookup_key))
+        except Exception:  # noqa: BLE001 - 单键失败按缺失
+            values[full] = None
+    return {"table": table, "keys": keys, "values": values}
 
 
 def mydb_tables() -> list[str]:

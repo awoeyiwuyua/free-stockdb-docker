@@ -1797,6 +1797,38 @@ def _wire_auction_tasks() -> None:
     _auction_tasks.research_store = _get_research_store()
 
 
+class _BoundedHTTPServer(ThreadingHTTPServer):
+    """0.9.12：HTTP 并发上限 + daemon 线程。
+
+    病灶（0.9.11 部署实证）：ThreadingHTTPServer 每请求一线程且无上限，慢操作
+    （mydb 全表列取 / VACUUM 备份 / MCP 慢路径）排队时线程无限堆积，最终新请求
+    挂起、全站"点击多了无法访问"。信号量限并发（超限快速断开保活，而非排队）；
+    daemon_threads 避免卡死请求线程阻塞关闭。
+    """
+
+    daemon_threads = True
+    request_queue_size = 64  # listen backlog（默认 5 太小，accept 风暴丢连接）
+
+    def __init__(self, *args, max_concurrency: int = 64, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._slots = threading.Semaphore(max_concurrency)
+
+    def process_request(self, request, client_address):
+        if not self._slots.acquire(blocking=False):
+            try:  # 并发已满：快速断开（客户端可重试），不排队挂起
+                request.close()
+            except OSError:
+                pass
+            return
+        super().process_request(request, client_address)
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._slots.release()  # 信号量覆盖完整请求生命周期
+
+
 def main():
     _wire_auction_tasks()  # 组合根：服务层依赖注入（0.9.2 批次 4）
     print(f"webui listening on 0.0.0.0:{LISTEN_PORT}", file=sys.stderr)
@@ -1807,7 +1839,8 @@ def main():
     # 0.9.11：Handler 延迟装配（app 模块已完整）——handlers.py 顶层 import app，
     # 脚本方式执行时必须在 app 完整后导入，否则循环重载 ImportError（0.9.10 实证）
     from interfaces.web.handlers import Handler  # noqa: E402 - 组合根装配（app 已完整）
-    ThreadingHTTPServer(("0.0.0.0", LISTEN_PORT), Handler).serve_forever()
+    # 0.9.12：并发有界 server（防线程风暴堆积；见 _BoundedHTTPServer）
+    _BoundedHTTPServer(("0.0.0.0", LISTEN_PORT), Handler).serve_forever()
 
 
 if __name__ == "__main__":
