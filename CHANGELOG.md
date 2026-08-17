@@ -4,6 +4,22 @@
 镜像 tag 跟随上游引擎版本。发布纪律见 `docs/webui-spa/release-policy.md`；
 部署记录见 `docs/DEPLOYMENTS.md`；本机目录关系与运行配方见 `docs/DEVELOPMENT-GUIDE.md`。
 
+## [0.9.13] — 2026-08-17（帧交错剩余通道封死：指标计算与 rd 读写统一锁 + 线程栈诊断）
+
+0.9.12 部署实证：点击多了仍卡顿 + RAM 不断膨胀 + 日志无异常——指向进程级冻结
+（C 扩展持 GIL）而非崩溃/异常：
+
+- **pybao 锁统一（根因）**：`_PYBAO_LOCK`（zhibiao.jisuan 指标计算）与 `_RD_LOCK`
+  （rd.get/keys）此前是两把独立锁——但 zhibiao 指标计算与 mydb 读写复用同一引擎
+  socket（zhibiao.rd / get_default_raw_rd 同源），两把锁分别串行仍会并发帧交错
+  （2026-08-16 事故：协议帧交错 → C 扩展持 GIL → 全进程冻结 → 冻结线程不释放
+  → RAM 膨胀）。统一为同一把锁：`_PYBAO_LOCK = _RD_LOCK`（同进程容器与 app 侧
+  `mydb_store._rd_lock` 共享，全进程单锁，无死锁——RLock）
+- **SIGUSR1 线程栈转储**：app.py 启动注册 faulthandler——冻结时执行
+  `docker exec stockdb sh -c 'kill -USR1 $(pgrep -f "python /opt/webui/app.py")'`
+  即可把全部线程栈打到 docker logs（定位卡点，无需重启）
+
+Python 295 全绿。
 ## [0.9.12] — 2026-08-17（webui 并发风暴修复：有界 HTTP 并发 + 备份/SQLite 锁收口）
 
 0.9.11 部署实证：点击多了 webui 全站请求超时（进程活着、无错误日志，请求排队/
