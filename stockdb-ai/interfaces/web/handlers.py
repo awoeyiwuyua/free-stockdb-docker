@@ -77,7 +77,17 @@ from app import (  # noqa: E402 - app.py 末尾导入本模块（组合根），
     sync_capability,
     tail_log,
 )
+
+# 0.9.11：请求体大小上限（防超大 POST 拖垮 NAS；配合 Handler.timeout 防读阻塞挂线程）
+_MAX_BODY_BYTES = 16 * 1024 * 1024
+
+
 class Handler(BaseHTTPRequestHandler):
+    # 0.9.11：每请求 socket 读写超时（此前无超时：客户端声明大 Content-Length 后
+    # 停发 → rfile.read 永久阻塞，ThreadingHTTPServer 每连接一线程 → 线程无限累积
+    # 拖死 webui）；配合 _read_json 的请求体上限双重防护
+    timeout = 30
+
     def log_message(self, *args):  # 静默访问日志
         pass
 
@@ -103,8 +113,12 @@ class Handler(BaseHTTPRequestHandler):
                     self._send_file(f)
             else:
                 self._serve_static(path)
+        except (BrokenPipeError, ConnectionResetError):
+            return  # 0.9.11：客户端断连短路（同 do_POST）
         except Exception as exc:
-            self._send(500, json.dumps({"error": str(exc)}))
+            # 0.9.11：500 不回显内部异常细节，日志留痕
+            print(f"webui: GET {path} 500: {type(exc).__name__}: {exc}", file=sys.stderr)
+            self._send(500, json.dumps({"error": "internal error"}))
 
     def _route_api_get(self, path: str):
         """GET /api/* 路由表（0.9.2 批次 6：表外置 web/routes.py，行为不变）。"""
@@ -163,17 +177,31 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(404, json.dumps({"error": "not found"}))
                 return
             getattr(self, handler)()
+        except (BrokenPipeError, ConnectionResetError):
+            # 0.9.11：客户端断连直接短路，不再二次写 500（否则二次 _send 再抛，
+            # 异常逃逸进 http.server 线程，真实错误与断连无法区分）
+            return
         except Exception as exc:
-            self._send(500, json.dumps({"error": str(exc)}))
+            # 0.9.11：500 响应不回显内部异常细节（路径/实现泄露）；日志留痕
+            print(f"webui: POST {path} 500: {type(exc).__name__}: {exc}", file=sys.stderr)
+            self._send(500, json.dumps({"error": "internal error"}))
 
     def _read_json(self) -> dict:
-        length = int(self.headers.get("Content-Length") or 0)
-        if not length:
-            return {}
+        # 0.9.11：Content-Length 非负且 ≤ 16MB（超大/负值会 rfile.read 阻塞挂线程）；
+        # 解析结果必须是 dict（null/[]/123 等合法 JSON 会导致调用方 body.get 崩溃）
         try:
-            return json.loads(self.rfile.read(length).decode("utf-8") or "{}")
-        except json.JSONDecodeError:
+            length = int(self.headers.get("Content-Length") or 0)
+        except (TypeError, ValueError):
+            length = 0
+        if length <= 0:
             return {}
+        if length > _MAX_BODY_BYTES:
+            raise ValueError(f"请求体过大（>{_MAX_BODY_BYTES} 字节）")
+        try:
+            parsed = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
 
     def _mcp(self):
         """只读 MCP JSON-RPC 端点：复用 stockdb_mcp_server.dispatch（与 stdio 同协议）。
@@ -196,8 +224,18 @@ class Handler(BaseHTTPRequestHandler):
             if mcp_dispatch is None:
                 self._send(500, json.dumps({"error": "MCP 模块不可用"}))
                 return
-            length = int(self.headers.get("Content-Length") or 0)
-            raw = self.rfile.read(length) if length > 0 else b""
+            # 0.9.11：Content-Length 防护（非法/负值/超大——此前负数 read(-1) 挂线程）
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except (TypeError, ValueError):
+                length = 0
+            if length <= 0 or length > _MAX_BODY_BYTES:
+                self._send(200, json.dumps({
+                    "jsonrpc": "2.0", "id": None,
+                    "error": {"code": -32700, "message": "Parse error: 请求体非法"},
+                }))
+                return
+            raw = self.rfile.read(length)
             if not raw.strip():
                 self._send(200, json.dumps({
                     "jsonrpc": "2.0", "id": None,
@@ -442,17 +480,29 @@ class Handler(BaseHTTPRequestHandler):
         body = self._read_json()
         codes = body.get("codes") or []
         years = body.get("years", 2)
-        if not codes:
+        if not isinstance(codes, list) or not codes:
             self._send(400, json.dumps({"error": "缺少 codes（如 ['00700','00941']）"}))
             return
+        # 0.9.11：输入校验——字符串会被按字符迭代成单字符"代码"，dict 迭代键
+        if not all(isinstance(c, str) and c.strip() for c in codes):
+            self._send(400, json.dumps({"error": "codes 必须是字符串数组"}))
+            return
+        if not isinstance(years, int) or isinstance(years, bool) or not 1 <= years <= 10:
+            self._send(400, json.dumps({"error": "years 必须是 1-10 的整数"}))
+            return
         try:
-            result = hk_sync(codes, years=years)
+            result = hk_sync([c.strip() for c in codes], years=years)
             self._send(200, json.dumps(result, ensure_ascii=False))
         except Exception as exc:
             self._send(500, json.dumps({"error": str(exc)}, ensure_ascii=False))
 
     def _log(self):
-        n = int(parse_qs(urlparse(self.path).query).get("n", ["100"])[0])
+        # 0.9.11：int 防护 + clamp（此前 n=abc → ValueError → 500；负数 tail 语义错乱）
+        try:
+            n = int(parse_qs(urlparse(self.path).query).get("n", ["100"])[0])
+        except (TypeError, ValueError):
+            n = 100
+        n = max(1, min(n, 5000))
         self._send(200, json.dumps({"log": tail_log(n)}, ensure_ascii=False))
 
     def _query(self):
@@ -469,20 +519,40 @@ class Handler(BaseHTTPRequestHandler):
         if _sync_state["running"]:
             self._send(200, json.dumps({"msg": "同步已在运行中，请等待完成"}))
             return
-        # 锁探测：running 标志可能与锁短暂不一致，且可区分「定时任务占用」与「空闲」
+        body = self._read_json()
+        # 0.9.11：hot 显式布尔解析（此前 bool('false')=True，字符串 false 被误判为
+        # 热更新，触发与预期相反的停服/不停服行为）
+        raw_hot = body.get("hot", True)
+        if isinstance(raw_hot, bool):
+            hot = raw_hot
+        elif isinstance(raw_hot, str):
+            hot = raw_hot.strip().lower() in ("1", "true", "yes", "on")
+        else:
+            hot = True
+        # 0.9.11：探测+启动原子化（锁所有权移交）——此前"探测-释放-再 spawn"存在
+        # 竞态窗口：两次并发请求都可探测通过并各起线程，第二个在 run_sync 内
+        # acquire 失败静默 return，用户却收到"已启动"。现在探测持锁期间 spawn，
+        # 由 worker 线程释放（run_sync 的 acquire(blocking=False) 随即成功）。
         if not _sync_lock.acquire(blocking=False):
             self._send(200, json.dumps({"msg": "同步引擎正在运行中（可能为定时任务），请稍候再试"}))
             return
-        _sync_lock.release()
-        body = self._read_json()
-        hot = bool(body.get("hot", True))  # 默认热更新；前端可传 hot=false 走严格模式
-        threading.Thread(target=run_sync, kwargs={"hot": hot, "trigger": "manual"}, daemon=True).start()
+
+        def _worker():
+            _sync_lock.release()  # 移交：探测占位锁由本线程释放
+            run_sync(hot=hot, trigger="manual")
+
+        threading.Thread(target=_worker, daemon=True).start()
         mode = "热更新" if hot else "严格模式(停服)"
         self._send(200, json.dumps({"msg": f"已启动{mode}同步（手动），日志将实时刷新"}))
 
     def _container_logs(self):
         """stockdb 日志尾部（系统页查看用，读 /data/log.txt）。"""
-        tail = int(parse_qs(urlparse(self.path).query).get("tail", ["150"])[0])
+        # 0.9.11：int 防护 + clamp（此前 tail=abc → ValueError → 500）
+        try:
+            tail = int(parse_qs(urlparse(self.path).query).get("tail", ["150"])[0])
+        except (TypeError, ValueError):
+            tail = 150
+        tail = max(1, min(tail, 5000))
         try:
             text = container_logs(tail)
             self._send(200, json.dumps({"log": text}, ensure_ascii=False))
@@ -514,7 +584,11 @@ class Handler(BaseHTTPRequestHandler):
         elif task == "close":
             self._send(200, json.dumps(auction_run_close(), ensure_ascii=False))
         elif task == "backfill":
-            days = int(body.get("days") or 60)
+            # 0.9.11：days 非法值回退默认（此前 days="abc" → int() ValueError → 500）
+            try:
+                days = int(body.get("days") or 60)
+            except (TypeError, ValueError):
+                days = 60
             self._send(200, json.dumps(auction_run_backfill_async(max(1, min(days, 500))),
                                        ensure_ascii=False))
         else:

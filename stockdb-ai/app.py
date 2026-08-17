@@ -42,8 +42,10 @@ from urllib.parse import urlparse, parse_qs, unquote
 # 缺失/加载失败时 webui 其余功能不受影响，/mcp 路由返回 500。
 try:
     from interfaces.mcp.stockdb_mcp_server import dispatch as mcp_dispatch
-except Exception:  # noqa: BLE001 - MCP 模块缺失时优雅降级
+except Exception as _mcp_import_exc:  # noqa: BLE001 - MCP 模块缺失时优雅降级
     mcp_dispatch = None
+    # 0.9.11：导入失败留痕（此前静默 None，/mcp 永久 500 且无法区分缺依赖/代码损坏）
+    print(f"webui: MCP 模块加载失败（/mcp 将不可用）: {_mcp_import_exc}", file=sys.stderr)
 
 # /mcp SSE 流式进度推送依赖 pybao_tools 的线程级 progress hook
 # （set_progress_hook/clear_progress_hook，见 pybao_tools 模块）；
@@ -701,7 +703,7 @@ def code_stats() -> dict:
             for group in data.values():
                 if isinstance(group, list):
                     codes.extend(str(c) for c in group)
-        stats = {"stock": 0, "etf": 0, "other": 0}
+        stats = {"stock": 0, "etf": 0, "other": 0, "hk": 0}  # 0.9.11：补 hk 键（_classify_code 输出域）
         for c in set(codes):
             stats[_classify_code(c)] += 1
         stats["latency_ms"] = latency_ms
@@ -712,6 +714,7 @@ def code_stats() -> dict:
 
 
 _coverage_cache: dict = {"at": 0.0, "data": None}  # 15 分钟缓存，避免 4s 轮询重复全历史扫描
+_coverage_scan_lock = threading.Lock()  # 0.9.11：全历史扫描单飞锁（并发缓存失效只跑一路）
 _latest_date_cache: dict = {"at": 0.0, "val": None}  # 8 秒缓存：/api/status 4s 心跳不重复打 stockdb
 _latest_date_probe_lock = threading.Lock()  # 单飞锁：并发缓存失效时只跑一路探测（其余立即取缓存）
 _code_stats_cache: dict = {"at": 0.0, "val": None}   # 15 秒缓存：全市场代码列表 GET 较贵
@@ -730,23 +733,31 @@ def data_coverage() -> dict | None:
         return _coverage_cache["data"]
     if _stockdb_breaker_open():
         return _coverage_cache["data"]  # 熔断快速降级（可能为 None）
-    import urllib.parse
-    from datetime import datetime as _dt
-    this_year = _dt.now().year
-    earliest = latest = None
-    for y in range(1990, this_year + 1):
-        try:
-            path = f"/?cmd=vals&t={urllib.parse.quote(f'日k:000001:{y}*')}"
-            rows = json.loads(stockdb_fetch(path, timeout=8, breaker=True))
-            ds = [int(r["date"]) for r in rows if isinstance(r, dict) and r.get("date")]
-            if ds:
-                earliest = min(ds) if earliest is None else earliest
-                latest = max(ds)
-        except Exception:
-            continue
-    data = {"earliest": earliest, "latest": latest} if earliest is not None else None
-    _coverage_cache.update(at=now, data=data)
-    return data
+    # 0.9.11：单飞锁（与 _latest_date_probe_lock 同款）——缓存过期时顺序扫 37 个
+    # 年份 × timeout=8 最坏约 5 分钟，多标签页并发命中 /api/status 会各跑一份
+    # 全量扫描（线程堆积、心跳拖到分钟级）；失败返回旧缓存
+    if not _coverage_scan_lock.acquire(blocking=False):
+        return _coverage_cache["data"]
+    try:
+        import urllib.parse
+        from datetime import datetime as _dt
+        this_year = _dt.now().year
+        earliest = latest = None
+        for y in range(1990, this_year + 1):
+            try:
+                path = f"/?cmd=vals&t={urllib.parse.quote(f'日k:000001:{y}*')}"
+                rows = json.loads(stockdb_fetch(path, timeout=8, breaker=True))
+                ds = [int(r["date"]) for r in rows if isinstance(r, dict) and r.get("date")]
+                if ds:
+                    earliest = min(ds) if earliest is None else earliest
+                    latest = max(ds)
+            except Exception:
+                continue
+        data = {"earliest": earliest, "latest": latest} if earliest is not None else None
+        _coverage_cache.update(at=now, data=data)
+        return data
+    finally:
+        _coverage_scan_lock.release()
 
 
 _mirror_cache: dict = {"at": 0.0, "val": None}  # 镜像日期抓取缓存（10 分钟），避免 4s 轮询重复访问外网
@@ -763,7 +774,9 @@ def mirror_latest_date() -> str | None:
     镜像抓取是公网请求且可能很慢（最多 12s）：/api/status 4s 心跳里不能同步等它。
     缓存过期时在后台线程刷新，本请求立即返回旧值（无则 None），下次轮询即有新值。
     """
-    if _mirror_cache["val"] is not None and time.time() - _mirror_cache["at"] < 600:
+    # 0.9.11：缓存命中不再要求 val 非 None（失败结果也缓存 600s）——此前镜像不可达
+    # 时每次心跳都 spawn 线程抓公网页面（7×24 无意义外呼），仅缓存过期才刷新
+    if time.time() - _mirror_cache["at"] < 600:
         return _mirror_cache["val"]
 
     def _refresh():
@@ -779,6 +792,9 @@ def mirror_latest_date() -> str | None:
                 result = m.group(1) if m else None
             except Exception:
                 result = None
+            # 0.9.11：失败结果同样入缓存（val=None 也缓存 600s）——此前缓存命中
+            # 条件要求 val 非 None，镜像不可达时每次心跳都 spawn 线程抓公网页面，
+            # 7×24 无意义外呼；失败也标记"已尝试"，仅缓存过期才刷新
             _mirror_cache.update(at=time.time(), val=result)
         finally:
             _mirror_refresh_lock.release()
@@ -1753,8 +1769,11 @@ _MIME = {
 _CACHEABLE_EXT = {".js", ".css", ".svg", ".png", ".ico", ".woff", ".woff2", ".map"}
 
 
-# ---- 0.9.6：HTTP Handler 迁 interfaces/web/handlers.py（app 完整后装配，环打破） ----
-from interfaces.web.handlers import Handler  # noqa: E402 - 组合根装配
+# ---- 0.9.6：HTTP Handler 迁 interfaces/web/handlers.py ----
+# 0.9.11：Handler 不再在模块级导入——handlers.py 顶层 `import app`，脚本方式
+# （python app.py，容器 entrypoint）执行时 sys.modules 无 'app' → 循环重载 →
+# "cannot import name 'Handler' from partially initialized module"（0.9.10 部署
+# 实证）。延迟到 main()（app 已完整）装配，循环消除且模块导入方式不受影响。
 
 def _wire_auction_tasks() -> None:
     """组合根装配（0.9.2 批次 4）：接口层/探针/日历能力绑定到服务层注入点。
@@ -1785,6 +1804,9 @@ def main():
     threading.Thread(target=scheduler_loop, daemon=True).start()
     threading.Thread(target=ops_watchdog_loop, daemon=True).start()     # 运营支撑看门狗（告警生产接线）
     threading.Thread(target=auction_scheduler_loop, daemon=True).start()  # 打板竞价调度（2s 轮询，独立线程）
+    # 0.9.11：Handler 延迟装配（app 模块已完整）——handlers.py 顶层 import app，
+    # 脚本方式执行时必须在 app 完整后导入，否则循环重载 ImportError（0.9.10 实证）
+    from interfaces.web.handlers import Handler  # noqa: E402 - 组合根装配（app 已完整）
     ThreadingHTTPServer(("0.0.0.0", LISTEN_PORT), Handler).serve_forever()
 
 

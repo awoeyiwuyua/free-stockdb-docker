@@ -4,6 +4,64 @@
 镜像 tag 跟随上游引擎版本。发布纪律见 `docs/webui-spa/release-policy.md`；
 部署记录见 `docs/DEPLOYMENTS.md`；本机目录关系与运行配方见 `docs/DEVELOPMENT-GUIDE.md`。
 
+## [0.9.11] — 2026-08-17（整体迭代：循环导入致命修复 + 常见 bug 类型扫描收口）
+
+0.9.10 部署实证 webui 启动即崩（循环导入），本轮整体迭代修复 + 按 14 类常见 bug
+清单对全部模块做系统扫描（5 组并行审计 40+ 发现，全部 P1 + 高价值 P2 已修）：
+
+**致命修复（0.9.10 部署回归）**
+
+- **app.py ↔ handlers.py 循环导入**：Handler 从模块级移到 `main()` 延迟装配——
+  脚本方式（`python /opt/webui/app.py`，容器 entrypoint）执行时 `sys.modules` 无
+  `app` → handlers 顶层 `import app` 触发循环重载 → ImportError 启动即崩。模块
+  导入方式（`import app`/测试）此前掩盖了该问题；0.9.11 起脚本方式实测启动通过，
+  `test_research` 基线红随之修绿
+
+**P1 并发/数据正确性**
+
+- **pybao rd 单连接无锁并发**（2026-08-16 协议帧交错冻结事故同类）：`mydb_store._rd_lock`
+  改 RLock 并收敛全进程——pybao_tools 新增加锁辅助 `rd_get/rd_keys`（同进程容器与
+  app 侧共享同一把锁），`query_mydb`、MCP 快速通道/合并路径、research_store 迁移
+  路径全部改经加锁访问；`_mydb_rd` 初始化、`research_store._connect`、
+  `research_factory` 单例创建均入锁（消除双连接泄漏与双实例）
+- **records.recent 遇缺日 break** → continue：跨周末/节假日/失败日后面板历史记录
+  不再被截断到当天
+- **screen_stocks indicator_cross 显式 date 窗口退化单日** → start 恒为 date 前推
+  warmup_days（EMA/MACD/OBV 收敛窗口恢复，金叉/死叉信号不再失真/全无）
+- **SDK 单日区间 start==end 空区间**（开区间契约）：`_fullmarket_sdk_outcomes` end
+  顺延一日并客户端过滤——全市场单日快照不再整批空返回被静默判 SUSPENDED
+- **config/pybao_tools 环境变量坏值崩溃**：`STOCKDB_PORT`/`WEBUI_PORT`/
+  `STOCKDB_MAX_CONCURRENCY` 经 `_env_int` 回退告警（此前 import 即崩）；
+  pybao_tools 坏端口不再废掉整个 pybao 子系统
+
+**P2 健壮性/可观测性**
+
+- 清单键跨周末失配：明日清单写"下一交易日"键（周五写周一键，此前恒走全市场兜底）
+- 收口分位口径：rank 窗口 = 严格"此前 60 观测"（先算分位再 append，与竞价版一致，
+  消除 1/60 偏差与提前出 rank）
+- 序列读-改-写原子化（`_series_lock`）：收口 append 与回填整体覆盖互斥防丢更新
+- 回填单飞"检查+置位"持锁原子（防并发双份分钟级全市场回填）
+- 手动重跑采集不再抹掉当日已收口对账结论（reconciled 行保留）
+- 休市表覆盖护栏（2027+ 未收录年份拒绝任务/快速通道回退慢路径，防休市日全 None
+  指标行污染）
+- 调度时间补零规范化（`9:26` 此前使采集 10 点后永不触发）
+- handlers：请求体上限 16MB/负长度防护/socket 超时 30s（防读阻塞挂线程）、
+  `_read_json` 非 dict/非法 UTF-8 防护、`_log`/`_container_logs`/`days` int 防护、
+  `_hk_sync` 入参校验、`hot` 布尔显式解析、`_sync` 锁所有权移交防"假启动"、
+  BrokenPipe 短路、500 不回显内部异常
+- MCP：排序 key 容错（单条脏 date 不再中断整批 5000 只快照）、引擎通道仅补缺
+  （迁移期遗留数据不覆盖权威 store）、响应 NaN/Inf → null 清洗（合法 JSON 输出）
+- app：镜像日期失败也缓存（不再 7×24 无意义外呼）、data_coverage 全历史扫描单飞
+  （多标签页不再各跑一份 5 分钟扫描）、code_stats 补 hk 键、MCP 模块导入失败留痕
+- storage：mydb_read 复合键解析（`split(":", 1)` 保留代码段）、records.append
+  捕获 TypeError（坏记录不再击穿任务）、migrate 全失败不再误标已迁移、
+  backup 文件名唯一化 + SQL 引号转义
+- 熔断器计数加锁 + 仅探针路径复位；entrypoint 进程身份校验（readlink /proc/pid/exe，
+  防 stale pid 复用误判存活）；ops.log 写失败静默（不再炸调度线程）
+
+Python 295 全绿（含 test_research 基线红转绿）；脚本方式启动实测（webui 200、
+非法入参 400/回退、后台线程零 traceback）。
+
 ## [0.9.10] — 2026-08-17（打板读取链路工程化收口：键契约修正 + 预计算快速通道）
 
 验收复盘（0.8.16 异源验收）：核心计算正确，但 HTTP MCP「能算、数也对，读取链路未

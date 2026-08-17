@@ -33,6 +33,9 @@ def append(record: dict) -> None:
     """追加一条日检记录（按天文件）；目录缺失自动创建；失败静默（不阻塞业务）。
 
     0.9.3：自动附加 trace_id（uuid4 前 12 位）；0.9.4：写入当日文件并清理过期。
+    0.9.11：捕获 TypeError/ValueError——json.dumps 对不可序列化值（datetime/set/
+    bytes 等）抛 TypeError，此前逃逸给调用方：采集成功路径上一条坏记录把整块任务
+    打成失败分支，失败路径上二次抛异常击穿 except 逃出任务（可能杀死调度线程）。
     """
     try:
         import uuid
@@ -43,7 +46,7 @@ def append(record: dict) -> None:
         with p.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(record, ensure_ascii=False) + "\n")
         _cleanup()
-    except OSError:
+    except (OSError, TypeError, ValueError):
         pass  # 日检落盘失败不阻塞采集/收口主流程
 
 
@@ -60,7 +63,12 @@ def _cleanup() -> None:
 
 
 def recent(n: int = 30) -> list[dict]:
-    """最近 n 条日检记录（最新在前，跨按天文件 + 兼容旧单文件）；损坏行跳过。"""
+    """最近 n 条日检记录（最新在前，跨按天文件 + 兼容旧单文件）；损坏行跳过。
+
+    0.9.11：缺日不再 break——按天文件只在采集/收口日生成（跨周末/节假日/任务失败
+    日为空），遇缺日应继续向更早扫描，否则 recent(n) 永远凑不满（如周一跑过后
+    offset=1 周日缺文件 → 旧实现 break，面板历史被截断到当天一条）。
+    """
     out: list[dict] = []
     today = datetime.now().strftime("%Y%m%d")
     # 按天文件从今天往回扫，直到凑够 n 条（每文件至多读 n 条尾部，防损坏行稀释）
@@ -68,9 +76,7 @@ def recent(n: int = 30) -> list[dict]:
         day = (datetime.now() - timedelta(days=offset)).strftime("%Y%m%d")
         p = _daily_path(day)
         if not p.exists():
-            if day < today and out:
-                break  # 已过最新有数据日，不再向后找
-            continue
+            continue  # 0.9.11：缺日继续向更早扫描（不再 break）
         out.extend(_read_tail(p, n))
         if len(out) >= n:
             break

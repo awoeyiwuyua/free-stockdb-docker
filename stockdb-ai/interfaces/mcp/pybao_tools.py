@@ -51,6 +51,34 @@ _load_error: str | None = None  # 最近一次加载失败原因（诊断用）
 # 全部 pybao 业务调用持锁执行。
 _PYBAO_LOCK = threading.Lock()
 
+# 0.9.11：rd 连接访问锁（get_mydb_rd 返回的 raw rd 单连接非线程安全，2026-08-16
+# 协议帧交错全进程冻结事故）。同进程容器部署时与 app 侧
+# storage/providers/mydb_store._rd_lock 共用同一把锁（stock_sdk.init 全局绑定
+# 端点，两处很可能是同一底层连接，必须全进程串行化）；独立进程（stdio/--http
+# MCP）storage 包不可导入时回退本模块自带锁。
+try:  # noqa: E402 - 同进程容器：与 app 侧共享同一把 rd 锁
+    from storage.providers.mydb_store import _rd_lock as _RD_LOCK
+except Exception:  # noqa: BLE001 - 独立进程部署：storage 包不在 sys.path
+    _RD_LOCK = threading.Lock()
+
+
+def rd_get(table: str, key: str) -> object | None:
+    """加锁读 mydb 单键（pybao rd 非线程安全，全进程串行化）；rd 不可用 → None。"""
+    rd = get_mydb_rd()
+    if rd is None:
+        return None
+    with _RD_LOCK:
+        return rd.get(table, key)
+
+
+def rd_keys(table: str, pattern: str) -> list:
+    """加锁枚举 mydb 键（pybao rd 非线程安全，全进程串行化）；rd 不可用 → []。"""
+    rd = get_mydb_rd()
+    if rd is None:
+        return []
+    with _RD_LOCK:
+        return list(rd.keys(table, pattern) or [])
+
 # 支持的技术指标白名单（39 项，与 pybao zb.get 支持集合一致；含 zhishu 指数）。
 # 未知指标离线即可报错，不依赖 pybao 是否可用。
 SUPPORTED_INDICATORS = frozenset({
@@ -181,7 +209,13 @@ def _load_pybao() -> object | None:
             import stock_sdk  # noqa: PLC0415 - 惰性导入，无 pybao 时本模块仍可 import
             import zhibiao  # noqa: PLC0415
             host = os.environ.get("STOCKDB_HOST", "127.0.0.1")
-            port = int(os.environ.get("STOCKDB_PORT", "7899"))
+            # 0.9.11：坏 STOCKDB_PORT 不再静默废掉整个 pybao 子系统（此前 int()
+            # ValueError 被外层 except 吞掉 → 全部候选失败 → 指标/选股/mydb 整体
+            # 降级 DEPENDENCY_UNAVAILABLE，仅 _load_error 可诊断）
+            try:
+                port = int(os.environ.get("STOCKDB_PORT", "7899"))
+            except (TypeError, ValueError):
+                port = 7899
             if hasattr(stock_sdk, "init"):
                 try:
                     stock_sdk.init(host=host, port=port, warm=False)
@@ -895,7 +929,8 @@ def query_mydb(args: dict) -> dict:
 
     try:
         if key:
-            value = _to_py(rd.get(table, key))
+            # 0.9.11：经加锁辅助访问（pybao rd 单连接非线程安全，全进程串行化）
+            value = _to_py(rd_get(table, key))
             return {
                 "ok": True,
                 "result": {
@@ -905,7 +940,7 @@ def query_mydb(args: dict) -> dict:
                     "value": value,
                 },
             }
-        raw_keys = list(rd.keys(table, "*") or [])
+        raw_keys = rd_keys(table, "*")
         # 排序保证游标续取的有序性（rd.keys 返回顺序不做假设）
         raw_keys.sort(key=str)
         if cursor is not None:
@@ -922,7 +957,7 @@ def query_mydb(args: dict) -> dict:
             full = str(k)
             lookup_key = full.split(":", 1)[-1] if ":" in full else full
             try:
-                values[full] = _to_py(rd.get(table, lookup_key))
+                values[full] = _to_py(rd_get(table, lookup_key))
             except Exception:  # noqa: BLE001 - 单键失败不中断整体
                 values[full] = None
         return {
@@ -1114,8 +1149,12 @@ def screen_stocks(args: dict, universe: list[str], universe_source: str = "full_
                         if name in _CROSS_WARMUP_LONG
                         else _CROSS_WARMUP_DAYS_SHORT
                     )
-                    cross_start = date or (
-                        datetime.now() - timedelta(days=warmup_days)
+                    # 0.9.11：显式 date 时窗口退化为单日 [date, date]——EMA/MACD/OBV
+                    # 等累积类指标以首值播种来不及收敛，金叉/死叉信号失真或全无。
+                    # start 恒为 date 前推 warmup_days，仅 end 取 date。
+                    base_day = date or datetime.now().strftime("%Y%m%d")
+                    cross_start = (
+                        datetime.strptime(base_day, "%Y%m%d") - timedelta(days=warmup_days)
                     ).strftime("%Y%m%d")
                     cross_end = date or "N"
                     jisuan_codes = universe[0] if len(universe) == 1 else universe

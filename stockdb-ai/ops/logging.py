@@ -22,10 +22,13 @@ def now() -> str:
 
 
 def log(line: str) -> None:
-    p = _sync_log_path()
-    p.parent.mkdir(parents=True, exist_ok=True)
-    with p.open("a", encoding="utf-8") as fh:
-        fh.write(f"{now()}  {line}\n")
+    try:
+        p = _sync_log_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with p.open("a", encoding="utf-8") as fh:
+            fh.write(f"{now()}  {line}\n")
+    except OSError:  # 0.9.11：日志失败静默——日志不可写（磁盘满/权限/只读卷）不炸
+        pass  # 调用线程（调度线程/任务函数内 log 遍布，一次写失败不应中断任务）
 
 
 def tail_log(n: int = 200) -> str:

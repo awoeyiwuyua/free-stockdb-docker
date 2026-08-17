@@ -2326,29 +2326,29 @@ class _AuctionKeyContractTests(unittest.TestCase):
         }
         return _AuctionKeyContractTests._payload(metrics=metrics, daily=daily)
 
-    def test_read_metrics_new_key_contract(self):
+    @mock.patch.object(server, "_rd_get_locked")
+    def test_read_metrics_new_key_contract(self, rd_get):
         """新契约：rd.get("打板指标:20260105", "metrics") 必须命中（0.9.10 键契约修复）。"""
-        fake_rd = mock.Mock()
-        fake_rd.get.return_value = self._payload()
+        rd_get.return_value = self._payload()
         row = {"trade_date": "2026-01-05"}
 
-        server._attach_auction_metrics(row, fake_rd, "2026-01-05")
+        server._attach_auction_metrics(row, None, "2026-01-05")
 
-        fake_rd.get.assert_called_once_with("打板指标:20260105", "metrics")
+        rd_get.assert_called_once_with("打板指标:20260105", "metrics")
         self.assertEqual(row["metrics"]["premium_mean"], 1.21)
         self.assertEqual(row["metrics"]["n_samples"], 57)
         self.assertEqual(row["metrics"]["value_source"], "auction")
 
-    def test_read_metrics_legacy_key_fallback(self):
+    @mock.patch.object(server, "_rd_get_locked")
+    def test_read_metrics_legacy_key_fallback(self, rd_get):
         """旧契约回退：新键形 miss 时 rd.get("打板指标", "20260105")（0.8.x 遗留数据）。"""
-        fake_rd = mock.Mock()
-        fake_rd.get.side_effect = [None, self._payload()]
+        rd_get.side_effect = [None, self._payload()]
 
         row = {"trade_date": "2026-01-05"}
-        server._attach_auction_metrics(row, fake_rd, "2026-01-05")
+        server._attach_auction_metrics(row, None, "2026-01-05")
 
         self.assertEqual(
-            fake_rd.get.call_args_list,
+            rd_get.call_args_list,
             [mock.call("打板指标:20260105", "metrics"),
              mock.call("打板指标", "20260105")],
         )
@@ -2521,13 +2521,13 @@ class _AuctionFastPathTests(unittest.TestCase):
                                (10.3 / 11.0 - 1) * 100)
         self.assertIn("竞价采集(source=tencent)", known_at)
 
-    def test_fast_path_engine_rd_legacy_keys(self):
+    @mock.patch.object(server, "_rd_get_locked")
+    def test_fast_path_engine_rd_legacy_keys(self, rd_get):
         """快速通道引擎通道：旧键形（表=打板指标，键=<date>）也能读（0.8.x 数据兼容）。"""
-        fake_rd = mock.Mock()
-        fake_rd.get.side_effect = [None, _AuctionKeyContractTests._daily_payload()]
+        rd_get.side_effect = [None, _AuctionKeyContractTests._daily_payload()]
         store = None
         with mock.patch.object(server, "_get_research_store", return_value=store), \
-             mock.patch.object(server.pybao_tools, "get_mydb_rd", return_value=fake_rd), \
+             mock.patch.object(server.pybao_tools, "get_mydb_rd", return_value=mock.Mock()), \
              mock.patch.object(server, "query_stock_list",
                                side_effect=AssertionError("不应拉全市场")), \
              mock.patch.object(server, "query_daily_kline",
@@ -2537,8 +2537,8 @@ class _AuctionFastPathTests(unittest.TestCase):
 
         self.assertTrue(result["cache_hit"])
         self.assertEqual(result["days"][0]["matched_count"], 57)
-        fake_rd.get.assert_any_call("打板指标:20260105", "metrics")
-        fake_rd.get.assert_any_call("打板指标", "20260105")
+        rd_get.assert_any_call("打板指标:20260105", "metrics")
+        rd_get.assert_any_call("打板指标", "20260105")
 
 
 if __name__ == "__main__":
