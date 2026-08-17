@@ -261,11 +261,18 @@ class SqliteResearchStore(ResearchStore):
             # 已存在 → VACUUM 失败被静默吞掉）；追加 uuid 后缀保证唯一
             unique = uuid4().hex[:8]
             target = backup_dir / f"research-{stamp}-{unique}.db"
-            conn = self._connect()
-            with self._lock:
-                # 0.9.11：路径经单引号转义后拼 SQL（DATA_DIR 含引号不再破坏语句）
+            # 0.9.12：独立连接执行 VACUUM INTO——此前在主连接 self._lock 内执行，
+            # 复制全库期间（NAS 磁盘慢时数十秒）全部 SQLite 业务（MCP 快速通道
+            # read_metrics/read_snapshots 等）被锁阻塞 → 请求排队 → webui 假死。
+            # 独立连接由 SQLite 文件级锁（WAL 模式在线备份）保证一致性，不占业务锁。
+            conn = sqlite3.connect(str(self._path), timeout=5.0)
+            try:
+                conn.execute("PRAGMA busy_timeout=5000")
+                # 路径经单引号转义后拼 SQL（DATA_DIR 含引号不再破坏语句）
                 sql = f"VACUUM INTO '{str(target).replace(chr(39), chr(39) * 2)}'"
                 conn.execute(sql)
+            finally:
+                conn.close()
             # 保留最近 BACKUP_KEEP 份
             backups = sorted(backup_dir.glob("research-*.db"))
             for old in backups[:-BACKUP_KEEP]:
