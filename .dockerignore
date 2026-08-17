@@ -11,3 +11,6 @@ README.md
 pyproject.toml
 uv.lock
 .python-version
+# 0.9.10：本地遗留旧 webui 目录（0.8.x 未跟踪残留）与前端依赖不进构建上下文
+docker/webui
+stockdb-ai/spa/node_modules

@@ -104,8 +104,8 @@ except ImportError:  # 防御：与 pybao_tools=None 同语义，相关工具返
 
 PROTOCOL_VERSION = "2025-06-18"
 SERVER_NAME = "stockdb-native"
-# 0.8.16：与 WEBUI_VERSION 同步（此前硬编码 0.1.0，与仓库 tag 脱节）
-SERVER_VERSION = "0.8.16"
+# 与 WEBUI_VERSION 同步（stockdb-ai/config.py；0.9.10 起手工对齐）
+SERVER_VERSION = "0.9.10"
 
 DEFAULT_HOST = "100.66.1.1"
 DEFAULT_PORT = 7899
@@ -740,6 +740,52 @@ def _parse_yyyymmdd(value: str, *, field: str) -> datetime:
         raise ValueError(f"{field} 必须是 8 位日期 YYYYMMDD") from exc
 
 
+def _classify_empty_codes(empty_codes: list[str], end_compact: str) -> dict:
+    """空代码（区间内无任何日K）分类：停牌 / 退市未上市 / 未发布 / 无法分类。
+
+    复用 query_point_snapshot 的单日时点判定（universe 归属 + bar 有无）：
+      - ERROR_NO_DATA（无 bar 但在股票池）→ "suspended"（停牌/长期停牌，不否决）
+      - ERROR_INVALID_SYMBOL（不在股票池）→ "delisted_or_not_listed"（不否决）
+      - ERROR_NOT_PUBLISHED（时点未发布）→ "not_published"（否决：候选识别不完整）
+      - TRADED（当日有 bar 但区间无 → 矛盾）/ 请求失败 → "unclassified"（否决：
+        可能是真实采集失败，保守按影响处理）
+    探测日 = 区间最后交易日（nearest_trading_day 兜底，避免 end 为非交易日报错）。
+    分批 200（query_point_snapshot 上限）；任一异常 → 全部 unclassified（保守）。
+    """
+    breakdown: dict[str, list[str]] = {
+        "suspended": [], "delisted_or_not_listed": [],
+        "not_published": [], "unclassified": [],
+    }
+    probe = calendar_xshg.nearest_trading_day(end_compact) or end_compact
+    try:
+        for i in range(0, len(empty_codes), _POINT_SNAPSHOT_CODES_MAX):
+            chunk = empty_codes[i:i + _POINT_SNAPSHOT_CODES_MAX]
+            res = query_point_snapshot({"date": probe, "codes": chunk, "limit": 0})
+            traded_codes = {str(p.get("code")) for p in (res.get("points") or [])}
+            seen: set[str] = set()
+            for err in (res.get("errors") or []):
+                code = str(err.get("symbol") or "")
+                if not code or code in seen:
+                    continue
+                seen.add(code)
+                kind = err.get("code")
+                if kind == ERROR_INVALID_SYMBOL:
+                    breakdown["delisted_or_not_listed"].append(code)
+                elif kind == ERROR_NOT_PUBLISHED:
+                    breakdown["not_published"].append(code)
+                elif kind == ERROR_NO_DATA:
+                    breakdown["suspended"].append(code)
+                else:
+                    breakdown["unclassified"].append(code)
+            for code in chunk:
+                if code in traded_codes and code not in seen:
+                    breakdown["unclassified"].append(code)
+    except Exception:  # noqa: BLE001 - 分类失败：全部保守按未分类（不改变"影响"语义）
+        breakdown = {"suspended": [], "delisted_or_not_listed": [],
+                     "not_published": [], "unclassified": list(empty_codes)}
+    return breakdown
+
+
 def query_fullmarket_daily_snapshot(
     start: str,
     end: str,
@@ -880,13 +926,27 @@ def query_fullmarket_daily_snapshot(
             partial_reasons.append("TARGET_UNIVERSE_MISMATCH")
         if failed:
             partial_reasons.append("SOURCE_REQUEST_FAILED")
+        # 0.9.10：空代码分类（停牌/退市未上市不否决；真实失败/未发布/无法分类才否决）
+        empty_breakdown: dict[str, list[str]] | None = None
+        fatal_empty_codes: list[str] = []
         if empty_codes:
-            partial_reasons.append("EMPTY_CODE_UNCLASSIFIED")
+            empty_breakdown = _classify_empty_codes(empty_codes, end)
+            fatal_empty_codes = list(empty_breakdown["unclassified"]) + list(
+                empty_breakdown["not_published"])
+            if empty_breakdown["suspended"]:
+                partial_reasons.append("EMPTY_SUSPENDED")
+            if empty_breakdown["delisted_or_not_listed"]:
+                partial_reasons.append("EMPTY_DELISTED_OR_NOT_LISTED")
+            if fatal_empty_codes:
+                partial_reasons.append("EMPTY_CODE_UNCLASSIFIED")
         if point_in_time_state_unknown_codes:
             partial_reasons.append("POINT_IN_TIME_STATE_UNKNOWN")
+        # 双覆盖率拆分（P2）：候选识别覆盖率（failed + 致命空代码）决定正式可用性；
+        # 样本覆盖率（缺价）不否决，由 days 行 missing_open_count / 信封 sample_coverage 呈现
+        candidate_coverage_complete = not failed and not fatal_empty_codes
         formal_usable = (
             not scope_is_partial
-            and coverage_is_complete
+            and candidate_coverage_complete
             and not point_in_time_state_unknown_codes
         )
         metadata = {
@@ -899,6 +959,12 @@ def query_fullmarket_daily_snapshot(
             "raw_row_count": raw_row_count,
             "scope_is_partial": scope_is_partial,
             "coverage_is_complete": coverage_is_complete,
+            "candidate_coverage": {
+                "complete": candidate_coverage_complete,
+                "failed_count": len(failed),
+                "empty_count": len(empty_codes),
+            },
+            "empty_code_breakdown": empty_breakdown or {},
             "partial_reasons": partial_reasons,
             "formal_usable": formal_usable,
             "is_partial": scope_is_partial,
@@ -913,15 +979,40 @@ def query_fullmarket_daily_snapshot(
         return snapshot, metadata
 
 
-# === 打板开盘溢价：mydb 竞价快照双源合并（0.7.0 任务E，仅本文件内私有函数） ===
+# === 打板开盘溢价：研究成果预计算 + 竞价快照双源合并（0.7.0 任务E；0.9.10 键契约修正） ===
 # 键契约（docs/design/auction-collector.md §2，命名空间保留前缀，本文件只读）：
-#   竞价快照:<YYYYMMDD>:<code> → JSON（表=竞价快照，键=<YYYYMMDD>:<code>）
-#   打板指标:<YYYYMMDD>        → JSON（表=打板指标，键=<YYYYMMDD>）
-# 读写通道复用 pybao_tools.get_mydb_rd（与 get_mydb_data 工具同一条 rd 连接，
-# 前缀通配用法一致）；缺失/不可达时静默降级为纯日K 口径，不影响既有行为。
+#   写端（services/auction_tasks + storage.research_store）：
+#     竞价快照:<YYYYMMDD>（表） + <code>（键）     → 快照 JSON
+#     打板指标:<YYYYMMDD>（表） + metrics（键）    → 指标载荷（含 daily 完整日级行）
+#     打板序列:<metric>（表）   + series（键）      → 滚动序列
+#   读端双通道（顺序）：
+#     ① research_store（0.9.5 抽象，写端同源：默认 SqliteResearchStore / mydb 回滚适配）
+#     ② 引擎 mydb rd 直读（兼容 0.8.x 遗留数据；新契约 打板指标:<date>/metrics，
+#        旧契约 打板指标/<date> 双键形回退）
+# 缺失/不可达时静默降级为纯日K 口径，不影响既有行为。
 _AUCTION_SNAPSHOT_TABLE = "竞价快照"  # mydb 表名（保留前缀，文档约定 AI 勿写）
 _AUCTION_METRICS_TABLE = "打板指标"   # mydb 表名（当日业务指标 + 60 日分位）
 _AUCTION_KNOWN_AT_DEFAULT_TIME = "09:26"  # 采集任务定时点（快照 timestamps 缺失时兜底）
+
+_store_cache: object | None = None  # research_store 惰性缓存（写端同源读取通道）
+
+
+def _get_research_store() -> object | None:
+    """惰性获取写端同源的 ResearchStore（0.9.5 抽象）；不可用 → None（不抛异常）。
+
+    stockdb_mcp_server 与 app.py 同进程部署时（容器 /mcp 路由），与采集器共享
+    同一仓储实现；独立进程（stdio/--http）部署时通过防御性导入读取同一
+    DATA_DIR/research.db（SQLite WAL 支持多进程读）。
+    """
+    global _store_cache
+    if _store_cache is not None:
+        return _store_cache
+    try:
+        from storage.research_factory import get_research_store
+        _store_cache = get_research_store()
+    except Exception:  # noqa: BLE001 - 仓储不可用：回退引擎 mydb 通道
+        _store_cache = None
+    return _store_cache
 
 
 def _auction_value_to_dict(value: object) -> dict | None:
@@ -960,45 +1051,77 @@ def _auction_float(value: object) -> float | None:
 
 
 def _read_auction_snapshots(
-    rd: object, start_iso: str, end_iso: str
+    rd: object, start_iso: str, end_iso: str, store: object | None = None
 ) -> tuple[dict[str, dict[str, dict]], bool]:
-    """读 mydb 竞价快照表 → ({date_iso: {code: snapshot}}, read_ok)。
+    """读竞价快照 → ({date_iso: {code: snapshot}}, read_ok)。
 
-    键形 "竞价快照:<YYYYMMDD>:<code>"：rd.keys 枚举后本地按日期段过滤区间，
-    避免对区间内每个交易日各发一次网络请求；兼容 rd.keys 返回含表名前缀的形态。
-    单键解析失败跳过（部分股票失败不影响整体）。read_ok=False 表示表级读取失败
+    双通道（0.9.10 键契约修正）：
+    ① research_store（写端同源：SqliteResearchStore 逐日读 / MydbResearchStore 适配）；
+    ② 引擎 mydb rd（keys 前缀枚举 + 精确键形 get，兼容 0.8.x 遗留数据）。
+    单键解析失败跳过（部分股票失败不影响整体）。read_ok=False 表示两通道均不可读
     （连接/权限），调用方据此不得判定"未采集"（避免误报）。
     """
-    try:
-        raw_keys = list(rd.keys(_AUCTION_SNAPSHOT_TABLE, "*") or [])
-    except Exception:  # noqa: BLE001 - mydb 不可达：整体降级，不抛错
-        return {}, False
     snapshots_by_date: dict[str, dict[str, dict]] = {}
-    for raw_key in raw_keys:
-        sub = str(raw_key)
-        # 兼容两种 keys 形态：含表名前缀（"竞价快照:20260817:600001"）或纯键
-        if sub.startswith(_AUCTION_SNAPSHOT_TABLE + ":"):
-            sub = sub[len(_AUCTION_SNAPSHOT_TABLE) + 1:]
-        parts = sub.split(":")
-        # 日期段 = 8 位数字段；缺失或非 "<日期>:<代码>" 形态的键跳过
-        date_seg = next((p for p in parts if len(p) == 8 and p.isdigit()), None)
-        if date_seg is None or len(parts) < 2:
-            continue
-        date_iso = f"{date_seg[:4]}-{date_seg[4:6]}-{date_seg[6:]}"
-        if not start_iso <= date_iso <= end_iso:
-            continue  # 只合并查询区间内的快照日期，days 信封区间不变量不变
-        code_seg = next((p for p in parts if p != date_seg), None)
-        if code_seg is None:
-            continue
+    read_ok = False
+
+    # ① research_store 通道（写端同源；日历枚举区间内交易日逐日读）
+    if store is not None:
         try:
-            value = rd.get(_AUCTION_SNAPSHOT_TABLE, sub)
-        except Exception:  # noqa: BLE001 - 单键读取失败不影响其余
-            continue
-        snap = _auction_value_to_dict(value)
-        if snap is None:
-            continue
-        snapshots_by_date.setdefault(date_iso, {})[code_seg] = snap
-    return snapshots_by_date, True
+            store_days = calendar_xshg.trading_days_between(
+                start_iso.replace("-", ""), end_iso.replace("-", ""))
+            for d8 in store_days:
+                rows = store.read_snapshots(d8) or {}
+                if not rows:
+                    continue
+                date_iso = f"{d8[:4]}-{d8[4:6]}-{d8[6:]}"
+                snapshots_by_date[date_iso] = {
+                    str(code): snap for code, snap in rows.items()
+                    if isinstance(snap, dict)
+                }
+            read_ok = True  # store 通道成功（可能无数据 → 正常"未采集"结论）
+        except Exception:  # noqa: BLE001 - store 通道失败：回退引擎通道
+            pass
+
+    # ② 引擎 mydb 通道（0.8.x 遗留数据兼容）
+    if rd is not None:
+        try:
+            raw_keys = list(rd.keys(_AUCTION_SNAPSHOT_TABLE, "*") or [])
+        except Exception:  # noqa: BLE001 - mydb 不可达
+            raw_keys = []
+        if raw_keys:
+            read_ok = True
+        for raw_key in raw_keys:
+            sub = str(raw_key)
+            # 兼容两种 keys 形态：含表名前缀（"竞价快照:20260817:600001"）或纯键
+            if sub.startswith(_AUCTION_SNAPSHOT_TABLE + ":"):
+                sub = sub[len(_AUCTION_SNAPSHOT_TABLE) + 1:]
+            parts = sub.split(":")
+            # 日期段 = 8 位数字段；缺失或非 "<日期>:<代码>" 形态的键跳过
+            date_seg = next((p for p in parts if len(p) == 8 and p.isdigit()), None)
+            if date_seg is None or len(parts) < 2:
+                continue
+            date_iso = f"{date_seg[:4]}-{date_seg[4:6]}-{date_seg[6:]}"
+            if not start_iso <= date_iso <= end_iso:
+                continue  # 只合并查询区间内的快照日期，days 信封区间不变量不变
+            code_seg = next((p for p in parts if p != date_seg), None)
+            if code_seg is None:
+                continue
+            value = None
+            try:  # 新契约精确键形：表=竞价快照:<date>，键=code
+                value = rd.get(f"{_AUCTION_SNAPSHOT_TABLE}:{date_seg}", code_seg)
+            except Exception:  # noqa: BLE001 - 单键读取失败不影响其余
+                value = None
+            if value is None:
+                try:  # 旧契约回退：表=竞价快照，键=<date>:<code>
+                    value = rd.get(_AUCTION_SNAPSHOT_TABLE, sub)
+                except Exception:  # noqa: BLE001 - 单键读取失败不影响其余
+                    continue
+            snap = _auction_value_to_dict(value)
+            if snap is None:
+                continue
+            # store 通道已读到的日期以 store 为准（写端同源）；引擎仅补缺
+            snapshots_by_date.setdefault(date_iso, {})[code_seg] = snap
+    return snapshots_by_date, read_ok
 
 
 def _merge_auction_day_row(
@@ -1064,7 +1187,38 @@ def _merge_auction_day_row(
     return summarize_board_open_effect_values(trade_date_iso, values, counts, sample_codes)
 
 
-def _attach_auction_metrics(row: dict, rd: object, date_iso: str) -> None:
+def _read_metrics_payload(rd: object, date_iso: str, store: object | None = None) -> dict | None:
+    """读 打板指标:<日期> 指标载荷（含 daily 子载荷；0.9.10 键契约修正）。
+
+    双通道：① research_store（写端同源）；② 引擎 mydb rd 双键形——新契约
+    （表=打板指标:<date>，键=metrics）优先，旧契约（表=打板指标，键=<date>）回退。
+    缺失/损坏 → None（调用方按"无预计算"处理，不抛错）。
+    """
+    date_compact = date_iso.replace("-", "")
+    if store is not None:
+        try:
+            payload = store.read_metrics(date_compact)
+            if isinstance(payload, dict) and isinstance(payload.get("metrics"), dict):
+                return payload
+        except Exception:  # noqa: BLE001 - store 通道失败：回退引擎
+            pass
+    if rd is None:
+        return None
+    for table, key in (
+        (f"{_AUCTION_METRICS_TABLE}:{date_compact}", "metrics"),  # 新契约（写端键形）
+        (_AUCTION_METRICS_TABLE, date_compact),                   # 旧契约（0.8.x 遗留）
+    ):
+        try:
+            payload = _auction_value_to_dict(rd.get(table, key))
+        except Exception:  # noqa: BLE001 - 单键读取失败不影响其余
+            continue
+        if payload and isinstance(payload.get("metrics"), dict):
+            return payload
+    return None
+
+
+def _attach_auction_metrics(row: dict, rd: object, date_iso: str,
+                            store: object | None = None) -> None:
     """打板指标:<日期> 存在时，当日行附 metrics 字段（指标载荷平铺，原样透传）。
 
     载荷键契约（auction_metrics.build_metrics_payload）：metrics{premium_mean,
@@ -1072,12 +1226,8 @@ def _attach_auction_metrics(row: dict, rd: object, date_iso: str) -> None:
     strength_60d{premium_mean, success_rate} + window + value_source；
     n_samples 兼容"顶层也冗余一份"的两种写库形态。
     """
-    try:
-        value = rd.get(_AUCTION_METRICS_TABLE, date_iso.replace("-", ""))
-    except Exception:  # noqa: BLE001 - 指标读失败不阻塞主结果
-        return
-    payload = _auction_value_to_dict(value)
-    if not payload or not isinstance(payload.get("metrics"), dict):
+    payload = _read_metrics_payload(rd, date_iso, store)
+    if not payload:
         return
     metrics = payload["metrics"]
     row["metrics"] = {
@@ -1089,6 +1239,46 @@ def _attach_auction_metrics(row: dict, rd: object, date_iso: str) -> None:
         "value_source": payload.get("value_source"),
         "window": payload.get("window"),
     }
+
+
+def _precomputed_row(rd: object, date_iso: str, store: object | None = None) -> dict | None:
+    """读 打板指标:<date> 的 daily 子载荷（完整日级行，0.9.10 起随指标持久化）。
+
+    无指标载荷或载荷无 daily → None（该日无预计算，须走日K 判定）。
+    """
+    payload = _read_metrics_payload(rd, date_iso, store)
+    if not payload:
+        return None
+    daily = payload.get("daily")
+    return daily if isinstance(daily, dict) else None
+
+
+def _row_from_daily(daily: dict, date_iso: str, include_distribution: bool) -> dict:
+    """预计算 daily 行 → 与日K 行同构的 days 行。
+
+    审计计数（BOARD_OPEN_COUNTER_FIELDS）在采集器侧不可得（清单口径），置 None
+    占位而非伪造 0；统计/分布/指标字段原样透传。
+    """
+    row = {field: None for field in BOARD_OPEN_COUNTER_FIELDS}
+    row.update(daily)
+    row["trade_date"] = row.get("trade_date") or date_iso
+    if not include_distribution:
+        row.pop("distribution", None)
+    return row
+
+
+def _precomputed_days(rd: object, start_iso: str, end_iso: str,
+                      store: object | None = None) -> dict[str, dict]:
+    """区间内全部有预计算 daily 行的交易日 → {date_iso: row}（日历枚举，与采集器同源）。"""
+    rows: dict[str, dict] = {}
+    for d8 in calendar_xshg.trading_days_between(
+        start_iso.replace("-", ""), end_iso.replace("-", "")
+    ):
+        date_iso = f"{d8[:4]}-{d8[4:6]}-{d8[6:]}"
+        row = _precomputed_row(rd, date_iso, store)
+        if row is not None:
+            rows[date_iso] = row
+    return rows
 
 
 def _auction_known_at(snapshots_by_date: dict[str, dict[str, dict]], date_iso: str) -> str | None:
@@ -1157,38 +1347,135 @@ def _overlay_day(days: list[dict], row: dict) -> None:
     days.append(row)
 
 
+def _precomputed_known_at(daily: dict, date_iso: str) -> str:
+    """预计算日信封标注：如 "20260817 09:25 预计算(auction)"。
+
+    时间取 daily.known_at（其次 computed_at）的 HH:MM；缺失用采集定时点兜底。
+    """
+    raw = daily.get("known_at") or daily.get("computed_at")
+    if isinstance(raw, str) and len(raw) >= 16:
+        hhmm = raw[11:16]  # "2026-08-17T09:25:00" → "09:25"
+    else:
+        hhmm = _AUCTION_KNOWN_AT_DEFAULT_TIME
+    source = daily.get("value_source") or "unknown"
+    return f"{date_iso.replace('-', '')} {hhmm} 预计算({source})"
+
+
 def _merge_auction_days(
     snapshot: dict[str, list[DailyBar]],
     days: list[dict],
     start_iso: str,
     end_iso: str,
     include_distribution: bool,
-) -> tuple[str | None, dict | None]:
-    """mydb 竞价快照双源合并主流程：就地改写 days，返回 (known_at, errors_note)。
+) -> tuple[str | None, dict | None, dict]:
+    """研究成果预计算 + 竞价快照双源合并主流程：就地改写 days。
 
-    - 有快照的日期：以"T-1 日K 判定 + 快照溢价"重组该日行（其余历史日期不动）；
-    - 打板指标:<日期> 存在 → 该日行附 metrics 字段；
-    - known_at：最近一个合并日期的采集证据标注；无合并 → None（历史口径保持现语义）；
-    - errors_note：当日未采集时给降级提示；mydb 不可读时不给（无法判定）。
+    返回 (known_at, errors_note, stats)：
+    - 有预计算 daily 行的日期：直接用完整日级行覆盖（写端同源，0.9.10）；
+    - 其余有快照的日期：以"T-1 日K 判定 + 快照溢价"重组该日行（现逻辑）；
+    - 打板指标:<日期> 存在 → 该日行附 metrics 字段（无 daily 时）；
+    - known_at：最近一个合并日期的来源标注；无合并 → None；
+    - errors_note：当日未采集时给降级提示；两通道均不可读时不给（无法判定）；
+    - stats：{"merged_dates": [...], "precomputed_dates": [...]}（信封覆盖统计）。
     """
     rd = pybao_tools.get_mydb_rd() if pybao_tools is not None else None
-    if rd is None:  # pybao 缺失：纯日K 口径，行为与现状完全一致
-        return None, None
-    snapshots_by_date, read_ok = _read_auction_snapshots(rd, start_iso, end_iso)
+    store = _get_research_store()
+    if rd is None and store is None:  # 两通道皆无：纯日K 口径，行为与现状完全一致
+        return None, None, {"merged_dates": [], "precomputed_dates": []}
+    snapshots_by_date, read_ok = _read_auction_snapshots(rd, start_iso, end_iso, store)
     merged_dates: list[str] = []
+    precomputed_dates: list[str] = []
+    known_at_by_date: dict[str, str] = {}
     for date_iso in sorted(snapshots_by_date):
-        row = _merge_auction_day_row(snapshot, date_iso, snapshots_by_date[date_iso])
-        if row is None:
-            continue  # T-1 无日K（区间首日等）：无法判定，跳过该快照日期
-        if not include_distribution:
-            row.pop("distribution", None)
-        _attach_auction_metrics(row, rd, date_iso)
+        daily = _precomputed_row(rd, date_iso, store)
+        if daily is not None:  # 预计算完整日级行优先（写端同源，无需 T-1 日K 判定）
+            row = _row_from_daily(daily, date_iso, include_distribution)
+            known_at_by_date[date_iso] = _precomputed_known_at(daily, date_iso)
+            precomputed_dates.append(date_iso)
+        else:
+            row = _merge_auction_day_row(snapshot, date_iso, snapshots_by_date[date_iso])
+            if row is None:
+                continue  # T-1 无日K（区间首日等）：无法判定，跳过该快照日期
+            if not include_distribution:
+                row.pop("distribution", None)
+            _attach_auction_metrics(row, rd, date_iso, store)
+            known_at_by_date[date_iso] = _auction_known_at(snapshots_by_date, date_iso)
         _overlay_day(days, row)
         merged_dates.append(date_iso)
+    stats = {"merged_dates": merged_dates, "precomputed_dates": precomputed_dates}
     if merged_dates:  # 合并存在 → 整体重排，保持 days 按交易日升序（信封不变量）
         days.sort(key=lambda item: item.get("trade_date", ""))
-        return _auction_known_at(snapshots_by_date, merged_dates[-1]), None
-    return None, _auction_missing_note(start_iso, end_iso, snapshots_by_date, read_ok)
+        return known_at_by_date.get(merged_dates[-1]), None, stats
+    return None, _auction_missing_note(start_iso, end_iso, snapshots_by_date, read_ok), stats
+
+
+def _fast_path_result(start_iso: str, end_iso: str, include_distribution: bool) -> dict | None:
+    """预计算全覆盖快速通道：区间内每个交易日都有 daily 行 → 直读返回。
+
+    - 不进入 _HEAVY_LOCK、不拉全市场日K（正常查询目标 <1s）；
+    - 任一交易日无预计算 → None（调用方走全市场重算慢路径）；
+    - 仅全市场默认请求适用（调用方保证 codes is None 且 limit == 0）。
+    """
+    rd = pybao_tools.get_mydb_rd() if pybao_tools is not None else None
+    store = _get_research_store()
+    if rd is None and store is None:
+        return None  # 两通道皆无：无预计算可读
+    trade_days = calendar_xshg.trading_days_between(
+        start_iso.replace("-", ""), end_iso.replace("-", ""))
+    if not trade_days:
+        return None  # 区间无交易日：走慢路径语义（快照判定产生空结果）
+    pre_rows: dict[str, dict] = {}
+    for d8 in trade_days:
+        date_iso = f"{d8[:4]}-{d8[4:6]}-{d8[6:]}"
+        row = _precomputed_row(rd, date_iso, store)
+        if row is None:
+            return None  # 任一交易日缺失 → 不全覆盖，走慢路径
+        pre_rows[date_iso] = row
+    days = []
+    latest_coverage: dict | None = None
+    latest_known_at: str | None = None
+    for d8 in trade_days:
+        date_iso = f"{d8[:4]}-{d8[4:6]}-{d8[6:]}"
+        daily = pre_rows[date_iso]
+        row = _row_from_daily(daily, date_iso, include_distribution)
+        days.append(row)
+        if isinstance(daily.get("coverage"), dict):
+            latest_coverage = daily["coverage"]
+        latest_known_at = _precomputed_known_at(daily, date_iso)
+    coverage = (latest_coverage or {}).get
+    sample_coverage = {
+        "codes_requested": coverage("codes_requested"),
+        "fetched": coverage("fetched"),
+        "fetch_errors": coverage("fetch_errors"),
+        "missing_open": coverage("missing_open"),
+        "n_samples": days[-1].get("matched_count"),
+        "complete": coverage("missing_open") == 0,
+    }
+    result = {
+        "source_name": "free-stockdb",
+        "source_contract_version": "board-open-effect-stockdb-v4.2",
+        "start": start_iso,
+        "end": end_iso,
+        "load_path": "mydb",
+        "cache_hit": True,
+        "precomputed_days": len(days),
+        "fallback_reason": None,
+        "sample_coverage": sample_coverage,
+        "methodology": {
+            "sample": "T-1沪深非ST、非一字板收盘涨停股（预计算清单口径）",
+            "one_word": "T-1 open=high=low=close=涨停价",
+            "limit_price": "前收×(1+10%/20%)，0.01元 ROUND_HALF_UP",
+            "value": "(T日开盘价/T-1收盘价-1)×100%",
+        },
+        "known_limitations": [
+            "预计算直读路径：样本集合 = 采集清单（T-1 非一字板涨停），"
+            "审计计数（涨停/排除/候选）在采集器侧不可得，置 null",
+        ],
+        "days": days,
+    }
+    if latest_known_at is not None:
+        result["known_at"] = latest_known_at  # 信封标注预计算来源（_derive_known_at 读取）
+    return result
 
 
 def query_board_open_effect_history(
@@ -1200,21 +1487,34 @@ def query_board_open_effect_history(
     workers: int = 16,
     include_distribution: bool = False,
 ) -> dict:
-    """基于 stockdb 全市场日 K 返回可审计的打板开盘溢价时序（0.7.0 双源合并版）。
+    """基于预计算结果 / 全市场日 K 返回可审计的打板开盘溢价时序（0.7.0 双源合并版）。
 
+    读取优先级（0.9.10 快速通道）：
+    - 区间内所有交易日都有预计算 daily 行（打板指标:<日期> 载荷，写端同源）→
+      直读返回（load_path=mydb, cache_hit=true，正常查询 <1s，不扫全市场）；
+    - 否则全市场日K 重算（load_path=kline，cache_hit=false），当日段仍用预计算/
+      快照覆盖（mydb+overlay），信封 fallback_reason 注明降级原因。
     双源合并（契约 docs/design/auction-collector.md §3）：
     - 历史日期（无竞价快照）：涨停判定 + 溢价全部从日K 计算（现逻辑，行为不变）；
-    - 当日段（mydb 存在 竞价快照:<日期>:*）：涨停判定仍用 T-1 日K，开盘溢价改用
+    - 当日段（存在 竞价快照:<日期>:*）：涨停判定仍用 T-1 日K，开盘溢价改用
       快照 open_price/prev_close（任一为 None/<=0 的样本剔除，计入 missing_open_count）；
     - 打板指标:<日期> 存在时，当日行附 metrics 字段（premium_mean/success_rate/
       n_samples/rank_60d/strength_60d/value_source/window，取自指标库载荷；
       strength_60d 为强弱标签 strong/weak/neutral，口径=此前 60 有效观测中
       严格低于当日值天数/60，不足 60 观测为 null）；
-    - 信封 known_at：当日段合并成功 → "<YYYYMMDD> <HH:MM> 竞价采集(source=<src>)"，
+    - 信封 known_at：预计算直读 → "<YYYYMMDD> <HH:MM> 预计算(<source>)"；
+      当日段合并成功 → "<YYYYMMDD> <HH:MM> 竞价采集(source=<src>)"；
       否则保持现语义（None）；
     - 降级：当日（<= 今天的最近交易日，且落在查询区间内）无快照 → 结果与历史口径
-      一致，errors 附一条 "当日竞价快照未采集"（mydb 读取失败时不下该结论）。
+      一致，errors 附一条 "当日竞价快照未采集"（两通道均不可读时不下该结论）。
     """
+    start_iso = _parse_yyyymmdd(start, field="start").date().isoformat()
+    end_iso = _parse_yyyymmdd(end, field="end").date().isoformat()
+    # 快速通道（_HEAVY_LOCK 之外）：预计算全覆盖 → 直读 mydb/SQLite
+    if codes is None and limit <= 0:
+        fast = _fast_path_result(start_iso, end_iso, include_distribution)
+        if fast is not None:
+            return fast
     with _HEAVY_LOCK:
         _notify_progress("snapshot_start")
         full_a_share_request = codes is None
@@ -1235,8 +1535,6 @@ def query_board_open_effect_history(
         )
         _notify_progress("snapshot_done")
         details = compute_board_open_effect_details(snapshot)
-        start_iso = _parse_yyyymmdd(start, field="start").date().isoformat()
-        end_iso = _parse_yyyymmdd(end, field="end").date().isoformat()
         days = []
         for trade_date, row in sorted(details.items()):
             if not start_iso <= trade_date <= end_iso:
@@ -1245,16 +1543,25 @@ def query_board_open_effect_history(
             if not include_distribution:
                 item.pop("distribution", None)
             days.append(item)
-        # 0.7.0：mydb 竞价快照双源合并（当日段溢价用采集表，历史段仍日K）
-        auction_known_at, auction_error = _merge_auction_days(
+        # 0.7.0：研究成果预计算 / 竞价快照双源合并（当日段用预计算或采集表，历史段仍日K）
+        auction_known_at, auction_error, merge_stats = _merge_auction_days(
             snapshot, days, start_iso, end_iso, include_distribution
         )
+        precomputed_dates = merge_stats.get("precomputed_dates") or []
         result = {
             "source_name": "free-stockdb",
-            "source_contract_version": "board-open-effect-stockdb-v4.1",
+            "source_contract_version": "board-open-effect-stockdb-v4.2",
             "start": start_iso,
             "end": end_iso,
             **metadata,
+            "load_path": "mydb+overlay" if precomputed_dates else "kline",
+            "cache_hit": False,
+            "precomputed_days": len(precomputed_dates),
+            "fallback_reason": (
+                None
+                if precomputed_dates
+                else "区间交易日无预计算结果，已全市场重算"
+            ),
             "methodology": {
                 "sample": "T-1沪深非ST、非一字板收盘涨停股",
                 "one_word": "T-1 open=high=low=close=涨停价",
@@ -1687,7 +1994,9 @@ TOOLS: list[dict] = [
         "name": "get_board_open_effect_history",
         "description": (
             "按交易日计算‘T-1非一字板收盘涨停股在T日开盘的溢价’。"
-            "默认遍历 stockdb 全市场，返回样本数、匹配数、成功率、均值和分位数。"
+            "预计算直读（0.9.10）：区间内交易日均有采集/收口预计算 → 直接返回 mydb/SQLite"
+            "结果（cache_hit=true，摘要<1s）；缺失时才全市场日K重算（cache_hit=false，"
+            "fallback_reason 注明）。返回样本数、匹配数、成功率、均值和分位数。"
             "codes/limit 仅用于调试，使用后 is_partial=true，不得当作市场结论。"
         ),
         "inputSchema": {

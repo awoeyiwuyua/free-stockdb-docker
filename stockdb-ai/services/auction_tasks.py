@@ -45,6 +45,7 @@ try:
     from core.auction_list import compute_limitup_list as _auction_compute_limitup_list
     from core.auction_metrics import (
         METRICS as AUCTION_METRICS,
+        build_daily_row as _auction_build_daily_row,
         compute_metrics as _auction_compute_metrics,
         load_series as _auction_load_series,
         append_series as _auction_append_series,
@@ -225,6 +226,16 @@ def auction_run_collect() -> dict:
         series_by = {m: _auction_load_series(_research_series_read, m) for m in AUCTION_METRICS}
         payload = _auction_build_payload(ok_items, series_by,
                                          computed_at=_now_iso(), value_source="auction")
+        # 0.9.10：完整日级结果随指标载荷一起持久化（daily 子载荷，MCP 快速通道直读；
+        #   含分布/计数/覆盖率/数据溯源，查询不再重扫全市场）
+        missing_open = sum(1 for s in ok_items
+                           if s.get("open_price") is None or s.get("prev_close") is None)
+        payload["daily"] = _auction_build_daily_row(
+            ok_items, payload,
+            trade_date=f"{today[:4]}-{today[4:6]}-{today[6:8]}",
+            known_at=f"{today[:4]}-{today[4:6]}-{today[6:8]}T09:25:00",
+            coverage={"codes_requested": len(codes), "fetched": len(ok_items),
+                      "fetch_errors": len(errors), "missing_open": missing_open})
         research_store.write_metrics(today, payload)
         log(f"📊 打板竞价采集（{today}）: {len(ok_items)} 只快照（errors={len(errors)}），"
             f"premium_mean={metrics.get('premium_mean')}, n={metrics.get('n_samples')}")
@@ -357,6 +368,12 @@ def auction_run_close() -> dict:
                 _research_series_read, _research_series_write, m, value, today)
         payload = _auction_build_payload(snapshots, series_by,
                                          computed_at=_now_iso(), value_source="kline")
+        # 0.9.10：K线权威版同样持久化 daily 子载荷（覆盖竞价版，含缺价守恒计数）
+        payload["daily"] = _auction_build_daily_row(
+            snapshots, payload,
+            trade_date=f"{today[:4]}-{today[4:6]}-{today[6:8]}",
+            coverage={"codes_requested": len(codes), "fetched": len(snapshots),
+                      "fetch_errors": 0, "missing_open": missing_open})
         research_store.write_metrics(today, payload)
         log(f"📊 打板收口对账（{today}）: 明日清单 {len(listing.get('codes') or [])} 只，"
             f"对账 {reconciled} 条（偏差告警 {diff_alerts}），"

@@ -38,15 +38,13 @@ def list_key(trade_date: str) -> str:
     return f"清单:{trade_date}:{LIST_NAME}"
 
 
-def compute_metrics(snapshots: list[dict]) -> dict:
-    """快照列表 → 当日业务指标。
+def _premiums_from_snapshots(snapshots: list[dict]) -> list[tuple[float, str]]:
+    """快照列表 → 有效样本 [(溢价小数, code), ...]（compute_metrics/build_daily_row 共用）。
 
-    snapshots 每项 {code, open_price, prev_close}（open_price/prev_close 为 None 的剔除）。
-    溢价 = open_price/prev_close - 1。
-    返回 {"premium_mean": float|None, "success_rate": float|None, "n_samples": int}
-    （n_samples=0 → 两指标均为 None）
+    剔除规则与 compute_metrics 完全一致：open_price/prev_close 任一缺失、非数值、
+    prev_close<=0 的样本跳过；脏数据防御不炸整批。
     """
-    premiums = []  # 只收集溢价可算的样本，一次循环同时产出均值与成功率
+    out: list[tuple[float, str]] = []
     for s in snapshots or []:
         open_price = s.get("open_price")
         prev_close = s.get("prev_close")
@@ -59,7 +57,19 @@ def compute_metrics(snapshots: list[dict]) -> dict:
             continue  # 脏数据防御：非数值样本跳过，而不是让整批指标崩溃
         if p <= 0:
             continue  # 昨收必须为正，否则除零/负昨收会让溢价失真
-        premiums.append(o / p - 1.0)  # 溢价 = open/prev - 1
+        out.append((o / p - 1.0, str(s.get("code") or "")))  # 溢价 = open/prev - 1
+    return out
+
+
+def compute_metrics(snapshots: list[dict]) -> dict:
+    """快照列表 → 当日业务指标。
+
+    snapshots 每项 {code, open_price, prev_close}（open_price/prev_close 为 None 的剔除）。
+    溢价 = open_price/prev_close - 1。
+    返回 {"premium_mean": float|None, "success_rate": float|None, "n_samples": int}
+    （n_samples=0 → 两指标均为 None）
+    """
+    premiums = [p for p, _ in _premiums_from_snapshots(snapshots)]
     n_samples = len(premiums)
     if n_samples == 0:
         # 无有效样本：指标置 None，让上层分位/展示明确知道"今日算不出"
@@ -207,3 +217,66 @@ def build_metrics_payload(snapshots: list[dict], series_by_metric: dict[str, lis
         "value_source": value_source,
         "contract": METRIC_CONTRACT,
     }
+
+
+def _nearest_rank(values: list[float], fraction: float) -> float | None:
+    """分位数近似（与 mcp.board_metrics 同构：排序后按最近秩取）。"""
+    if not values:
+        return None
+    ordered = sorted(values)
+    return ordered[round((len(ordered) - 1) * fraction)]
+
+
+def build_daily_row(snapshots: list[dict], payload: dict, *,
+                    coverage: dict | None = None, known_at: str | None = None,
+                    trade_date: str | None = None) -> dict:
+    """组装「打板指标:<日期>」的 daily 子载荷（完整日级行，供 MCP 快速通道直读）。
+
+    行结构与 mcp.board_metrics.summarize_board_open_effect_values 同构（计数/正平负/
+    成功率/均值/分位数/分布），另附指标载荷的 metrics/rank_60d/strength_60d 与
+    数据溯源。分布与百分比字段口径 = 日K 行（×100 百分数），与竞价版 metrics
+    （小数）并存不冲突。coverage 记录清单请求/采集覆盖（候选数、缺价数）。
+    """
+    premiums = _premiums_from_snapshots(snapshots)          # [(小数, code), ...]
+    values_pct = [round(p * 100, 6) for p, _ in premiums]   # 与日K 行同构（百分数）
+    sample_codes = sorted(code for _, code in premiums if code)
+    positive = sum(1 for v in values_pct if v > 0)
+    flat = sum(1 for v in values_pct if abs(v) < 1e-12)
+    negative = sum(1 for v in values_pct if v < 0)
+    metrics = payload.get("metrics") if isinstance(payload.get("metrics"), dict) else {}
+    row: dict = {
+        "matched_count": len(values_pct),
+        "positive_count": positive,
+        "flat_count": flat,
+        "negative_count": negative,
+        "success_rate": positive / len(values_pct) if values_pct else None,
+        "average_open_return_pct": sum(values_pct) / len(values_pct) if values_pct else None,
+        "p10_open_return_pct": _nearest_rank(values_pct, 0.10),
+        "p25_open_return_pct": _nearest_rank(values_pct, 0.25),
+        "median_open_return_pct": _nearest_rank(values_pct, 0.50),
+        "p75_open_return_pct": _nearest_rank(values_pct, 0.75),
+        "p90_open_return_pct": _nearest_rank(values_pct, 0.90),
+        "distribution": {
+            "open_return_pct": sorted(values_pct),
+            "sample_codes": sample_codes,
+        },
+        "metrics": {
+            "premium_mean": metrics.get("premium_mean"),
+            "success_rate": metrics.get("success_rate"),
+            "n_samples": metrics.get("n_samples", payload.get("n_samples")),
+        },
+        "rank_60d": payload.get("rank_60d"),
+        "strength_60d": payload.get("strength_60d"),
+        "window": payload.get("window"),
+        "n_samples": metrics.get("n_samples", payload.get("n_samples")),
+        "computed_at": payload.get("computed_at"),
+        "value_source": payload.get("value_source"),
+        "contract": METRIC_CONTRACT,
+    }
+    if coverage is not None:
+        row["coverage"] = coverage
+    if known_at is not None:
+        row["known_at"] = known_at
+    if trade_date is not None:
+        row["trade_date"] = trade_date
+    return row

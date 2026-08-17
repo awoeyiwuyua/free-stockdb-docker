@@ -24,7 +24,7 @@ STOCKDB_PAUSE: Path = Path(os.environ.get("STOCKDB_PAUSE_FLAG", "/data/.stockdb-
 STOCKDB_LOG_FILE: Path = Path(os.environ.get("STOCKDB_LOG_FILE", "/data/log.txt"))
 
 # 版本号（发布物标识，见 docs/webui-spa/release-policy.md）
-WEBUI_VERSION: str = "0.9.9"
+WEBUI_VERSION: str = "0.9.10"
 
 # ---- 打板调度触发点（HH:MM，非法值回退默认） ----
 # 独立函数保留（0.9.2 随调度模块归位）；默认值与历史行为一致
