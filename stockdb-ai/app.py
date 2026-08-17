@@ -1830,6 +1830,14 @@ class _BoundedHTTPServer(ThreadingHTTPServer):
 
 
 def main():
+    # 0.9.13：注册 SIGUSR1 → 全部线程栈转储到 stderr（docker logs 可见）。
+    # 冻结/卡顿时执行 docker exec stockdb sh -c 'kill -USR1 $(pgrep -f "python /opt/webui/app.py")'
+    # 即可定位卡点（如 C 扩展帧/锁等待），无需重启进程。
+    try:
+        import faulthandler
+        faulthandler.register(signal.SIGUSR1, all_threads=True)
+    except Exception:  # noqa: BLE001 - 转储能力缺失不影响主流程
+        pass
     _wire_auction_tasks()  # 组合根：服务层依赖注入（0.9.2 批次 4）
     print(f"webui listening on 0.0.0.0:{LISTEN_PORT}", file=sys.stderr)
     print(f"stockdb: {STOCKDB_HOST}:{STOCKDB_PORT}（同容器进程）| data: {DATA_DIR}", file=sys.stderr)

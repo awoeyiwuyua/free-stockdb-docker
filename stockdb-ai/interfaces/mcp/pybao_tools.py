@@ -46,20 +46,17 @@ from pathlib import Path
 _zhibiao: object | None = None
 _load_error: str | None = None  # 最近一次加载失败原因（诊断用）
 
-# pybao 调用串行化锁：stock_sdk 的惰性连接初始化（_default_client 懒建）与
-# C 扩展调用不做并发假设，webui 的 ThreadingHTTPServer 每请求一线程，
-# 全部 pybao 业务调用持锁执行。
-_PYBAO_LOCK = threading.Lock()
-
-# 0.9.11：rd 连接访问锁（get_mydb_rd 返回的 raw rd 单连接非线程安全，2026-08-16
-# 协议帧交错全进程冻结事故）。同进程容器部署时与 app 侧
-# storage/providers/mydb_store._rd_lock 共用同一把锁（stock_sdk.init 全局绑定
-# 端点，两处很可能是同一底层连接，必须全进程串行化）；独立进程（stdio/--http
-# MCP）storage 包不可导入时回退本模块自带锁。
+# 0.9.13：pybao 调用与 rd 访问统一同一把锁——zhibiao.jisuan（指标计算）与
+# rd.get/rd.keys 复用同一引擎 socket（zhibiao.rd / get_default_raw_rd 同源），
+# 两把锁分别串行仍会并发帧交错（2026-08-16 事故：协议帧交错 → C 扩展持 GIL →
+# 全进程冻结 → 线程不释放 → RAM 膨胀）。必须全进程一把锁。
+# 同进程容器部署时与 app 侧 storage/providers/mydb_store._rd_lock 共用同一把锁；
+# 独立进程（stdio/--http MCP）storage 包不可导入时回退本模块自带锁。
 try:  # noqa: E402 - 同进程容器：与 app 侧共享同一把 rd 锁
     from storage.providers.mydb_store import _rd_lock as _RD_LOCK
 except Exception:  # noqa: BLE001 - 独立进程部署：storage 包不在 sys.path
     _RD_LOCK = threading.Lock()
+_PYBAO_LOCK = _RD_LOCK  # 指标计算与 mydb 读写同锁互斥（防帧交错）
 
 
 def rd_get(table: str, key: str) -> object | None:
