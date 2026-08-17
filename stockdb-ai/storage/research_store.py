@@ -207,6 +207,17 @@ class SqliteResearchStore(ResearchStore):
                 parts = table_full.split(":")
                 if len(parts) < 3:
                     continue
+                # 0.9.12：仅补缺失——SQLite 已存在的键（0.9.11+ 新采集，payload 含
+                # daily 子载荷等新字段）不覆盖；此前 INSERT OR REPLACE 会把新数据
+                # 覆盖回旧载荷，daily/覆盖率字段永久丢失
+                if kind == "metrics" and self.read_metrics(parts[1]) is not None:
+                    continue
+                if kind == "series" and self.read_series(parts[1]) is not None:
+                    continue
+                if kind == "lists" and self.read_list(parts[1]) is not None:
+                    continue
+                if kind == "snapshots" and parts[2] in self.read_snapshots(parts[1]):
+                    continue
                 try:
                     # 0.9.11：持 _rd_lock 访问（与 _mydb_rd_keys 同语义）
                     with _mydb._rd_lock:
