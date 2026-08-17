@@ -19,6 +19,10 @@
 - **mydb_read 全表列取连续持锁**：500 键逐键 get 持 `_rd_lock` 全程（引擎慢时
   25s+），MCP 快速通道/打板任务等全部 rd 访问排队 → 改细粒度持锁（keys 一次、
   逐键各一次），面板展示对中间态不敏感
+- **旧研究成果导入**：0.9.5 存储迁移（引擎 mydb → /data/research.db）后旧数据
+  不自动导入，打板序列（60 日分位分母）从零积累约 60 个交易日——
+  `migrate_from_engine` 改**仅补缺失**（不覆盖 0.9.11+ 新采集含 daily 的载荷），
+  新增 `POST /api/research/migrate` 入口（幂等可重跑）
 
 本地压力实测：100 并发 /api/status 全部 200 快速完成、0 tracebacks。
 Python 295 全绿。
