@@ -11,6 +11,7 @@ import importlib
 import json
 import sys
 import threading
+import time  # 0.9.14：mydb_tables 30s 缓存
 
 import config  # 模块引用（config.STOCKDB_HOST/PORT 动态读取，测试 patch 生效）
 
@@ -193,21 +194,40 @@ def mydb_read(table: str, key: str = "") -> dict:
     return {"table": table, "keys": keys, "values": values}
 
 
+# 业务命名空间前缀（0.9.14：mydb_tables 弃用 keys("*") 全库扫描——引擎全库枚举
+# 数十万键、持 _rd_lock 数十秒，面板点击即卡死全站 rd；research_store 已明令
+# 禁止 keys("*")。改逐前缀枚举，覆盖实际使用的表空间）
+_MYDB_TABLE_PREFIXES = ("hk日k", "打板指标", "竞价快照", "打板序列", "清单", "自定义")
+
+_tables_cache: dict = {"at": 0.0, "val": None}  # 30s 缓存：面板 4s 轮询不重复扫描
+
+
 def mydb_tables() -> list[str]:
-    """列出自定义表名（含保留表前缀过滤）。0.8.10：rd.keys 持锁 + 异常自愈。"""
-    with _rd_lock:
-        try:
-            rd = _mydb_rd()
-            keys = rd.keys("*") or []
-        except Exception:
-            _mydb_rd_reset()
-            raise
-    tables = set()
-    for k in keys:
-        table = str(k).split(":")[0] if ":" in str(k) else str(k)
-        if table and not any(table.startswith(r) for r in _RESERVED_TABLES):
-            tables.add(table)
-    return sorted(tables)
+    """列出自定义表名（业务命名空间前缀枚举）。
+
+    0.9.14：弃用 rd.keys("*") 全库扫描（引擎串行处理全库枚举极慢且持 _rd_lock
+    阻塞全部 rd 访问——面板 mydb 页点击即全站卡顿）；改对已知业务前缀逐前缀
+    keys(prefix, "*")（单前缀枚举毫秒级），30s 缓存防 4s 轮询重复扫描。
+    命名空间之外的 AI 自定义表不在列表（引擎无廉价的全库枚举手段）。
+    """
+    now = time.time()
+    if _tables_cache["val"] is not None and now - _tables_cache["at"] < 30:
+        return _tables_cache["val"]
+    tables: set[str] = set()
+    for prefix in _MYDB_TABLE_PREFIXES:
+        with _rd_lock:
+            try:
+                rd = _mydb_rd()
+                keys = rd.keys(prefix, "*") or []
+            except Exception:  # noqa: BLE001 - 单前缀失败不影响其余（不重置连接：前缀不存在可能报错）
+                continue
+        for k in keys:
+            table = str(k).split(":")[0] if ":" in str(k) else str(k)
+            if table and not any(table.startswith(r) for r in _RESERVED_TABLES):
+                tables.add(table)
+    result = sorted(tables)
+    _tables_cache.update(at=now, val=result)
+    return result
 
 
 # ---- 打板序列薄封装（0.9.2 批次 3 迁入；读/写链路由 services 层注入） ----
