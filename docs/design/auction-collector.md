@@ -59,15 +59,28 @@
 emotion-v1：窗口 60、rank∈[0,1] 越小越弱；**分位与强弱标签口径 2026-08-16 用户拍板**）：
 
 ```
-打板指标:<YYYYMMDD> → JSON
+打板指标:<YYYYMMDD>（表） + metrics（键） → JSON 指标载荷
+# 0.9.10 键契约定稿：表名含日期后缀、子键为 metrics；早期版本曾用
+# 表=打板指标/键=<日期>，读取端双键形兼容，新写一律走定稿键形
 { "metrics": {"premium_mean": .., "success_rate": .., "n_samples": ..,
               "missing_open_count": ..},
   "rank_60d": {"premium_mean": .., "success_rate": ..},
   "strength_60d": {"premium_mean": "strong|weak|neutral|null", ..},
   "window": 60, "computed_at": ..,
-  "value_source": "auction" | "kline" }   # 09:26 竞价版 / 16:30 K线权威版
+  "value_source": "auction" | "kline",   # 09:26 竞价版 / 16:30 K线权威版
+  "daily": { ... } }                     # 0.9.10：完整日级行（见下）
 
-打板序列:<metric> → JSON   # 分位分母：滚动 60 交易日序列（仅存有效观测）
+打板指标 daily 子载荷（0.9.10：采集/收口时随指标一并持久化，MCP 快速通道直读）：
+{ "trade_date", "matched_count", "positive_count", "flat_count", "negative_count",
+  "success_rate", "average_open_return_pct", "p10/p25/median/p75/p90_open_return_pct",
+  "distribution": {"open_return_pct": [...], "sample_codes": [...]},
+  "metrics": {...}, "rank_60d": {...}, "strength_60d": {...},
+  "coverage": {"codes_requested", "fetched", "fetch_errors", "missing_open"},
+  "known_at", "computed_at", "value_source", "window", "contract" }
+# 行结构与日K 行同构；审计计数（涨停/一字板/候选）在采集器侧不可得 → 不写（读端置 null）
+
+竞价快照:<YYYYMMDD>（表） + <code>（键） → 快照 JSON（0.9.10 键形定稿：日期在表名）
+打板序列:<metric>（表）   + series（键）    → 滚动序列 # 分位分母（仅存有效观测）
 { "metric": "premium_mean", "values": [...60..], "dates": [...] }
 ```
 
@@ -99,13 +112,22 @@ rank = (此前 60 个有效观测中严格低于当日值的天数) / 60
 ## 3. 读取设计（关键）
 
 - **通用出口**：`get_mydb_data`（前缀通配 `竞价快照:<日期>:*`）——AI/研究直接读原始快照，不新增工具。
-- **业务派生**：`get_board_open_effect_history` 改造为双源合并：
-  - 历史段（T-2 及更早）：涨停判定 + 溢价全部从 kline 算（现逻辑不变）；
+- **业务派生**：`get_board_open_effect_history` 读取优先级（0.9.10 快速通道，兑现
+  "09:27 即时读取"）：
+  1. **预计算直读**（`_HEAVY_LOCK` 之外）：区间内每个交易日都有 `打板指标:<日期>`
+     daily 行 → 直接返回（`load_path=mydb`、`cache_hit=true`；摘要 <1s、含分布 <3s，
+     不扫全市场、不带全市场日K）；
+  2. **全市场重算**（降级）：任一交易日缺预计算 → 日K 快照重算 + 当日段用预计算/
+     快照覆盖（`cache_hit=false`、`fallback_reason` 注明；当日 `known_at=
+     "20260817 09:26 预计算(auction)"` 或 `"… 竞价采集(source=tencent)"`）；
+  - 历史段（T-2 及更早，无预计算）：涨停判定 + 溢价全部从 kline 算（现逻辑不变）；
   - 当日段（采集表有数据的日期）：涨停判定用 T-1 kline，**溢价 = 采集表 open_price /
     T-1 日收盘价 - 1**（0.8.13：分母统一用 T-1 收盘——采集表 prev_close 在除权
     除息日为交易所调整昨收，混入分红会失真；历史段/回填/收口同一口径）；
-  - 信封标注：当日 `known_at="20260817 09:26 竞价采集(source=tencent)"`，历史 `known_at="盘后日K"`；
-  - 降级：当日无采集记录 → 回退"截至 T-1" + errors 注明；部分股票失败 → `is_partial=true` + 明细。
+  - 降级：当日无采集记录 → 回退"截至 T-1" + errors 注明；部分股票失败 →
+    `is_partial=true` + 明细；
+  - 完整性（0.9.10）：空代码分类（停牌/退市未上市不否决；真实失败/未分类才否决），
+    双覆盖率 `candidate_coverage` + 信封 `sample_coverage`。
 - **对账（可信度关键）**：15:35 盘后任务对比"采集 open_price vs kline 开盘价"，差异超阈值（±0.5%）记审计/告警——长期监测"9:25 竞价≈开盘"口径的真实偏差。
 
 ## 4. 调度与流程

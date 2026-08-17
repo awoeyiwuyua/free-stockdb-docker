@@ -4,6 +4,50 @@
 镜像 tag 跟随上游引擎版本。发布纪律见 `docs/webui-spa/release-policy.md`；
 部署记录见 `docs/DEPLOYMENTS.md`；本机目录关系与运行配方见 `docs/DEVELOPMENT-GUIDE.md`。
 
+## [0.9.10] — 2026-08-17（打板读取链路工程化收口：键契约修正 + 预计算快速通道）
+
+验收复盘（0.8.16 异源验收）：核心计算正确，但 HTTP MCP「能算、数也对，读取链路未
+收口」——每次查询全市场重扫约 37s、带分布 20s 超时、写入键与读取键不对齐、15 个
+空代码导致 `formal_usable=false`。本版按 P0/P1/P2 修复：
+
+**P0 正确性与快速读取**
+
+- **键契约统一（核心 bug）**：写入端（`打板指标:<YYYYMMDD>` 表 + `metrics` 键）与
+  读取端（曾用 `打板指标` 表 + `<YYYYMMDD>` 键）不对齐，预计算指标读不到、异常被
+  静默吞掉。读端改为双通道双键形：① research_store（0.9.5 抽象，写端同源，
+  默认 SqliteResearchStore / mydb 回滚适配）② 引擎 mydb rd 直读（新契约
+  `打板指标:<date>`/`metrics` 优先，旧契约 `打板指标`/`<date>` 回退，0.8.x 数据兼容）；
+  快照读取同步精确键形（`竞价快照:<date>`/`code`）
+- **预计算快速通道**：`query_board_open_effect_history` 在 `_HEAVY_LOCK` 之外先读
+  预计算结果——区间内每个交易日都有 daily 行 → 直读返回（`load_path=mydb`、
+  `cache_hit=true`，正常查询 <1s、带分布 <3s，不扫 5200 只）；任一交易日缺失才回退
+  全市场重算（`cache_hit=false` + `fallback_reason` 注明），当日段仍用预计算覆盖
+- **回归测试**：真实键形 mock（`打板指标:20260817`/`metrics`、`竞价快照:20260817`/
+  `<code>`），键契约/快速通道/双键形回退/慢路径覆盖全绿
+
+**P1 响应内容**
+
+- **完整日级结果持久化**：09:26 竞价版与 16:30 K线版写 `payload.daily` 子载荷——
+  样本数、正/平/负数量、均值、成功率、分位数、完整分布（open_return_pct +
+  sample_codes）、候选数/采集数/缺价数（coverage）、known_at、value_source
+  （`core.auction_metrics.build_daily_row`，与日K 行同构）
+- **`include_distribution` 语义兑现**：false → 摘要（快速通道直读，<1s）；
+  true → 直接读已持久化的样本分布（不再全市场扫描，<3s）
+
+**P2 质量审计**
+
+- **空代码分类**：15 个空代码不再一刀切——按 `query_point_snapshot` 时点判定分类为
+  停牌（EMPTY_SUSPENDED）/ 退市未上市（EMPTY_DELISTED_OR_NOT_LISTED）/ 未发布 /
+  无法分类（EMPTY_CODE_UNCLASSIFIED）；前两类不否决正式可用性，只有真实失败与
+  未分类才否决
+- **双覆盖率拆分**：`candidate_coverage`（候选识别完整性，决定 formal_usable）与
+  信封 `sample_coverage`（赚钱效应样本覆盖：候选数/采集数/缺价数）；`formal_usable`
+  不再被"区间无 bar 但分类为停牌/退市"的代码否决
+- **信封增强**：`load_path` / `cache_hit` / `precomputed_days` / `fallback_reason` /
+  `sample_coverage` / `empty_code_breakdown`；`source_contract_version` v4.1 → v4.2
+
+Python 239 全绿（MCP 120 + 采集/领域 119）。
+
 ## [0.9.9] — 2026-08-16（D11 落位：采集执行迁数据层 storage/providers/quote_sources.py）
 
 架构决策 D11 落地（采集执行归数据层、编排归服务层）：
