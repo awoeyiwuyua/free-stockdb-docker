@@ -14,6 +14,7 @@ import threading
 from abc import ABC, abstractmethod
 from datetime import datetime
 from pathlib import Path
+from uuid import uuid4  # 0.9.11：备份文件唯一后缀
 
 import config  # 模块引用（config.DATA_DIR 动态读取，测试 patch 生效）
 
@@ -98,19 +99,22 @@ class SqliteResearchStore(ResearchStore):
 
     def __init__(self, db_path: Path | None = None):
         self._path = db_path or (Path(config.DATA_DIR) / DB_FILE)
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()  # 0.9.11：RLock——_connect 建连在锁内，写/读再入不冲突
         self._conn: sqlite3.Connection | None = None
 
     # ---- 连接管理 ----
     def _connect(self) -> sqlite3.Connection:
-        if self._conn is None:
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            conn = sqlite3.connect(str(self._path), timeout=5.0)
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA busy_timeout=5000")
-            conn.executescript(_SCHEMA)
-            self._conn = conn
-        return self._conn
+        # 0.9.11：建连+建表放入 self._lock 临界区（RLock）——首次并发访问不再
+        # 产生双连接（fd/shm 泄漏）与并发 executescript
+        with self._lock:
+            if self._conn is None:
+                self._path.parent.mkdir(parents=True, exist_ok=True)
+                conn = sqlite3.connect(str(self._path), timeout=5.0)
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA busy_timeout=5000")
+                conn.executescript(_SCHEMA)
+                self._conn = conn
+            return self._conn
 
     def close(self) -> None:
         if self._conn is not None:
@@ -204,8 +208,10 @@ class SqliteResearchStore(ResearchStore):
                 if len(parts) < 3:
                     continue
                 try:
-                    value = _mydb._rd_to_py(
-                        _mydb._mydb_rd().get(":".join(parts[:-1]), parts[-1]))
+                    # 0.9.11：持 _rd_lock 访问（与 _mydb_rd_keys 同语义）
+                    with _mydb._rd_lock:
+                        value = _mydb._rd_to_py(
+                            _mydb._mydb_rd().get(":".join(parts[:-1]), parts[-1]))
                 except Exception:  # noqa: BLE001 - 单键失败跳过
                     continue
                 if not isinstance(value, dict):
@@ -222,6 +228,11 @@ class SqliteResearchStore(ResearchStore):
                 elif kind == "snapshots":
                     self.write_snapshots(parts[1], {parts[2]: value})
                     counts["snapshots"] += 1
+        # 0.9.11：仅实际迁移成功才写 migrated_at——此前引擎不可达/全部读取失败时
+        # counts 全 0 也落 meta，运维据此跳过迁移则永久丢失旧研究成果
+        if sum(counts.values()) == 0:
+            return {"ok": False, "counts": counts,
+                    "reason": "引擎 mydb 无可迁移数据或不可达（未标记已迁移）"}
         self._set_meta(MIGRATION_KEY, datetime.now().isoformat(timespec="seconds"))
         return {"ok": True, "counts": counts,
                 "migrated_at": self._get_meta(MIGRATION_KEY)}
@@ -246,10 +257,15 @@ class SqliteResearchStore(ResearchStore):
             backup_dir = Path(config.DATA_DIR) / BACKUP_DIR
             backup_dir.mkdir(parents=True, exist_ok=True)
             stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-            target = backup_dir / f"research-{stamp}.db"
+            # 0.9.11：秒级时间戳同名冲突（日检自动备份与手动备份同一秒重叠 → 目标
+            # 已存在 → VACUUM 失败被静默吞掉）；追加 uuid 后缀保证唯一
+            unique = uuid4().hex[:8]
+            target = backup_dir / f"research-{stamp}-{unique}.db"
             conn = self._connect()
             with self._lock:
-                conn.execute(f"VACUUM INTO '{target.as_posix()}'")
+                # 0.9.11：路径经单引号转义后拼 SQL（DATA_DIR 含引号不再破坏语句）
+                sql = f"VACUUM INTO '{str(target).replace(chr(39), chr(39) * 2)}'"
+                conn.execute(sql)
             # 保留最近 BACKUP_KEEP 份
             backups = sorted(backup_dir.glob("research-*.db"))
             for old in backups[:-BACKUP_KEEP]:
@@ -264,13 +280,15 @@ def _mydb_rd_keys(prefix: str) -> list:
 
     以表前缀为 table 参数（如 "打板指标"），引擎按前缀匹配所有该命名空间表；
     禁止 keys("*")（全库扫描，引擎串行处理会挂）。
+    0.9.11：持 _rd_lock 访问（pybao rd 单连接非线程安全，防协议帧交错）。
     """
     from storage.providers import mydb_store as _mydb
     table = prefix.rstrip(":")
     if not table:
         return []
     try:
-        return _mydb._mydb_rd().keys(table, "*")
+        with _mydb._rd_lock:
+            return _mydb._mydb_rd().keys(table, "*")
     except Exception:  # noqa: BLE001 - 引擎不可用 → 空
         return []
 

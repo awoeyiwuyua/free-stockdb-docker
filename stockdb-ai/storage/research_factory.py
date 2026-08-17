@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import os
+import threading
 
 from storage.research_store import (
     MydbResearchStore,
@@ -17,21 +18,25 @@ from storage.research_store import (
 )
 
 _singleton: ResearchStore | None = None
+_singleton_lock = threading.Lock()  # 0.9.11：单例惰性创建加锁（防多线程首次并发双实例）
 
 
 def get_research_store() -> ResearchStore:
     """研究成果仓储单例（RESEARCH_STORE=sqlite 默认 / mydb 回滚）。"""
     global _singleton
     if _singleton is None:
-        mode = os.environ.get("RESEARCH_STORE", "sqlite").strip().lower()
-        _singleton = (MydbResearchStore() if mode == "mydb"
-                      else SqliteResearchStore())
+        with _singleton_lock:
+            if _singleton is None:  # 双检：锁内二次确认（首次访问可能来自多线程）
+                mode = os.environ.get("RESEARCH_STORE", "sqlite").strip().lower()
+                _singleton = (MydbResearchStore() if mode == "mydb"
+                              else SqliteResearchStore())
     return _singleton
 
 
 def reset() -> None:
     """复位单例（测试隔离用）。"""
     global _singleton
-    if isinstance(_singleton, SqliteResearchStore):
-        _singleton.close()
-    _singleton = None
+    with _singleton_lock:
+        if isinstance(_singleton, SqliteResearchStore):
+            _singleton.close()
+        _singleton = None

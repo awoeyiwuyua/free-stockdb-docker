@@ -58,6 +58,7 @@ from datetime import datetime, timedelta
 from decimal import Decimal  # 当日段涨停价取整与 board_metrics 同口径（0.7.0 双源合并）
 import http.server
 import json
+import math  # 0.9.11：响应 NaN/Inf 清洗
 import os
 from pathlib import Path
 import sys
@@ -268,8 +269,8 @@ def query_daily_kline(code: str, start: str, end: str | None, fields: str | None
             rows.extend(_normalize_rows(data))
         rows = [row for row in rows if isinstance(row, dict)]
         s, e = int(start), int(end)
-        rows = [r for r in rows if s <= int(r.get("date") or 0) <= e]
-        rows.sort(key=lambda r: int(r.get("date") or 0))
+        rows = [r for r in rows if s <= _row_date_key(r) <= e]
+        rows.sort(key=_row_date_key)
     else:
         data = _http_get("get", f"日k:{code}:{start}")
         rows = _normalize_rows(data)
@@ -740,6 +741,33 @@ def _parse_yyyymmdd(value: str, *, field: str) -> datetime:
         raise ValueError(f"{field} 必须是 8 位日期 YYYYMMDD") from exc
 
 
+def _row_date_key(row: dict) -> int:
+    """行 date 排序/区间键（0.9.11 容错）：非法形态 → -1（该行被过滤/排最前，
+    不中断整批约 5000 只的全市场快照——此前 int() 位于逐行 try 之外，单条脏
+    date 记录会让整批失败返回错误而非带诊断的部分结果）。"""
+    try:
+        return int(row.get("date") or 0)
+    except (TypeError, ValueError):
+        return -1
+
+
+def _json_clean(value):
+    """递归替换 NaN/Inf 浮点为 None（0.9.11：响应必须输出合法 JSON——裸 NaN/
+    Infinity 令牌会让严格解析器（JS JSON.parse）整包失败；读/响应侧此前无护栏）。"""
+    if isinstance(value, float):
+        return None if (math.isnan(value) or math.isinf(value)) else value
+    if isinstance(value, dict):
+        return {key: _json_clean(val) for key, val in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_clean(val) for val in value]
+    return value
+
+
+def _json_dumps(obj, **kwargs):
+    """响应序列化（NaN/Inf → null 后 dumps）。"""
+    return json.dumps(_json_clean(obj), ensure_ascii=False, **kwargs)
+
+
 def _classify_empty_codes(empty_codes: list[str], end_compact: str) -> dict:
     """空代码（区间内无任何日K）分类：停牌 / 退市未上市 / 未发布 / 无法分类。
 
@@ -869,7 +897,7 @@ def query_fullmarket_daily_snapshot(
 
         for code, rows in sorted(code_rows):
             history_close: float | None = None
-            for row in sorted(rows, key=lambda item: int(item.get("date") or 0)):
+            for row in sorted(rows, key=_row_date_key):
                 try:
                     day = str(row.get("date"))
                     if len(day) != 8:
@@ -1050,6 +1078,17 @@ def _auction_float(value: object) -> float | None:
     return number
 
 
+def _rd_get_locked(table: str, key: str) -> object | None:
+    """加锁 rd.get（0.9.11）：经 pybao_tools.rd_get 全进程串行化（pybao rd 单连接
+    非线程安全，2026-08-16 协议帧交错事故）；pybao_tools 缺失时防御直调。"""
+    if pybao_tools is not None and hasattr(pybao_tools, "rd_get"):
+        return pybao_tools.rd_get(table, key)
+    rd = pybao_tools.get_mydb_rd() if pybao_tools is not None else None
+    if rd is None:
+        return None
+    return rd.get(table, key)
+
+
 def _read_auction_snapshots(
     rd: object, start_iso: str, end_iso: str, store: object | None = None
 ) -> tuple[dict[str, dict[str, dict]], bool]:
@@ -1082,12 +1121,19 @@ def _read_auction_snapshots(
         except Exception:  # noqa: BLE001 - store 通道失败：回退引擎通道
             pass
 
-    # ② 引擎 mydb 通道（0.8.x 遗留数据兼容）
+    # ② 引擎 mydb 通道（0.8.x 遗留数据兼容；0.9.11 起经 pybao_tools 加锁辅助
+    #    访问——pybao rd 单连接非线程安全，全进程串行化，防协议帧交错冻结）
     if rd is not None:
-        try:
-            raw_keys = list(rd.keys(_AUCTION_SNAPSHOT_TABLE, "*") or [])
-        except Exception:  # noqa: BLE001 - mydb 不可达
-            raw_keys = []
+        if pybao_tools is not None and hasattr(pybao_tools, "rd_keys"):
+            try:
+                raw_keys = pybao_tools.rd_keys(_AUCTION_SNAPSHOT_TABLE, "*")
+            except Exception:  # noqa: BLE001 - mydb 不可达
+                raw_keys = []
+        else:  # 防御：pybao_tools 缺失（理论不可达，rd 非 None 则模块必在）
+            try:
+                raw_keys = list(rd.keys(_AUCTION_SNAPSHOT_TABLE, "*") or [])
+            except Exception:  # noqa: BLE001 - mydb 不可达
+                raw_keys = []
         if raw_keys:
             read_ok = True
         for raw_key in raw_keys:
@@ -1108,19 +1154,20 @@ def _read_auction_snapshots(
                 continue
             value = None
             try:  # 新契约精确键形：表=竞价快照:<date>，键=code
-                value = rd.get(f"{_AUCTION_SNAPSHOT_TABLE}:{date_seg}", code_seg)
+                value = _rd_get_locked(f"{_AUCTION_SNAPSHOT_TABLE}:{date_seg}", code_seg)
             except Exception:  # noqa: BLE001 - 单键读取失败不影响其余
                 value = None
             if value is None:
                 try:  # 旧契约回退：表=竞价快照，键=<date>:<code>
-                    value = rd.get(_AUCTION_SNAPSHOT_TABLE, sub)
+                    value = _rd_get_locked(_AUCTION_SNAPSHOT_TABLE, sub)
                 except Exception:  # noqa: BLE001 - 单键读取失败不影响其余
                     continue
             snap = _auction_value_to_dict(value)
             if snap is None:
                 continue
-            # store 通道已读到的日期以 store 为准（写端同源）；引擎仅补缺
-            snapshots_by_date.setdefault(date_iso, {})[code_seg] = snap
+            # 0.9.11：引擎通道仅补缺（setdefault 而非直接覆盖）——store 通道
+            # 已读到的日期以 store 为准（写端同源、权威），迁移期遗留数据不覆盖
+            snapshots_by_date.setdefault(date_iso, {}).setdefault(code_seg, snap)
     return snapshots_by_date, read_ok
 
 
@@ -1202,14 +1249,16 @@ def _read_metrics_payload(rd: object, date_iso: str, store: object | None = None
                 return payload
         except Exception:  # noqa: BLE001 - store 通道失败：回退引擎
             pass
-    if rd is None:
+    # 引擎通道：经 pybao_tools 加锁辅助（0.9.11；rd 参数仅为通道可用性兼容，
+    # 实际访问由 _rd_get_locked 内部获取连接并串行化）
+    if pybao_tools is None:
         return None
     for table, key in (
         (f"{_AUCTION_METRICS_TABLE}:{date_compact}", "metrics"),  # 新契约（写端键形）
         (_AUCTION_METRICS_TABLE, date_compact),                   # 旧契约（0.8.x 遗留）
     ):
         try:
-            payload = _auction_value_to_dict(rd.get(table, key))
+            payload = _auction_value_to_dict(_rd_get_locked(table, key))
         except Exception:  # noqa: BLE001 - 单键读取失败不影响其余
             continue
         if payload and isinstance(payload.get("metrics"), dict):
@@ -1424,6 +1473,11 @@ def _fast_path_result(start_iso: str, end_iso: str, include_distribution: bool) 
         start_iso.replace("-", ""), end_iso.replace("-", ""))
     if not trade_days:
         return None  # 区间无交易日：走慢路径语义（快照判定产生空结果）
+    # 0.9.11：休市表覆盖护栏——未收录年份"工作日=交易日"会把休市日误判为交易日，
+    # 快速通道不得把休市日的全 None 指标行当真实预计算返回（回退慢路径，基于
+    # 真实快照数据仍正确）
+    if trade_days[-1] > calendar_xshg.XSHG_HOLIDAYS_THROUGH.replace("-", ""):
+        return None
     pre_rows: dict[str, dict] = {}
     for d8 in trade_days:
         date_iso = f"{d8[:4]}-{d8[4:6]}-{d8[6:]}"
@@ -1716,9 +1770,13 @@ def _fullmarket_sdk_outcomes(codes: list[str], date: str):
     bars: dict[str, dict] = {}
 
     def _pull(chunk: list[str]) -> None:
-        data = sdk.get_data(chunk, start=date, end=date, fq=None) or {}
+        # 0.9.11：SDK 区间为开区间（start<end 不含 end，见 _bump_end 契约）——
+        # start==end 是空区间，整批返回空会被静默判为全市场无 bar（SUSPENDED）
+        # 且 formal_usable 仍为 True。end 顺延一日，客户端过滤回原日期。
+        data = sdk.get_data(chunk, start=date, end=_bump_end(date, "1d"), fq=None) or {}
         for c, recs in data.items():
-            recs = [r for r in (recs or []) if isinstance(r, dict)]
+            recs = [r for r in (recs or []) if isinstance(r, dict)
+                    and str(r.get("date") or "")[:8] == date]
             if recs:
                 bars[str(c)] = recs[-1]  # 单日区间，取最后一条
 
@@ -2408,7 +2466,7 @@ def _error_result(message: str, code: str, *, hint: str | None = None) -> dict:
     if hint:
         payload["hint"] = hint
     return {
-        "content": [{"type": "text", "text": json.dumps(payload, ensure_ascii=False)}],
+        "content": [{"type": "text", "text": _json_dumps(payload)}],
         "isError": True,
     }
 
@@ -2718,7 +2776,7 @@ def _call_tool(name: str, args: dict) -> dict:
     return {
         "content": [{
             "type": "text",
-            "text": json.dumps(_apply_contract(name, result), ensure_ascii=False),
+            "text": _json_dumps(_apply_contract(name, result)),
         }],
     }
 
@@ -2918,7 +2976,7 @@ class _MCPRequestHandler(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
-        body = json.dumps(response, ensure_ascii=False).encode("utf-8")
+        body = _json_dumps(response).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))

@@ -33,9 +33,22 @@ fi
 (
   while :; do
     if [ ! -f /data/.stockdb-paused ]; then
-      if [ -f /data/stockdb.pid ] && kill -0 "$(cat /data/stockdb.pid 2>/dev/null)" 2>/dev/null; then
-        : # stockdb 运行中
+      PID="$(cat /data/stockdb.pid 2>/dev/null || true)"
+      if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
+        # 0.9.11：kill -0 只能证明"有进程"——容器 PID 空间小，stockdb 崩溃后其
+        # PID 可能被 5s 窗口内重启的 webui python/sleep 子进程复用 → 误报存活
+        # 永不重启。校验 /proc/<pid>/exe 是否指向 stockdb 二进制本体（Linux）。
+        EXE="$(readlink "/proc/$PID/exe" 2>/dev/null || true)"
+        case "$EXE" in
+          */stockdb) : ;;  # 身份匹配：确为 stockdb
+          *) echo "[entrypoint] stale pid $PID (exe=$EXE)，重启 stockdb ..." >&2
+             kill "$PID" 2>/dev/null || true
+             PID="";;
+        esac
       else
+        PID=""
+      fi
+      if [ -z "$PID" ]; then
         echo "[entrypoint] starting stockdb ..."
         (cd /data && exec /opt/stockdb/stockdb /data/stockdb.conf) &
         echo "$!" > /data/stockdb.pid

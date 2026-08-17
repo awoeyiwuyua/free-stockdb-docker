@@ -34,23 +34,32 @@ def _mydb_import():
     raise ImportError("pybao 写库不可用（PYTHONPATH 未注入或平台不兼容）")
 
 
-_rd_lock = threading.Lock()  # pybao rd 单连接非线程安全：全部 rd 读写持锁串行化（0.8.10）
+_rd_lock = threading.RLock()  # pybao rd 单连接非线程安全：全部 rd 读写持锁串行化（0.8.10）
 # 事故背景 2026-08-16：/api/data/* 与回填线程并发用同一 socket，协议帧交错 →
 # C 扩展阻塞持 GIL → 全进程冻结。锁保证同一时刻只有一条 rd 请求在线上。
+# 0.9.11：改为 RLock 并让 _mydb_rd 初始化自身持锁——连接创建也串行化，且
+# interfaces/mcp/pybao_tools 复用本锁（同进程容器与 MCP 共享同一底层连接）。
 
 
 def _mydb_rd_reset():
     """丢弃缓存的 rd 连接：调用失败后置空，下次调用重新 init（0.8.10 自愈楔死连接）。"""
-    _mydb_rd._rd = None
+    with _rd_lock:
+        _mydb_rd._rd = None
 
 
 def _mydb_rd():
-    """获取连接 stockdb 的 pybao 客户端（惰性、缓存，函数对象属性持连接）。"""
-    if getattr(_mydb_rd, "_rd", None) is None:
-        mod = _mydb_import()
-        _mydb_rd._rd = mod.init(config.STOCKDB_HOST, int(config.STOCKDB_PORT),
-                                socket_timeout=5)
-    return _mydb_rd._rd
+    """获取连接 stockdb 的 pybao 客户端（惰性、缓存，函数对象属性持连接）。
+
+    0.9.11：初始化自身持 _rd_lock（RLock 可重入，调用方再持锁不冲突）——
+    首次并发访问不再产生双连接（socket 泄漏）；调用方（mydb_read/write/tables
+    及 pybao_tools.rd_get/rd_keys）仍应持锁执行请求。
+    """
+    with _rd_lock:
+        if getattr(_mydb_rd, "_rd", None) is None:
+            mod = _mydb_import()
+            _mydb_rd._rd = mod.init(config.STOCKDB_HOST, int(config.STOCKDB_PORT),
+                                    socket_timeout=5)
+        return _mydb_rd._rd
 
 
 def _rd_to_py(v):
@@ -158,11 +167,16 @@ def mydb_read(table: str, key: str = "") -> dict:
             keys = rd.keys(table, "*") or []
             values = {}
             for k in keys:
-                date_str = str(k).split(":")[-1]
+                # 0.9.11：复合键解析（split(":", 1) 保留代码段）——键形如
+                # "hk日k:00700:20250425"，此前 split(":")[-1] 只取日期段，
+                # 同一日期多只股票时读出错误记录/读不到（pybao_tools.query_mydb
+                # 已修同款，app 侧同步）
+                full = str(k)
+                lookup_key = full.split(":", 1)[-1] if ":" in full else full
                 try:
-                    values[str(k)] = _rd_to_py(rd.get(table, date_str))
+                    values[full] = _rd_to_py(rd.get(table, lookup_key))
                 except Exception:  # noqa: BLE001 - 单键失败按缺失
-                    values[str(k)] = None
+                    values[full] = None
             return {"table": table, "keys": keys, "values": values}
         except Exception:
             _mydb_rd_reset()
