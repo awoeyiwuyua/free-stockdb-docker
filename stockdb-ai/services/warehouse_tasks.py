@@ -50,12 +50,14 @@ def _snapshot_points(date: str) -> list[dict]:
 
 
 def warehouse_run(days: int = 1, reconcile_sample: int = 10,
-                  require_today: bool = False) -> dict:
-    """沉淀任务：把已同步交易日沉淀进仓库（幂等；days>1 供小范围测试通道，上限 5）。
+                  require_today: bool = False, backfill: bool = False) -> dict:
+    """沉淀任务（幂等；days>1 供小范围测试通道，上限 5）。
 
     就绪门：require_today=True（调度路径）时要求 data_latest >= 今日（当日 K 线
     已同步——与打板收口同判定），未就绪返回 reason 以"未就绪："开头（调度层重试）；
     手动路径（HTTP 运维口）不设此门，沉淀到最新已同步日为止。
+    backfill=True（0.10.3）：历史回填模式——向 watermark 之前回看 days 个交易日
+    （跳过非交易日；已有分区幂等跳过；watermark 不回退）。
     对账：行数 + 同源字段回读 + （有异源行时）异源开盘/昨收；issues 非空 → 告警 + 日检记录。
     """
     if availability is None or not availability()[0]:
@@ -74,14 +76,28 @@ def warehouse_run(days: int = 1, reconcile_sample: int = 10,
         watermark = sink.catalog.get_watermark(root, "daily") if hasattr(sink, "catalog") else None
 
         results = []
-        # 逐日沉淀（正常调度 days=1；手动小范围测试最多回看 5 日）
-        target = latest
+        # 目标日集合（0.10.3 增 backfill 模式）：
+        #   默认：watermark 之后的前向缺口（正常调度语义——不重复沉淀）
+        #   backfill=True：从已沉淀最早日（无沉淀则 latest）向更早回看 days 个**交易日**
+        #     （跳过非交易日；已有分区由 sink 跳过，幂等；watermark 只前进不受影响）
         targets = []
-        for _ in range(days):
-            if watermark and target <= watermark:
-                break  # 只补 watermark 之后的缺口，不重复沉淀
-            targets.append(target)
-            target = _prev_date(target)
+        if backfill:
+            sedimented = sink.layout.list_daily_dates(root) if hasattr(sink, "layout") else []
+            cursor = _prev_date(sedimented[0]) if sedimented else latest
+            traded_seen = 0
+            while traded_seen < days and cursor >= "20000101":
+                if is_trading_day is None or is_trading_day(
+                        datetime.strptime(cursor, "%Y%m%d").date()):
+                    targets.append(cursor)
+                    traded_seen += 1
+                cursor = _prev_date(cursor)
+        else:
+            target = latest
+            for _ in range(days):
+                if watermark and target <= watermark:
+                    break  # 只补 watermark 之后的缺口，不重复沉淀
+                targets.append(target)
+                target = _prev_date(target)
         for t in reversed(targets):  # 旧 → 新
             points = [p for p in _snapshot_points(t)
                       if isinstance(p, dict) and p.get("status") == "TRADED"]
@@ -139,7 +155,8 @@ def _adjust_rows(latest: str) -> list[dict]:
     return adjust_provider() or []
 
 
-def warehouse_run_async(days: int = 1, reconcile_sample: int = 10) -> dict:
+def warehouse_run_async(days: int = 1, reconcile_sample: int = 10,
+                        backfill: bool = False) -> dict:
     """异步触发沉淀（HTTP 运维口用；单飞防重，状态进 _wh_run_state）。"""
     if _wh_run_state["running"]:
         return {"ok": False, "async": True, "reason": "沉淀任务已在运行中",
@@ -148,7 +165,8 @@ def warehouse_run_async(days: int = 1, reconcile_sample: int = 10) -> dict:
     def _worker():
         _wh_run_state.update(running=True, started=_now_iso(), finished=None, result=None)
         try:
-            result = warehouse_run(days=days, reconcile_sample=reconcile_sample)
+            result = warehouse_run(days=days, reconcile_sample=reconcile_sample,
+                                   backfill=backfill)
         except Exception as exc:  # noqa: BLE001 - 状态落库，绝不外抛
             result = {"ok": False, "reason": str(exc)}
         _wh_run_state.update(running=False, finished=_now_iso(), result=result)

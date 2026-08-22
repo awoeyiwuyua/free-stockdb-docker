@@ -514,6 +514,27 @@ class WarehouseTasksTest(unittest.TestCase):
         finally:
             self.wt._wh_run_state.update(running=False, started=None)
 
+    def test_backfill_mode_fills_history(self):
+        """0.10.3：backfill=True 向 watermark 之前回看（跳非交易日；幂等；watermark 不回退）。"""
+        from datetime import date as _date
+        # 预置已沉淀日 0822（setUp 的 data_latest）
+        self.wt.warehouse_run(days=1)
+        # is_trading_day：周末（0822 六/0823 日）非交易日
+        def _trading(d):
+            return d.weekday() < 5
+        self.wt.is_trading_day = _trading
+        res = self.wt.warehouse_run(days=3, backfill=True)
+        self.assertTrue(res["ok"], res)
+        dates = [d["date"] for d in res["days"]]
+        # 0822(六) 往前 3 个交易日 = 0821(五)、0820(四)、0819(三)
+        self.assertEqual(dates, ["20260819", "20260820", "20260821"])
+        # 继续回填 = 从新的最早日（0819）向下扩展（目标恒低于最早日——构造上免重，
+        # skip-existing 不可达属预期）；watermark 不因回填回退
+        again = self.wt.warehouse_run(days=2, backfill=True)
+        self.assertTrue(again["ok"])
+        self.assertEqual([d["date"] for d in again["days"]], ["20260817", "20260818"])
+        self.assertEqual(self.wt.sink.catalog.get_watermark(self.root, "daily"), "20260822")
+
     def test_status_shape(self):
         self.wt.warehouse_run(days=1)
         s = self.wt.warehouse_status()
