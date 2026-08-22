@@ -4,6 +4,18 @@
 镜像 tag 跟随上游引擎版本。发布纪律见 `docs/release-policy.md`；
 部署记录见 `docs/deployments.md`；本机目录关系与运行配方见 `docs/development-guide.md`。
 
+## [0.10.2] — 2026-08-22（启动期崩溃修复：main() 两处合并解决错误 + 冒烟测试兜底）
+
+0.10.0/0.10.1 合并 0.9.10~0.9.13 时引入两处 main() 启动期崩溃（单测不执行 main()，
+CI 未拦住；本机 webui 启动实测暴露——**0.10.1 的 docker entrypoint 直跑会崩，未部署过**）：
+
+- `config.WAREHOUSE_ENABLED`：app.py 未 `import config`（from-import 风格）→ NameError；
+  改为从 config 导入 `WAREHOUSE_ENABLED`
+- 旧 `ThreadingHTTPServer(...)` 残行先于 Handler 延迟导入执行 → UnboundLocalError；
+  删除残行（保留 0.9.11 延迟装配 + 0.9.12 `_BoundedHTTPServer`）
+- **新增 MainStartupSmokeTest**（test_ops）：静态检查 main() 自由变量按语句顺序可解析
+  （含"局部导入前使用"类错误），反向注错验证可检出；326 测试全绿
+
 ## [0.10.1] — 2026-08-22（OOM 重启循环收口：全库扫描移除 + 慢路径忙时快速失败）
 
 > 源自未合入的 release-0.9.14 分支（2026-08-17，作者 Nicholas666；0.9.13 部署实证

@@ -1371,5 +1371,53 @@ class _AuctionBackfillTests(_OpsTestCase):
         self.assertIn("running", payload["backfill"])
 
 
+class MainStartupSmokeTest(unittest.TestCase):
+    """main() 名字解析冒烟（0.10.2）：合并曾引入 config 未导入/Handler 早引用两处
+    启动期 NameError/UnboundLocalError——单测不执行 main() 拦不住，此测静态兜底：
+    main() 内引用的自由变量必须能被 app 模块命名空间解析（局部导入除外）。"""
+
+    def test_main_names_resolvable(self):
+        """main() 自由变量必须（按语句顺序）在使用点之前可解析。
+
+        抓两类启动期崩溃：① 名字不在 app 命名空间（如 config 未导入）；
+        ② 名字仅由后续局部导入/赋值绑定（如 Handler 在延迟导入前被引用）。
+        按行号近似执行顺序（main 无循环回边，安全）。
+        """
+        import ast, builtins
+        source = open(app.__file__, encoding="utf-8").read()
+        tree = ast.parse(source)
+        main_fn = next(n for n in ast.walk(tree)
+                       if isinstance(n, ast.FunctionDef) and n.name == "main")
+        builtin_names = set(dir(builtins))
+
+        def bindings(node):
+            """(名字, 行号)：局部导入/赋值/参数/内嵌函数定义。"""
+            out = []
+            for n in ast.walk(node):
+                if isinstance(n, (ast.Import, ast.ImportFrom)):
+                    out.extend((a.asname or a.name.split(".")[0], n.lineno) for a in n.names)
+                elif isinstance(n, (ast.FunctionDef, ast.ClassDef)):
+                    out.append((n.name, n.lineno))
+                elif isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store):
+                    out.append((n.id, n.lineno))
+                elif isinstance(n, ast.arg):
+                    out.append((n.arg, n.lineno))
+                elif isinstance(n, ast.ExceptHandler) and n.name:
+                    out.append((n.name, n.lineno))
+            return out
+
+        local_binds = bindings(main_fn)
+        for node in ast.walk(main_fn):
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+                name = node.id
+                if name in builtin_names:
+                    continue
+                if any(ln <= node.lineno for n_, ln in local_binds if n_ == name):
+                    continue  # 使用点之前已有局部绑定
+                self.assertTrue(hasattr(app, name),
+                                f"app.main() 第 {node.lineno} 行引用 {name!r}："
+                                f"既无先行局部绑定也不在 app 命名空间（启动即崩）")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

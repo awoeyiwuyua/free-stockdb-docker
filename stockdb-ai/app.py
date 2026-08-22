@@ -74,6 +74,7 @@ from config import (  # noqa: E402 - 配置为纯 stdlib，无循环依赖
     STOCKDB_PAUSE,
     STOCKDB_PIDFILE,
     STOCKDB_PORT,
+    WAREHOUSE_ENABLED,
     WEBUI_VERSION,
 )
 
@@ -1884,9 +1885,8 @@ def main():
     threading.Thread(target=scheduler_loop, daemon=True).start()
     threading.Thread(target=ops_watchdog_loop, daemon=True).start()     # 运营支撑看门狗（告警生产接线）
     threading.Thread(target=auction_scheduler_loop, daemon=True).start()  # 打板竞价调度（2s 轮询，独立线程）
-    if config.WAREHOUSE_ENABLED:  # 0.10.0：仓库沉淀调度（5s 轮询；回滚演练 = WAREHOUSE_ENABLED=0）
+    if WAREHOUSE_ENABLED:  # 0.10.0：仓库沉淀调度（5s 轮询；回滚演练 = WAREHOUSE_ENABLED=0）
         threading.Thread(target=warehouse_scheduler_loop, daemon=True).start()
-    ThreadingHTTPServer(("0.0.0.0", LISTEN_PORT), Handler).serve_forever()
     # 0.9.11：Handler 延迟装配（app 模块已完整）——handlers.py 顶层 import app，
     # 脚本方式执行时必须在 app 完整后导入，否则循环重载 ImportError（0.9.10 实证）
     from interfaces.web.handlers import Handler  # noqa: E402 - 组合根装配（app 已完整）
