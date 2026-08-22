@@ -4,6 +4,15 @@
 镜像 tag 跟随上游引擎版本。发布纪律见 `docs/release-policy.md`；
 部署记录见 `docs/deployments.md`；本机目录关系与运行配方见 `docs/development-guide.md`。
 
+## [0.10.4] — 2026-08-22（hotfix：run_sql 结果 DATE 列 JSON 序列化崩溃）
+
+- 实测暴露：`warehouse_run_sql` 经 MCP 通道查询含 DATE 列（如 `SELECT date FROM
+  v_daily`）必现 `Object of type date is not JSON serializable`（INTERNAL_ERROR）——
+  W5 单测从未让 DATE 列过 MCP 边界，漏网
+- 修复在引擎出口统一 JSON 安全化：date/datetime → ISO 字符串、Decimal → float
+  （MCP/HTTP 两侧免处理）；新增日期列 MCP 边界测试锁定
+- 328 测试全绿
+
 ## [0.10.3] — 2026-08-22（历史回填通道启用：backfill 模式，用户拍板激活延后项）
 
 - `warehouse_run(backfill=True)`（0.10.3）：向已沉淀最早日之前回看 N 个**交易日**
