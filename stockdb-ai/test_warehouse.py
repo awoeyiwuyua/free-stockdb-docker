@@ -631,6 +631,13 @@ class McpWarehouseToolsTest(unittest.TestCase):
         self.assertEqual(st["watermark_daily"], "20260822")
         self.assertEqual(st["sedimented_dates"], 1)
 
+    def test_run_sql_date_column_json_safe(self):
+        """0.10.4：DATE 列经 MCP 边界返回 ISO 字符串（此前 json.dumps 必崩）。"""
+        out = self._call("warehouse_run_sql",
+                         {"sql": "SELECT date, close FROM v_daily LIMIT 3"})
+        self.assertIsInstance(out["rows"][0][0], str)
+        self.assertRegex(out["rows"][0][0], r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
+
     def test_warehouse_group_registration(self):
         names = {t["name"] for t in self.srv.TOOLS if t.get("group") == "warehouse"}
         self.assertEqual(names, {"warehouse_run_sql", "warehouse_list_tables",

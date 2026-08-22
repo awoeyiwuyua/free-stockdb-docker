@@ -166,6 +166,21 @@ class WarehouseEngine:
 
     # ---- run_sql ----
 
+    @staticmethod
+    def _jsonable(v):
+        """结果值 JSON 安全化：date/datetime → ISO 字符串；Decimal → float。
+
+        0.10.4：MCP 通道 json.dumps 遇 DATE 列抛 TypeError（实测 ta_ma 查询经
+        warehouse_run_sql 必现）——统一在引擎出口转换，MCP/HTTP 两侧免处理。
+        """
+        import datetime as _dt
+        import decimal as _decimal
+        if isinstance(v, (_dt.date, _dt.datetime)):
+            return v.isoformat()
+        if isinstance(v, _decimal.Decimal):
+            return float(v)
+        return v
+
     def run_sql(self, sql: str) -> dict:
         """执行单条 SQL（读写全开）。
 
@@ -200,6 +215,7 @@ class WarehouseEngine:
                 if truncated:
                     rows = rows[:cap]
                 rows = [list(r) for r in rows]  # tuple → list（JSON 序列化友好）
+                rows = [[self._jsonable(v) for v in row] for row in rows]
                 return {"kind": "rows", "columns": columns, "rows": rows,
                         "row_count": len(rows), "truncated": truncated,
                         "statement_type": str(getattr(stmt, "type", "unknown"))}
