@@ -21,16 +21,16 @@ AI 客户端（Claude 等）               程序/脚本                人
                  │
         ┌────────┴────────────────────────────────┐
         │            stockdb-ai 应用层              │
-        │  接口层：MCP 服务器（53 工具+契约信封）/ HTTP 路由 │
-        │  服务层：打板采集/收口/回填 · 同步 · 日检       │
+        │  接口层：MCP 服务器（53+3 工具+契约信封）/ HTTP 路由 │
+        │  服务层：打板采集/收口/回填 · 同步 · 仓库沉淀 · 日检  │
         │  领域层：涨停判定/指标/日历（纯规则）           │
-        │  数据层：providers（多源）+ records          │
+        │  数据层：providers（多源）+ records + warehouse │
         └────────┬────────────────────────────────┘
                  │
    ┌─────────────┴──────────────┐   ┌──────────────────┐
-   │ 上游引擎（数据层 provider）   │   │ 自建存储（M5 起）   │
-   │ stockdb.exe                 │   │ 研究成果自持      │
-   │ data/（行情） + mydb/（过渡） │   │ （M5 前暂存 mydb） │
+   │ 上游引擎（数据层 provider）   │   │ 自建存储            │
+   │ stockdb.exe                 │   │ research.db（M5）  │
+   │ data/（行情） + mydb/（过渡） │   │ warehouse/（D12）  │
    └────────────────────────────┘   └──────────────────┘
 ```
 
@@ -44,7 +44,7 @@ AI 客户端（Claude 等）               程序/脚本                人
 | 接口层 | interfaces/mcp/（MCP 服务器、契约信封、sdk_bridge）+ interfaces/web/（HTTP 路由） | **sdk_bridge 归接口层**（提供查询服务与结果契约化）；其引擎连接走数据层；0.9.8 接口层统一收拢 interfaces/ |
 | 服务层 | services/：打板三用例、同步、日检编排 | **采集编排在服务层**；执行（腾讯/东财抓取）在数据层 |
 | 领域层 | core/：涨停判定/指标/日历（纯规则） | 零外部依赖；验收签字资产 |
-| 数据层 | storage/providers/free_stockdb.py（引擎）、providers/quote_sources.py（腾讯/东财）、providers/mydb_store.py（研究产出）、records.py | **文件边界按 provider 划分**；统一抽象接口随 M5 |
+| 数据层 | storage/providers/free_stockdb.py（引擎）、providers/quote_sources.py（腾讯/东财）、providers/mydb_store.py（研究产出）、records.py、research_store.py、warehouse/（D12：layout/sink/catalog/engine/queries） | **文件边界按 provider 划分**；仓库层 = 派生存储（sink 唯一写入口）；服务层访问走注入（C3） |
 | 横切 | ops/：日志/告警/调度/健康 | 进程内即可（单进程系统） |
 
 依赖铁律：接口层 → 服务层 → 领域层/数据层；领域层不依赖任何人；数据层不知道"调用者是谁"。
@@ -64,18 +64,21 @@ AI 客户端（Claude 等）               程序/脚本                人
 | D9 | **单进程两接口**：MCP 与 HTTP 同进程（webui）；代码保持可拆（interfaces/web/ 与 interfaces/mcp/ 物理分开） | 本机单人够用；将来独立 MCP 进程只是启动方式变化 |
 | D10 | **sdk_bridge 归接口层**，引擎连接归数据层 free_stockdb provider | 上游引擎被替换时 sdk_bridge 通过 provider 接口仍可用 |
 | D11 | **采集执行归数据层**（providers/quote_sources.py），编排归服务层 | 0.9.9 落位：auction_collect → storage/providers/quote_sources（git mv，契约不变） |
+| D12 | **列式仓库层（0.10.0）**：Parquet 事实沉淀 + DuckDB 查询/计算，落位 storage/warehouse/；事实只增不改、watermark 承载可信度；SQL 对个人研究读写全开（三护栏：行数上限/超时/facts 写保护） | 2026-08-22 用户拍板，**显式推翻 0.9.4「Parquet/DuckDB 不做」**：动机 = 分析型横截面/关联查询 + 个人可写研究仓库需列式底座；沉淀数据全部来自现有引擎（不新增获取源，红线不破）；duckdb 为首个第三方依赖（uv 锁定），缺失时降级 DEPENDENCY_UNAVAILABLE 不伤 53 既有工具 |
 
 ## 5. 演进路径（更新）
 
 ```
 0.9.2  四层搬迁（按 D10/D11 归属）+ 可观测性三件套（日检/探活/结构化日志）
 0.9.3  M5 产出自持（D8）：研究产出迁自建存储，mydb 降级为过渡缓存
-0.9.x  M6 行情镜像（可选）：关键行情镜像层，上游死时历史可读
+0.10.0 列式仓库层（D12，取代原 M6「行情镜像」备胎定位）：Parquet 事实沉淀 + DuckDB
+       查询 + warehouse MCP 工具组（3 个）；数据范围首期 = 日K/复权/代码表，
+       分钟/基本面/龙虎榜数据集与历史回填延后（ROADMAP 收敛清单）
 1.0.0  契约冻结评审（MCP 工具面 + 数据契约 + 错误码全部签字）
 ```
 
 ## 6. 不做什么（边界红线，沿用 ROADMAP）
 
-- ❌ 不自建行情获取管线（**引擎本地 LevelDB 即自建行情存储**——0.9.4 用户澄清：free-stockdb 就是自建存储，无需 Parquet 镜像；红线 = 不重造"从行情源拉数自建同步"的底座业务）
+- ❌ 不自建行情获取管线（**引擎本地 LevelDB 即自建行情存储**——0.9.4 用户澄清：free-stockdb 就是自建存储，无需 Parquet 镜像；红线 = 不重造"从行情源拉数自建同步"的底座业务。**0.10.0 修订（D12）**：仓库层沉淀数据全部来自现有引擎通道，不新增行情获取源，红线继续成立）
 - ❌ 不做模拟盘/执行类功能；面板不加功能；不换技术栈；不引入付费实时源
 - ❌ 0.9.x 不引入独立监控系统（进程内 ops/ 够用）、不引入消息队列/微服务

@@ -1,23 +1,31 @@
 # 开发指南：本机目录关系与运行模式（Windows 原生引擎优先）
 
 > 2026-08-16 定稿（0.8.18 仓库治理版）：开发主线 = 本机 Windows 原生引擎模式；
-> docker 镜像封装为可选发布物，仅当版本成熟后再构建（见 `docs/webui-spa/release-policy.md`）。
+> docker 镜像封装为可选发布物，仅当版本成熟后再构建（见 `docs/release-policy.md`）。
+> 0.10.0 治理批修订：仓库根四区自解释（代码/数据/文档/部署），见下。
 
-## 1. 两个目录的分工（严格遵循）
+## 1. 目录分工（严格遵循）
+
+**外部：引擎目录（只读）**
 
 | 目录 | 角色 | 允许操作 |
 |---|---|---|
 | `C:\Users\75393\Desktop\stockdb` | **原生引擎运行时**：`stockdb.exe`（127.0.0.1:7899）+ `data/*.ldb`（全市场行情 LevelDB）+ `data1/` + `pybao/`（Python 扩展）+ `mydb/`（私有存储 LevelDB） | 只读。引擎由上游 `数据更新.exe` 同步维护，私有代码**不写文件**进此目录 |
-| `C:\Users\75393\Desktop\stockdb-private` | **研究成果仓库**（本仓库，唯一版本化对象）：`stockdb-ai/`（app.py + 打板模块 + MCP）+ `docs/` | 全部代码改动在此，走分支 + PR |
+
+**内部：本仓库（唯一版本化对象）四区**
+
+| 区 | 内容 | git |
+|---|---|---|
+| `stockdb-ai/` | **代码区**：后端主体（app.py + interfaces/services/core/storage/ops 四层）。注意 `storage/` 是数据层的**代码**，不是数据文件夹 | 版本化 |
+| `data/` | **数据区**（DATA_DIR，dev.sh 默认）：`warehouse/`（Parquet + DuckDB）、`research/`（SQLite）、`records/`（jsonl）、alerts.json/sync.log。要看数据文件来这里，别去 storage/ | gitignore |
+| `docs/` | **文档区**（索引见 `docs/README.md`） | 版本化 |
+| `docker/` | **部署区**：Dockerfile/compose 等部署物 | 版本化 |
 
 **硬性禁止**（原任务书约定，维持有效）：
 - 禁止改动/删除原生目录任何文件（`*.ldb` / `data*` / `*.pyd` / `stockdb.exe` 等）
 - 禁止把原生目录 git 化；禁止把其中任何文件纳入本仓库 git
-- 两个目录互不写文件；唯一的数据流动方向：**私有代码 → pybao 扩展 → 引擎（7899）→ LevelDB（data/ 行情 + mydb/ 私有存储）**
-
-**数据落点说明**：打板回填/采集/收口写 `mydb`（引擎侧 LevelDB），键约定见
-`docs/design/auction-collector.md` 存储设计——保留前缀（`竞价快照:` / `打板指标:` /
-`打板序列:` / `清单:`）为 AI 禁用区，不得由第三方写入。
+- 两个目录互不写文件；数据流动方向：**私有代码 → pybao 扩展 → 引擎（7899）→ LevelDB（data/ 行情 + mydb/ 私有存储）**；研究成果/仓库数据落本仓库 `data/`（不进引擎）
+- mydb 保留前缀（`日k`/`分钟k`/`复权`/`股票代码` 等 + `打板指标:`/`竞价快照:` 等研究命名空间）为禁用区，自定义表写入（/api/data/write）已被 `validate_custom_table` 拦截，勿绕过
 
 ## 2. 运行配方（本机实测，缺一不可）
 
@@ -33,6 +41,16 @@
 （`pybao/` 内 `3.14t+*.pyd` 为上游 free-threaded 备用件，当前不用）。本机 uv 索引最高
 3.14.4，用 `uv venv --python 3.14.4` 即可（测试纯标准库、扩展 ABI 匹配已验证）。
 
+**依赖管理（0.10.0 起）**：duckdb 为首个第三方依赖（uv 锁定）。本机开发统一
+`uv sync` 后 `uv run python -m unittest ...`（或 `uv run python app.py`）；CI 同源
+（setup-uv + `uv sync --frozen`）。升级 duckdb：改 pyproject 后 `uv lock`，并同步
+`docker/Dockerfile` 的 `pip install duckdb==<pin>`（发布纪律）。
+
+**仓库层（0.10.0 D12）**：`DATA_DIR/warehouse/`（facts/ Parquet + warehouse.duckdb）。
+沉淀任务交易日 16:40 自动触发（`WAREHOUSE_SEDIMENT_TIME` 可覆盖）；手动小范围测试：
+`POST /api/warehouse/run {"days":3}`；状态 `GET /api/warehouse/status`；回滚演练
+`WAREHOUSE_ENABLED=0`。设计见 `docs/design/warehouse.md`。
+
 **git 访问**（本机 TLS 特殊性）：Windows schannel 凭据获取失败（SEC_E_NO_CREDENTIALS），
 仓库级 config 已固化 `http.sslBackend=openssl` + `http.proxy=http://127.0.0.1:7890`；
 新 clone 时需手工加上这两个配置。
@@ -40,8 +58,9 @@
 ## 3. 开发工作流
 
 1. 数据更新：上游 `数据更新.exe` 保持引擎数据最新（`000001` 最新交易日为探针）
-2. 代码改动：本仓库分支 → 单测（`stockdb-ai/` 下 `python -m unittest test_quote_sources
-   test_auction_metrics test_auction_list test_ops interfaces.mcp.test_stockdb_mcp_server`，261 全绿）
+2. 代码改动：本仓库分支 → 单测（`stockdb-ai/` 下 `uv run python -m unittest
+   test_quote_sources test_auction_metrics test_auction_list test_ops test_warehouse
+   interfaces.mcp.test_stockdb_mcp_server`，308 全绿）
 3. 回填/采集：`auction_run_backfill(days=60)`（app.py）直连引擎写 mydb
 4. 验收：异源签字口径见 `docs/design/auction-collector.md` 与 `docs/acceptance/`
 5. 发布：CHANGELOG → 分支 → PR → 合并 → tag `vX.Y.Z`；docker 镜像仅成熟后手动触发

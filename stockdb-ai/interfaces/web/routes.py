@@ -21,6 +21,7 @@ GET_ROUTES: dict[str, str] = {
     "/api/overview": "_overview",
     "/api/auction/status": "_auction_status",
     "/api/auction/daily": "_auction_daily",
+    "/api/warehouse/status": "_warehouse_status",
     "/api/diag": "_diag",
     "/api/alerts": "_alerts",
     "/api/alerts/summary": "_alerts_summary",
@@ -37,6 +38,7 @@ POST_ROUTES: dict[str, str] = {
     "/api/hk/sync": "_hk_sync",
     "/api/alerts/clear": "_alerts_clear",
     "/api/auction/run": "_auction_run",
+    "/api/warehouse/run": "_warehouse_run",
     "/api/research/migrate": "_research_migrate",  # 0.9.12：引擎 mydb 旧研究成果导入 SQLite
     "/mcp": "_mcp",
 }

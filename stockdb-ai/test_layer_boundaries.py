@@ -28,7 +28,8 @@ ALLOWED = {
 LAYER_PACKAGES = ("interfaces", "services", "core", "storage", "ops")
 # 0.9.8：接口层整体禁止被下层依赖（web/mcp 已收拢 interfaces/，无需再单列）
 FORBIDDEN = {
-    "services": {"interfaces", "storage.providers"},  # 0.9.5 M5：服务层只依赖注入的仓储接口
+    # 0.9.5 M5：服务层只依赖注入的仓储接口；0.10.0 C3：warehouse 同样走注入
+    "services": {"interfaces", "storage.providers", "storage.warehouse"},
     "storage": {"interfaces", "services", "core"},
     "ops": {"interfaces", "services", "core"},
     "core": {"interfaces", "services", "storage", "ops"},

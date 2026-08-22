@@ -76,6 +76,8 @@ from app import (  # noqa: E402 - app.py 末尾导入本模块（组合根），
     stockdb_get,
     sync_capability,
     tail_log,
+    warehouse_run_async,
+    warehouse_status,
 )
 
 # 0.9.11：请求体大小上限（防超大 POST 拖垮 NAS；配合 Handler.timeout 防读阻塞挂线程）
@@ -132,6 +134,22 @@ class Handler(BaseHTTPRequestHandler):
         """GET /api/auction/status：回填状态 + 日级守卫（0.9.2 批次 6 从内联提取）。"""
         self._send(200, json.dumps({"backfill": _auction_backfill_state,
                                     "fired": _auction_fired}, ensure_ascii=False))
+
+    def _warehouse_status(self):
+        """GET /api/warehouse/status：仓库沉淀状态（0.10.0 W4 运维口，非面板）。"""
+        self._send(200, json.dumps(warehouse_status(), ensure_ascii=False))
+
+    def _warehouse_run(self):
+        """POST /api/warehouse/run {"days":1-5,"reconcile_sample":n}：手动触发沉淀。
+
+        days>1 供小范围测试通道（从最新已同步交易日回看补沉淀，幂等：已有分区
+        跳过）；异步执行（单飞防重），进度走 GET /api/warehouse/status。
+        """
+        body = self._read_json()
+        days = max(1, min(int(body.get("days") or 1), 5))
+        sample = max(1, min(int(body.get("reconcile_sample") or 10), 50))
+        self._send(200, json.dumps(
+            warehouse_run_async(days=days, reconcile_sample=sample), ensure_ascii=False))
 
     def _auction_daily(self):
         """GET /api/auction/daily：打板链路日检记录（0.9.2 批次 7 可观测性）。"""

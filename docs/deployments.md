@@ -1,6 +1,8 @@
 # 部署台账（NAS 极空间 Q4）
 
 > 每次用户手动部署后更新：日期 / 版本 / 验证结论 / 备注。
+> 0.10.0 注：开发主线 = 本机 Windows 原生（无部署动作）；本台账记录 NAS docker
+> 可选发布物的部署历史。
 > 部署方式：`docker compose pull && docker compose up -d`（面板级回滚：环境变量 `WEBUI_UI=legacy`）。
 
 | 日期 | 版本 | 部署人 | 验证结论 | 备注 |

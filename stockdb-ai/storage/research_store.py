@@ -3,7 +3,10 @@
 ResearchStore 抽象接口（防腐层，用户 Repository 模式采纳）+ SQLite（WAL）实现
 + 引擎 mydb 回滚适配。应用层只依赖注入的接口，不感知存储实现（D3 兑现）。
 
-存储：DATA_DIR/research.db，WAL 模式，busy_timeout 5s；NaN/Inf 写前护栏沿用。
+存储：DATA_DIR/research/research.db（0.10.0 治理批起按存储类型收纳；WAL 模式，
+busy_timeout 5s）。旧布局 DATA_DIR/research.db 存在时粘性沿用（NAS 升级无缝；
+不自动搬移，避免 WAL 伴生文件 -wal/-shm 风险，手动迁移 = 停服后整组复制）。
+NaN/Inf 写前护栏沿用。
 """
 from __future__ import annotations
 
@@ -22,6 +25,24 @@ DB_FILE = "research.db"
 BACKUP_DIR = "backups"
 BACKUP_KEEP = 14          # 备份保留份数
 MIGRATION_KEY = "migrated_at"
+
+
+def _legacy_db_exists() -> bool:
+    return (Path(config.DATA_DIR) / DB_FILE).exists()
+
+
+def resolve_db_path() -> Path:
+    """研究库路径：新布局 DATA_DIR/research/research.db；旧布局存在则粘性沿用。"""
+    if _legacy_db_exists():
+        return Path(config.DATA_DIR) / DB_FILE
+    return Path(config.DATA_DIR) / "research" / DB_FILE
+
+
+def resolve_backup_dir() -> Path:
+    """备份目录随库走（新布局 research/backups；旧布局 backups）。"""
+    if _legacy_db_exists():
+        return Path(config.DATA_DIR) / BACKUP_DIR
+    return Path(config.DATA_DIR) / "research" / BACKUP_DIR
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS metrics (
@@ -91,14 +112,14 @@ class ResearchStore(ABC):
 
 
 class SqliteResearchStore(ResearchStore):
-    """SQLite（WAL）实现：DATA_DIR/research.db。
+    """SQLite（WAL）实现：DATA_DIR/research/research.db（旧布局粘性，见模块头）。
 
     单连接 + 线程锁（写串行，读并行——SQLite 读天然并发）；WAL 模式解决
     读写互锁；busy_timeout 5s 防写锁竞争报错。
     """
 
     def __init__(self, db_path: Path | None = None):
-        self._path = db_path or (Path(config.DATA_DIR) / DB_FILE)
+        self._path = db_path or resolve_db_path()
         self._lock = threading.RLock()  # 0.9.11：RLock——_connect 建连在锁内，写/读再入不冲突
         self._conn: sqlite3.Connection | None = None
 
@@ -265,7 +286,7 @@ class SqliteResearchStore(ResearchStore):
     # ---- 备份（VACUUM INTO，在线安全；保留 N 份）----
     def backup(self) -> Path | None:
         try:
-            backup_dir = Path(config.DATA_DIR) / BACKUP_DIR
+            backup_dir = resolve_backup_dir()
             backup_dir.mkdir(parents=True, exist_ok=True)
             stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
             # 0.9.11：秒级时间戳同名冲突（日检自动备份与手动备份同一秒重叠 → 目标

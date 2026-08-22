@@ -67,9 +67,13 @@ FROM python:3.14-slim AS runtime-amd64
 
 # bash：极空间等容器管理 APP 进容器默认执行 /bin/bash，Debian slim 默认没有需显式装；
 # libgcc-s1：提供 pybao 依赖的 libgcc_s.so.1；ca-certificates 供 curl 走 HTTPS。
+# 0.10.0 仓库层（D12）：duckdb 为首个第三方依赖，版本 pin 与仓库根 uv.lock 手动对齐
+# （发布纪律：升 uv.lock 时同步改此处）。仅 amd64(Debian/glibc) 安装——duckdb 无
+# musllinux wheel，arm64(alpine) 不装，仓库工具在镜像内自动降级 DEPENDENCY_UNAVAILABLE。
 RUN apt-get update && apt-get install -y --no-install-recommends \
         tzdata curl bash libgcc-s1 ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && pip install --no-cache-dir duckdb==1.5.5
 
 # ================= 运行时：arm64 保留 alpine(musl)，补 libgcc + libc.so 软链 =================
 FROM python:3.14-alpine AS runtime-arm64

@@ -6,7 +6,7 @@ data/
 __pycache__/
 *.pyc
 .zcode/
-stockdb-ai/.dev-data/
+# 本机开发数据落仓库根 data/（已被首行 data/ 规则忽略；旧 stockdb-ai/.dev-data 已废）
 .npm-cache/
 .venv/
 

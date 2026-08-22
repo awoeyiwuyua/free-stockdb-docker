@@ -18,22 +18,32 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      # 0.10.0 起 duckdb 为首个第三方依赖：uv sync --frozen 按 uv.lock 精确复现
+      # （本机与 CI 同源，版本不漂移）；pyproject/uv.lock 均在仓库根。
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
         with:
           python-version: '3.14'
+          enable-cache: true
+
+      - name: Sync dependencies
+        run: uv sync --frozen
 
       - name: Run MCP unit tests
         working-directory: stockdb-ai
-        run: python -m unittest interfaces.mcp.test_stockdb_mcp_server -v
+        run: uv run --project .. python -m unittest interfaces.mcp.test_stockdb_mcp_server -v
 
       - name: Run ops unit tests
         working-directory: stockdb-ai
-        run: python -m unittest test_ops -v
+        run: uv run --project .. python -m unittest test_ops -v
 
       - name: Run auction collector tests
         working-directory: stockdb-ai
-        run: python -m unittest test_quote_sources test_auction_metrics test_auction_list test_records test_layer_boundaries -v
+        run: uv run --project .. python -m unittest test_quote_sources test_auction_metrics test_auction_list test_records test_layer_boundaries -v
+
+      - name: Run warehouse tests
+        working-directory: stockdb-ai
+        run: uv run --project .. python -m unittest test_warehouse test_research test_research_store test_tool_groups_trace -v
 
   spa-tests:
     name: SPA 前端（构建 + Vitest）

@@ -159,6 +159,6 @@ npm run build      # 编译出 dist/
 ## 下个里程碑（Phase 5 收口）
 
 本地 11 深链冒烟（`app.py` + `dist` 双通道）→ NAS 部署实测与 `/legacy` 逃生通道演练 → 功能清单回归表
-（`docs/webui-spa/m2-regression-checklist.md` 风格）按新菜单结构重新逐项勾选收口。后续可玩的方向：
+（`docs/history/m2-regression-checklist.md` 风格）按新菜单结构重新逐项勾选收口。后续可玩的方向：
 日志中心加"级别筛选"（DEBUG/INFO/WARN/ERROR 下拉）与一键导出；诊断中心记录历史体检结果画趋势；
 趋势图把"下载量"换成速率轴；顶栏再考虑"可配置隐藏"。
