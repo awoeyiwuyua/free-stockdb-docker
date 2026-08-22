@@ -141,10 +141,11 @@ class StockdbMcpServerTests(unittest.TestCase):
         self.assertFalse(metadata["formal_usable"])
         self.assertIn("SOURCE_REQUEST_FAILED", metadata["partial_reasons"])
 
+    @mock.patch.object(server, "_classify_empty_codes")
     @mock.patch.object(server, "query_stock_list")
     @mock.patch.object(server, "query_daily_kline")
     def test_unclassified_empty_code_blocks_complete_coverage(
-        self, query_daily_kline, query_stock_list
+        self, query_daily_kline, query_stock_list, classify
     ):
         query_stock_list.return_value = {
             "total": 2,
@@ -153,6 +154,10 @@ class StockdbMcpServerTests(unittest.TestCase):
         query_daily_kline.side_effect = lambda code, *_: (
             [] if code == "600002" else [self._daily_row(code)]
         )
+        classify.return_value = {
+            "suspended": [], "delisted_or_not_listed": [],
+            "not_published": [], "unclassified": ["600002"],
+        }
 
         _, metadata = server.query_fullmarket_daily_snapshot(
             "20260105", "20260105", workers=1
@@ -160,7 +165,95 @@ class StockdbMcpServerTests(unittest.TestCase):
 
         self.assertFalse(metadata["coverage_is_complete"])
         self.assertFalse(metadata["formal_usable"])
+        self.assertFalse(metadata["candidate_coverage"]["complete"])
         self.assertIn("EMPTY_CODE_UNCLASSIFIED", metadata["partial_reasons"])
+        classify.assert_called_once_with(["600002"], "20260105")
+
+    @mock.patch.object(server, "_classify_empty_codes")
+    @mock.patch.object(server, "query_stock_list")
+    @mock.patch.object(server, "query_daily_kline")
+    def test_suspended_empty_codes_do_not_block_formal_usable(
+        self, query_daily_kline, query_stock_list, classify
+    ):
+        """P2：空代码分类为停牌/退市 → 不否决正式可用性（只记 partial_reasons）。"""
+        query_stock_list.return_value = {
+            "total": 2,
+            "codes": ["600001", "600002"],
+        }
+        query_daily_kline.side_effect = lambda code, *_: (
+            [] if code == "600002" else [self._daily_row(code)]
+        )
+        classify.return_value = {
+            "suspended": ["600002"], "delisted_or_not_listed": [],
+            "not_published": [], "unclassified": [],
+        }
+
+        _, metadata = server.query_fullmarket_daily_snapshot(
+            "20260105", "20260105", workers=1
+        )
+
+        self.assertFalse(metadata["coverage_is_complete"])  # 审计语义不变
+        self.assertTrue(metadata["candidate_coverage"]["complete"])
+        self.assertTrue(metadata["formal_usable"])           # 新语义：停牌不否决
+        self.assertIn("EMPTY_SUSPENDED", metadata["partial_reasons"])
+        self.assertNotIn("EMPTY_CODE_UNCLASSIFIED", metadata["partial_reasons"])
+        self.assertEqual(
+            metadata["empty_code_breakdown"]["suspended"], ["600002"],
+        )
+
+    @mock.patch.object(server, "_classify_empty_codes")
+    @mock.patch.object(server, "query_stock_list")
+    @mock.patch.object(server, "query_daily_kline")
+    def test_delisted_empty_codes_do_not_block_formal_usable(
+        self, query_daily_kline, query_stock_list, classify
+    ):
+        query_stock_list.return_value = {
+            "total": 2,
+            "codes": ["600001", "600002"],
+        }
+        query_daily_kline.side_effect = lambda code, *_: (
+            [] if code == "600002" else [self._daily_row(code)]
+        )
+        classify.return_value = {
+            "suspended": [], "delisted_or_not_listed": ["600002"],
+            "not_published": [], "unclassified": [],
+        }
+
+        _, metadata = server.query_fullmarket_daily_snapshot(
+            "20260105", "20260105", workers=1
+        )
+
+        self.assertTrue(metadata["formal_usable"])
+        self.assertIn("EMPTY_DELISTED_OR_NOT_LISTED", metadata["partial_reasons"])
+
+    @mock.patch.object(server, "query_point_snapshot")
+    def test_classify_empty_codes_maps_point_snapshot_categories(self, point_snapshot):
+        """P2：分类映射——INVALID_SYMBOL→退市未上市 / NO_DATA→停牌 / 未发布→否决类。"""
+        point_snapshot.return_value = {
+            "points": [],
+            "errors": [
+                {"code": server.ERROR_INVALID_SYMBOL, "symbol": "000001",
+                 "message": "代码不在股票池"},
+                {"code": server.ERROR_NO_DATA, "symbol": "000002",
+                 "message": "交易日无 bar"},
+                {"code": server.ERROR_NOT_PUBLISHED, "symbol": "000003",
+                 "message": "尚未发布"},
+                {"code": server.ERROR_INTERNAL_ERROR, "symbol": "000004",
+                 "message": "timeout"},
+            ],
+        }
+
+        breakdown = server._classify_empty_codes(
+            ["000001", "000002", "000003", "000004"], "20260105")
+
+        self.assertEqual(breakdown["delisted_or_not_listed"], ["000001"])
+        self.assertEqual(breakdown["suspended"], ["000002"])
+        self.assertEqual(breakdown["not_published"], ["000003"])
+        self.assertEqual(breakdown["unclassified"], ["000004"])
+        point_snapshot.assert_called_once_with(
+            {"date": "20260105", "codes": ["000001", "000002", "000003", "000004"],
+             "limit": 0},
+        )
 
     @mock.patch.object(server, "query_stock_list")
     @mock.patch.object(server, "query_daily_kline")
@@ -2185,6 +2278,272 @@ class _SnapshotPacingTests(unittest.TestCase):
         self.assertEqual(m_sleep.call_count, 60)      # 每只一次节流
         self.assertEqual(len(result["points"]), 60)
         self.assertFalse(result["truncated"])
+
+
+class _AuctionKeyContractTests(unittest.TestCase):
+    """0.9.10 键契约回归：写端键形（表=打板指标:<date>，键=metrics）必须可读。"""
+
+    @staticmethod
+    def _payload(**overrides) -> dict:
+        payload = {
+            "metrics": {"premium_mean": 1.21, "success_rate": 0.49, "n_samples": 57},
+            "rank_60d": {"premium_mean": 0.5, "success_rate": 0.5},
+            "strength_60d": {"premium_mean": "neutral", "success_rate": "neutral"},
+            "window": 60, "n_samples": 57,
+            "computed_at": "2026-01-05T09:26:03", "value_source": "auction",
+            "contract": "auction-metric-v1",
+        }
+        payload.update(overrides)
+        return payload
+
+    @staticmethod
+    def _daily_payload() -> dict:
+        """写端 0.9.10 真实载荷形态：打板指标:<date> 表 + metrics 键，payload 含 daily。
+
+        daily 结构 = core.auction_metrics.build_daily_row 输出（统计/分布/指标/溯源）。
+        """
+        metrics = {"premium_mean": 1.21, "success_rate": 0.4912, "n_samples": 57}
+        daily = {
+            "trade_date": "2026-01-05",
+            "matched_count": 57,
+            "positive_count": 28, "flat_count": 1, "negative_count": 28,
+            "success_rate": 0.4912, "average_open_return_pct": 1.2113,
+            "p10_open_return_pct": -2.0, "p25_open_return_pct": -1.0,
+            "median_open_return_pct": 0.5, "p75_open_return_pct": 2.0,
+            "p90_open_return_pct": 3.5,
+            "distribution": {
+                "open_return_pct": [-2.0, -1.0, 0.5, 2.0, 3.5],
+                "sample_codes": ["600001", "600002", "600003", "600004", "600005"],
+            },
+            "metrics": dict(metrics),
+            "rank_60d": {"premium_mean": 0.5, "success_rate": 0.5},
+            "strength_60d": {"premium_mean": "neutral", "success_rate": "neutral"},
+            "window": 60, "n_samples": 57,
+            "computed_at": "2026-01-05T09:26:03", "value_source": "auction",
+            "contract": "auction-metric-v1",
+            "coverage": {"codes_requested": 59, "fetched": 57,
+                         "fetch_errors": 2, "missing_open": 0},
+            "known_at": "2026-01-05T09:25:00",
+        }
+        return _AuctionKeyContractTests._payload(metrics=metrics, daily=daily)
+
+    @mock.patch.object(server, "_rd_get_locked")
+    def test_read_metrics_new_key_contract(self, rd_get):
+        """新契约：rd.get("打板指标:20260105", "metrics") 必须命中（0.9.10 键契约修复）。"""
+        rd_get.return_value = self._payload()
+        row = {"trade_date": "2026-01-05"}
+
+        server._attach_auction_metrics(row, None, "2026-01-05")
+
+        rd_get.assert_called_once_with("打板指标:20260105", "metrics")
+        self.assertEqual(row["metrics"]["premium_mean"], 1.21)
+        self.assertEqual(row["metrics"]["n_samples"], 57)
+        self.assertEqual(row["metrics"]["value_source"], "auction")
+
+    @mock.patch.object(server, "_rd_get_locked")
+    def test_read_metrics_legacy_key_fallback(self, rd_get):
+        """旧契约回退：新键形 miss 时 rd.get("打板指标", "20260105")（0.8.x 遗留数据）。"""
+        rd_get.side_effect = [None, self._payload()]
+
+        row = {"trade_date": "2026-01-05"}
+        server._attach_auction_metrics(row, None, "2026-01-05")
+
+        self.assertEqual(
+            rd_get.call_args_list,
+            [mock.call("打板指标:20260105", "metrics"),
+             mock.call("打板指标", "20260105")],
+        )
+        self.assertEqual(row["metrics"]["n_samples"], 57)
+
+    def test_read_metrics_prefers_research_store(self):
+        """双通道优先级：research_store（写端同源）命中时引擎 rd 不被触碰。"""
+        fake_rd = mock.Mock()
+        store = mock.Mock()
+        store.read_metrics.return_value = self._payload()
+
+        row = {"trade_date": "2026-01-05"}
+        server._attach_auction_metrics(row, fake_rd, "2026-01-05", store=store)
+
+        store.read_metrics.assert_called_once_with("20260105")
+        fake_rd.get.assert_not_called()
+        self.assertEqual(row["metrics"]["premium_mean"], 1.21)
+
+    def test_precomputed_row_reads_daily_payload(self):
+        store = mock.Mock()
+        store.read_metrics.return_value = self._daily_payload()
+
+        daily = server._precomputed_row(None, "2026-01-05", store)
+
+        self.assertIsNotNone(daily)
+        self.assertEqual(daily["matched_count"], 57)
+        self.assertEqual(
+            daily["distribution"]["sample_codes"],
+            ["600001", "600002", "600003", "600004", "600005"],
+        )
+
+    def test_row_from_daily_is_homomorphic_with_kline_rows(self):
+        """daily 行 → days 行：审计计数置 None 占位（不伪造 0），分布/指标原样。"""
+        daily = self._daily_payload()["daily"]
+        row = server._row_from_daily(daily, "2026-01-05", include_distribution=True)
+
+        self.assertEqual(row["trade_date"], "2026-01-05")
+        self.assertEqual(row["matched_count"], 57)
+        for field in server.BOARD_OPEN_COUNTER_FIELDS:
+            self.assertIsNone(row[field])  # 采集器侧不可得：null 而非 0
+        self.assertEqual(row["distribution"], daily["distribution"])
+        self.assertIn("metrics", row)
+        self.assertEqual(row["metrics"]["n_samples"], 57)
+
+    def test_row_from_daily_strips_distribution_when_excluded(self):
+        daily = self._daily_payload()["daily"]
+        row = server._row_from_daily(daily, "2026-01-05", include_distribution=False)
+        self.assertNotIn("distribution", row)
+
+
+class _AuctionFastPathTests(unittest.TestCase):
+    """0.9.10 预计算快速通道：全覆盖直读 mydb/SQLite，不扫全市场。"""
+
+    def test_fast_path_full_precomputed_skips_market_scan(self):
+        """区间内全部交易日有 daily 行 → 直读返回：不调 stock_list/日K，cache_hit=true。"""
+        store = mock.Mock()
+        store.read_metrics.side_effect = (
+            lambda d8: _AuctionKeyContractTests._daily_payload()
+            if d8 == "20260105" else None)
+        store.read_snapshots.return_value = {}
+        with mock.patch.object(server, "_get_research_store", return_value=store), \
+             mock.patch.object(server.pybao_tools, "get_mydb_rd", return_value=None), \
+             mock.patch.object(server, "query_stock_list",
+                               side_effect=AssertionError("快速通道不应拉全市场")) as qsl, \
+             mock.patch.object(server, "query_daily_kline",
+                               side_effect=AssertionError("快速通道不应拉日K")) as qdk:
+            result = server.query_board_open_effect_history(
+                "20260105", "20260105", include_distribution=True)
+
+        qsl.assert_not_called()
+        qdk.assert_not_called()
+        self.assertTrue(result["cache_hit"])
+        self.assertEqual(result["load_path"], "mydb")
+        self.assertEqual(result["precomputed_days"], 1)
+        self.assertIsNone(result["fallback_reason"])
+        self.assertEqual(len(result["days"]), 1)
+        day = result["days"][0]
+        self.assertEqual(day["trade_date"], "2026-01-05")
+        self.assertEqual(day["matched_count"], 57)
+        self.assertIn("distribution", day)  # include_distribution=true 保留分布
+        self.assertEqual(result["known_at"], "20260105 09:25 预计算(auction)")
+        self.assertEqual(result["sample_coverage"]["codes_requested"], 59)
+        self.assertTrue(result["sample_coverage"]["complete"])
+
+    def test_fast_path_strips_distribution_when_excluded(self):
+        store = mock.Mock()
+        store.read_metrics.side_effect = (
+            lambda d8: _AuctionKeyContractTests._daily_payload()
+            if d8 == "20260105" else None)
+        store.read_snapshots.return_value = {}
+        with mock.patch.object(server, "_get_research_store", return_value=store), \
+             mock.patch.object(server.pybao_tools, "get_mydb_rd", return_value=None):
+            result = server.query_board_open_effect_history(
+                "20260105", "20260105", include_distribution=False)
+
+        self.assertNotIn("distribution", result["days"][0])
+        self.assertEqual(result["sample_coverage"]["n_samples"], 57)
+
+    def test_fast_path_partial_precomputed_falls_back(self):
+        """区间部分交易日无预计算 → 全市场重算慢路径（cache_hit=false + fallback 标记）。"""
+        store = mock.Mock()
+        store.read_metrics.side_effect = (
+            lambda d8: _AuctionKeyContractTests._daily_payload()
+            if d8 == "20260105" else None)  # 01-06 无预计算
+        store.read_snapshots.return_value = {}
+        with mock.patch.object(server, "_get_research_store", return_value=store), \
+             mock.patch.object(server.pybao_tools, "get_mydb_rd", return_value=None), \
+             mock.patch.object(server, "query_stock_list",
+                               return_value={"codes": ["600001", "600002"]}), \
+             mock.patch.object(server, "query_daily_kline",
+                               side_effect=lambda code, *_: [
+                                   {"date": 20260106, "open": 10.0, "high": 10.5,
+                                    "low": 9.8, "close": 10.2, "pre_close": 10.0,
+                                    "amount": 1, "is_st": 0, "code": code}]):
+            result = server.query_board_open_effect_history(
+                "20260105", "20260106", include_distribution=False)
+
+        self.assertFalse(result["cache_hit"])
+        self.assertEqual(result["load_path"], "kline")
+        self.assertEqual(result["precomputed_days"], 0)
+        self.assertIn("已全市场重算", result["fallback_reason"])
+
+    def test_merge_prefers_daily_row_when_present(self):
+        """慢路径合并：有预计算 daily 的日期优先用完整日级行（写端同源）。"""
+        fake_rd = mock.Mock()
+        fake_rd.keys.return_value = ["竞价快照:20260105:600001"]
+        fake_rd.get.return_value = {"open_price": 10.3, "prev_close": 10.0,
+                                    "source": "tencent", "fetched_at": "2026-01-05T09:26:03"}
+        store = mock.Mock()
+        store.read_metrics.side_effect = (
+            lambda d8: _AuctionKeyContractTests._daily_payload()
+            if d8 == "20260105" else None)
+        with mock.patch.object(server, "_get_research_store", return_value=store), \
+             mock.patch.object(server.pybao_tools, "get_mydb_rd", return_value=fake_rd):
+            days = []
+            known_at, error, stats = server._merge_auction_days(
+                {}, days, "2026-01-05", "2026-01-05", include_distribution=True)
+
+        self.assertEqual(stats["precomputed_dates"], ["2026-01-05"])
+        self.assertEqual(len(days), 1)
+        self.assertEqual(days[0]["matched_count"], 57)  # daily 行（非快照重组）
+        self.assertIn("预计算(auction)", known_at)
+        self.assertIsNone(error)
+
+    def test_merge_falls_back_to_snapshot_row_without_daily(self):
+        """无预计算但有快照：T-1 日K 判定 + 快照溢价重组（现逻辑，引擎键形兼容）。"""
+        fake_rd = mock.Mock()
+        fake_rd.keys.return_value = ["竞价快照:20260105:600001"]
+        fake_rd.get.return_value = {"open_price": 10.3, "prev_close": 10.0,
+                                    "source": "tencent", "fetched_at": "2026-01-05T09:26:03"}
+        store = mock.Mock()
+        store.read_metrics.return_value = None
+        store.read_snapshots.return_value = {}
+        with mock.patch.object(server, "_get_research_store", return_value=store), \
+             mock.patch.object(server.pybao_tools, "get_mydb_rd", return_value=fake_rd):
+            # T-1（2026-01-02）非一字板涨停：close=涨停价 11.0，open=10.5 < 11.0
+            snapshot = {"2026-01-02": [server.DailyBar(
+                code="600001", close=11.0, high=11.0, low=10.5,
+                amount=1, prev_close=10.0, open=10.5, is_st=False)]}
+            days = []
+            known_at, error, stats = server._merge_auction_days(
+                snapshot, days, "2026-01-05", "2026-01-05", include_distribution=True)
+
+        self.assertEqual(stats["precomputed_dates"], [])
+        self.assertEqual(len(days), 1)
+        self.assertEqual(days[0]["prior_limit_up_count"], 1)
+        self.assertEqual(days[0]["matched_count"], 1)
+        # 溢价 = 快照 open_price / T-1 收盘（11.0 涨停价）- 1（0.8.13 分母口径）
+        self.assertAlmostEqual(days[0]["average_open_return_pct"],
+                               (10.3 / 11.0 - 1) * 100)
+        self.assertIn("竞价采集(source=tencent)", known_at)
+
+    @mock.patch.object(server, "_rd_get_locked")
+    def test_fast_path_engine_rd_legacy_keys(self, rd_get):
+        """快速通道引擎通道：旧键形（表=打板指标，键=<date>）也能读（0.8.x 数据兼容）。"""
+        rd_get.side_effect = [None, _AuctionKeyContractTests._daily_payload()]
+        store = None
+        with mock.patch.object(server, "_get_research_store", return_value=store), \
+             mock.patch.object(server.pybao_tools, "get_mydb_rd", return_value=mock.Mock()), \
+             mock.patch.object(server, "query_stock_list",
+                               side_effect=AssertionError("不应拉全市场")), \
+             mock.patch.object(server, "query_daily_kline",
+                               side_effect=AssertionError("不应拉日K")):
+            result = server.query_board_open_effect_history(
+                "20260105", "20260105", include_distribution=False)
+
+        self.assertTrue(result["cache_hit"])
+        self.assertEqual(result["days"][0]["matched_count"], 57)
+        rd_get.assert_any_call("打板指标:20260105", "metrics")
+        rd_get.assert_any_call("打板指标", "20260105")
+
+
+if __name__ == "__main__":
+    unittest.main()
 
 
 if __name__ == "__main__":

@@ -45,6 +45,7 @@ try:
     from core.auction_list import compute_limitup_list as _auction_compute_limitup_list
     from core.auction_metrics import (
         METRICS as AUCTION_METRICS,
+        build_daily_row as _auction_build_daily_row,
         compute_metrics as _auction_compute_metrics,
         load_series as _auction_load_series,
         append_series as _auction_append_series,
@@ -65,6 +66,10 @@ except Exception as _auction_import_exc:  # noqa: BLE001 - 任一模块缺失时
 _auction_fired: dict = {}  # 日级防重触发守卫：{date: {"collect": bool, "close": bool}}
 _auction_backfill_state: dict = {"running": False, "started": None, "finished": None,
                                  "result": None}  # 回填任务状态（0.8.2 异步化 + 单飞防重）
+# 0.9.11：回填单飞守卫锁（检查+置位原子化，防并发双份回填）与序列写锁
+#（append 读-改-写与回填整体覆盖互斥，防 lost update）
+_auction_backfill_lock = threading.Lock()
+_series_lock = threading.Lock()
 
 
 def _auction_apply_reference(points: list[dict], date: str,
@@ -171,6 +176,47 @@ def _auction_prev_trade_date(d8: str, n: int = 1) -> str:
     return d.strftime("%Y%m%d")
 
 
+def _auction_next_trade_date(d8: str, n: int = 1) -> str:
+    """从 d8 往后找第 n 个交易日（YYYYMMDD），用于明日清单键（0.9.11）。
+
+    此前用"日历次日"：周五 16:30 收口写 清单:<周六>，周一 09:26 读 清单:<周一>
+    永远读不到 → 每周一/节后首个交易日恒走全市场兜底现算（浪费且兜底失败即
+    当日采集失败）。清单是"下一交易日采集清单"，键必须落在下一交易日。
+    """
+    d = datetime.strptime(d8, "%Y%m%d").date()
+    found = 0
+    guard = 0
+    while found < n:
+        d += timedelta(days=1)
+        guard += 1
+        if guard > 400:  # 约一年自然日上限：注入点缺失时防御死循环
+            raise ValueError(f"_auction_next_trade_date: 400 日内未找到交易日（{d8}）")
+        if is_trading_day is None or is_trading_day(d):
+            found += 1
+    return d.strftime("%Y%m%d")
+
+
+def _auction_calendar_guard(d8: str) -> None:
+    """休市表覆盖护栏（0.9.11）：未收录年份按"工作日=交易日"处理，休市日会被误判
+    为交易日——采集会写全 None 指标行并生成 daily 子载荷，MCP 快速通道会把它当
+    真实预计算结果返回。超过 XSHG_HOLIDAYS_THROUGH 直接拒绝任务并告警。"""
+    try:
+        from core.calendar_xshg import XSHG_HOLIDAYS_THROUGH
+        if d8 > XSHG_HOLIDAYS_THROUGH.replace("-", ""):
+            msg = (f"休市表未收录 {d8[:4]} 年（数据截至 {XSHG_HOLIDAYS_THROUGH}），"
+                   f"拒绝打板任务以免休市日误判；请更新 calendar_xshg")
+            log(f"⚠️ {msg}")
+            try:
+                notify_alert("warning", "打板日历", msg)
+            except Exception:  # noqa: BLE001 - 告警通道异常忽略
+                pass
+            raise ValueError(f"休市表未收录 {d8[:4]} 年（数据截至 {XSHG_HOLIDAYS_THROUGH}）")
+    except ValueError:
+        raise
+    except Exception:  # noqa: BLE001 - 护栏读取失败不阻塞任务（保守放行）
+        pass
+
+
 def auction_run_collect() -> dict:
     """09:26 打板竞价采集任务（幂等，可手动重跑）。
 
@@ -186,6 +232,10 @@ def auction_run_collect() -> dict:
                 "collected": 0, "errors_count": 0, "metrics": None, "rank_60d": None, "strength_60d": None}
     today = datetime.now().strftime("%Y%m%d")
     try:
+        # 0.9.11：休市表覆盖护栏——未收录年份按"工作日=交易日"处理，休市日会被误判
+        # 为交易日并写入全 None 指标行（MCP 快速通道会当真实预计算返回）
+        _auction_calendar_guard(today)
+
         # ① 清单：昨日 16:30 已算好落库；缺失/为空 → 前一交易日快照兜底现算
         codes = _auction_load_codes(today)
         if not codes:
@@ -217,6 +267,20 @@ def auction_run_collect() -> dict:
             row["diff_pct"] = None             # 对账后回填
             row["reconciled_at"] = None
             items.append((str(snap["code"]), row))  # 0.8.6：pybao 存原生 dict，不存 JSON 字符串
+        # 0.9.11：手动重跑 collect 不得抹掉当日已收口对账结论——state=reconciled 的
+        # 行保留 diff_pct/reconciled_at，仅补缺失 code（否则对账证据/告警审计丢失）
+        try:
+            existing = (research_store.read_snapshots(today)
+                        if research_store is not None else {})
+        except Exception:  # noqa: BLE001 - 读失败不阻塞采集
+            existing = {}
+        preserved_codes = {
+            code for code, row in existing.items()
+            if isinstance(row, dict) and row.get("state") == "reconciled"
+        }
+        if preserved_codes:
+            items = [(c, r) for c, r in items if c not in preserved_codes]
+            log(f"📊 当日 {len(preserved_codes)} 条快照已对账，重跑采集保留其结论")
         if items:                              # 空 items 时仓储写会抛 ValueError
             research_store.write_snapshots(today, dict(items))
 
@@ -225,6 +289,16 @@ def auction_run_collect() -> dict:
         series_by = {m: _auction_load_series(_research_series_read, m) for m in AUCTION_METRICS}
         payload = _auction_build_payload(ok_items, series_by,
                                          computed_at=_now_iso(), value_source="auction")
+        # 0.9.10：完整日级结果随指标载荷一起持久化（daily 子载荷，MCP 快速通道直读；
+        #   含分布/计数/覆盖率/数据溯源，查询不再重扫全市场）
+        missing_open = sum(1 for s in ok_items
+                           if s.get("open_price") is None or s.get("prev_close") is None)
+        payload["daily"] = _auction_build_daily_row(
+            ok_items, payload,
+            trade_date=f"{today[:4]}-{today[4:6]}-{today[6:8]}",
+            known_at=f"{today[:4]}-{today[4:6]}-{today[6:8]}T09:25:00",
+            coverage={"codes_requested": len(codes), "fetched": len(ok_items),
+                      "fetch_errors": len(errors), "missing_open": missing_open})
         research_store.write_metrics(today, payload)
         log(f"📊 打板竞价采集（{today}）: {len(ok_items)} 只快照（errors={len(errors)}），"
             f"premium_mean={metrics.get('premium_mean')}, n={metrics.get('n_samples')}")
@@ -263,6 +337,9 @@ def auction_run_close() -> dict:
                 "list_count": 0, "reconciled": 0, "diff_alerts": 0, "metrics": None}
     today = datetime.now().strftime("%Y%m%d")
     try:
+        # 0.9.11：休市表覆盖护栏（同 collect）
+        _auction_calendar_guard(today)
+
         # ① 当日 K 线已同步校验（force 绕过 8s 缓存，收口口径必须实时）
         latest = str(data_latest(force=True) or "").replace("-", "")
         if not latest or latest < today:
@@ -280,7 +357,9 @@ def auction_run_close() -> dict:
         prev_points = (query_snapshot({"date": prev_day, "limit": 0}) or {}).get("points") or []
         listing = _auction_compute_limitup_list(
             _auction_apply_reference(points, today, _auction_lag_close(prev_points)))
-        tomorrow = (datetime.strptime(today, "%Y%m%d").date() + timedelta(days=1)).strftime("%Y%m%d")
+        # 0.9.11：明日清单键 = 下一交易日（此前用日历次日：周五写周六键 → 周一采集
+        # 读不到，每周一/节后首个交易日恒走全市场兜底现算）
+        tomorrow = _auction_next_trade_date(today)
         list_payload = {"codes": listing.get("codes") or [],
                         "computed_at": _now_iso(),
                         "contract": "limitup-non-yizi-v1"}
@@ -348,15 +427,29 @@ def auction_run_close() -> dict:
             snapshots = [s for s in snapshots if s["prev_close"] is not None]
         metrics = _auction_compute_metrics(snapshots)
         metrics = {**metrics, "missing_open_count": missing_open}
-        series_by = {}
+        # 0.9.11 分位口径：rank 窗口 = 严格"此前 60 个有效观测"（与 09:26 竞价版/
+        # 回填同口径）——先用 append 前的序列算分位，再追加当日值。此前先
+        # append_series 再 build_metrics_payload：当日值挤进窗口，第 60 条此前观测
+        # 被挤出，rank 与竞价版差 1/60；历史恰 59 条时还提前给出 rank（口径未定义）
+        series_before = {m: _auction_load_series(_research_series_read, m)
+                         for m in AUCTION_METRICS}
+        payload = _auction_build_payload(snapshots, series_before,
+                                         computed_at=_now_iso(), value_source="kline")
         for m in AUCTION_METRICS:
             value = metrics.get(m)
             if value is None:      # n_samples=0 时指标为 None：不入序列
                 continue
-            series_by[m] = _auction_append_series(
-                _research_series_read, _research_series_write, m, value, today)
-        payload = _auction_build_payload(snapshots, series_by,
-                                         computed_at=_now_iso(), value_source="kline")
+            # 0.9.11：序列读-改-写持 _series_lock 原子化（与回填 write_series 并发
+            # 防 lost update：收口 append 与回填整体覆盖互斥）
+            with _series_lock:
+                _auction_append_series(
+                    _research_series_read, _research_series_write, m, value, today)
+        # 0.9.10：K线权威版同样持久化 daily 子载荷（覆盖竞价版，含缺价守恒计数）
+        payload["daily"] = _auction_build_daily_row(
+            snapshots, payload,
+            trade_date=f"{today[:4]}-{today[4:6]}-{today[6:8]}",
+            coverage={"codes_requested": len(codes), "fetched": len(snapshots),
+                      "fetch_errors": 0, "missing_open": missing_open})
         research_store.write_metrics(today, payload)
         log(f"📊 打板收口对账（{today}）: 明日清单 {len(listing.get('codes') or [])} 只，"
             f"对账 {reconciled} 条（偏差告警 {diff_alerts}），"
@@ -474,13 +567,15 @@ def auction_run_backfill(days: int = 60) -> dict:
                     all_vals[metric].append(m[metric])
 
         # 写序列（正序、裁剪 60）：周一 09:26 分位的分母
+        # 0.9.11：持 _series_lock（与收口 append_series 读-改-写互斥，防 lost update）
         series_result = {}
         for metric in AUCTION_METRICS:
             vals = all_vals[metric][-60:]
             seq = {"metric": metric, "values": vals,
                    "window": 60, "contract": "auction-metric-v1",
                    "updated_at": _now_iso(), "source": "backfill-kline"}
-            research_store.write_series(metric, seq)
+            with _series_lock:
+                research_store.write_series(metric, seq)
             series_result[metric] = len(vals)
         return {"ok": True, "backfilled_days": len(rows), "series": series_result}
     except Exception as exc:  # noqa: BLE001 - 单块降级
@@ -495,14 +590,17 @@ def auction_run_backfill_async(days: int = 60) -> dict:
     否则后台线程执行 auction_run_backfill，状态进 _auction_backfill_state
     （GET /api/auction/status 查询），请求立即返回 {ok:True, async:True}。
     幂等：重跑覆盖写，结果确定性。
+    0.9.11：单飞守卫"检查+置 running"在调用线程内持锁原子完成（此前检查与置位
+    分离，两次并发请求可同时通过检查各起一份分钟级全市场回填）。
     """
-    if _auction_backfill_state["running"]:
-        return {"ok": False, "async": True, "reason": "回填已在运行中",
-                "started": _auction_backfill_state["started"]}
-
-    def _worker():
+    with _auction_backfill_lock:
+        if _auction_backfill_state["running"]:
+            return {"ok": False, "async": True, "reason": "回填已在运行中",
+                    "started": _auction_backfill_state["started"]}
         _auction_backfill_state.update(running=True, started=_now_iso(),
                                        finished=None, result=None)
+
+    def _worker():
         try:
             result = auction_run_backfill(days)
         except Exception as exc:  # noqa: BLE001 - 状态落库，绝不外抛

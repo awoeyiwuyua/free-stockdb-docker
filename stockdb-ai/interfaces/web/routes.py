@@ -39,5 +39,6 @@ POST_ROUTES: dict[str, str] = {
     "/api/alerts/clear": "_alerts_clear",
     "/api/auction/run": "_auction_run",
     "/api/warehouse/run": "_warehouse_run",
+    "/api/research/migrate": "_research_migrate",  # 0.9.12：引擎 mydb 旧研究成果导入 SQLite
     "/mcp": "_mcp",
 }

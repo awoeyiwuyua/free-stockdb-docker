@@ -60,6 +60,7 @@ from unittest import mock
 
 import app                       # 生产实现（被测对象）
 import config                    # 配置单一入口（0.9.1）
+from interfaces.web.handlers import Handler as _WebHandler  # 0.9.11：Handler 已不在 app 模块级
 from ops import alerts as ops_alerts  # 告警中心（0.9.2 批次 2 迁 ops/alerts.py）
 from storage.providers import free_stockdb as free_stockdb_mod  # 引擎闸口（批次 3）
 from storage.providers import mydb_store as mydb_store_mod      # mydb 读写（批次 3）
@@ -845,11 +846,14 @@ class _FakeConn:
     def sendall(self, data):
         self.wfile.write(data)
 
+    def settimeout(self, *args):  # 0.9.11：Handler.timeout 触发 setup 调用（桩兼容）
+        pass
+
 
 def _do_get(path: str):
     """直连 do_GET，返回 (status, headers_dict, body_bytes)。"""
     conn = _FakeConn()
-    handler = app.Handler(conn, ("127.0.0.1", 1), None)
+    handler = _WebHandler(conn, ("127.0.0.1", 1), None)
     handler.command = "GET"
     handler.request_version = "HTTP/1.1"
     handler.protocol_version = "HTTP/1.1"
@@ -1309,7 +1313,7 @@ class _AuctionBackfillTests(_OpsTestCase):
         # 注意：BaseRequestHandler.__init__ 会自动跑一次 handle()（把空 rfile 当请求行）。
         # 构造后再换入带 body 的新 rfile 与干净 wfile，避免 body 被 parse_request 吃掉。
         conn = _FakeConn()
-        handler = app.Handler(conn, ("127.0.0.1", 1), None)
+        handler = _WebHandler(conn, ("127.0.0.1", 1), None)
         body = json.dumps({"task": "backfill", "days": 3}).encode()
         conn.wfile = io.BytesIO()
         handler.wfile = conn.wfile

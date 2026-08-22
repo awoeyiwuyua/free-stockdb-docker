@@ -50,6 +50,147 @@
   pybao 异源对账 + 性能下限回归（首日实测：横截面 1ms/单标的 2ms/自连接 3ms，大幅达标）
 - 文档：warehouse.md 新增；ROADMAP/README/architecture/development-guide 同步
 
+## [0.9.13] — 2026-08-17（帧交错剩余通道封死：指标计算与 rd 读写统一锁 + 线程栈诊断）
+
+0.9.12 部署实证：点击多了仍卡顿 + RAM 不断膨胀 + 日志无异常——指向进程级冻结
+（C 扩展持 GIL）而非崩溃/异常：
+
+- **pybao 锁统一（根因）**：`_PYBAO_LOCK`（zhibiao.jisuan 指标计算）与 `_RD_LOCK`
+  （rd.get/keys）此前是两把独立锁——但 zhibiao 指标计算与 mydb 读写复用同一引擎
+  socket（zhibiao.rd / get_default_raw_rd 同源），两把锁分别串行仍会并发帧交错
+  （2026-08-16 事故：协议帧交错 → C 扩展持 GIL → 全进程冻结 → 冻结线程不释放
+  → RAM 膨胀）。统一为同一把锁：`_PYBAO_LOCK = _RD_LOCK`（同进程容器与 app 侧
+  `mydb_store._rd_lock` 共享，全进程单锁，无死锁——RLock）
+- **SIGUSR1 线程栈转储**：app.py 启动注册 faulthandler——冻结时执行
+  `docker exec stockdb sh -c 'kill -USR1 $(pgrep -f "python /opt/webui/app.py")'`
+  即可把全部线程栈打到 docker logs（定位卡点，无需重启）
+
+Python 295 全绿。
+## [0.9.12] — 2026-08-17（webui 并发风暴修复：有界 HTTP 并发 + 备份/SQLite 锁收口）
+
+0.9.11 部署实证：点击多了 webui 全站请求超时（进程活着、无错误日志，请求排队/
+阻塞累积而非崩溃）。三个确定性病灶：
+
+- **HTTP 并发无上限**：ThreadingHTTPServer 每请求一线程，慢操作排队时线程无限
+  堆积（最终新请求挂起、全站"无法访问"）→ 新增 `_BoundedHTTPServer`（信号量限
+  并发 64，超限快速断开保活；`daemon_threads=True`；listen backlog 64），点击/
+  客户端风暴不再拖死 webui
+- **backup VACUUM INTO 持业务锁**：主连接 `self._lock` 内复制全库（NAS 磁盘慢时
+  数十秒），期间 MCP 快速通道等全部 SQLite 访问阻塞排队 → 备份改独立连接执行
+  （WAL 模式在线备份由文件级锁保证一致性，不占业务锁）
+- **mydb_read 全表列取连续持锁**：500 键逐键 get 持 `_rd_lock` 全程（引擎慢时
+  25s+），MCP 快速通道/打板任务等全部 rd 访问排队 → 改细粒度持锁（keys 一次、
+  逐键各一次），面板展示对中间态不敏感
+- **旧研究成果导入**：0.9.5 存储迁移（引擎 mydb → /data/research.db）后旧数据
+  不自动导入，打板序列（60 日分位分母）从零积累约 60 个交易日——
+  `migrate_from_engine` 改**仅补缺失**（不覆盖 0.9.11+ 新采集含 daily 的载荷），
+  新增 `POST /api/research/migrate` 入口（幂等可重跑）
+
+本地压力实测：100 并发 /api/status 全部 200 快速完成、0 tracebacks。
+Python 295 全绿。
+
+## [0.9.11] — 2026-08-17（整体迭代：循环导入致命修复 + 常见 bug 类型扫描收口）
+
+0.9.10 部署实证 webui 启动即崩（循环导入），本轮整体迭代修复 + 按 14 类常见 bug
+清单对全部模块做系统扫描（5 组并行审计 40+ 发现，全部 P1 + 高价值 P2 已修）：
+
+**致命修复（0.9.10 部署回归）**
+
+- **app.py ↔ handlers.py 循环导入**：Handler 从模块级移到 `main()` 延迟装配——
+  脚本方式（`python /opt/webui/app.py`，容器 entrypoint）执行时 `sys.modules` 无
+  `app` → handlers 顶层 `import app` 触发循环重载 → ImportError 启动即崩。模块
+  导入方式（`import app`/测试）此前掩盖了该问题；0.9.11 起脚本方式实测启动通过，
+  `test_research` 基线红随之修绿
+
+**P1 并发/数据正确性**
+
+- **pybao rd 单连接无锁并发**（2026-08-16 协议帧交错冻结事故同类）：`mydb_store._rd_lock`
+  改 RLock 并收敛全进程——pybao_tools 新增加锁辅助 `rd_get/rd_keys`（同进程容器与
+  app 侧共享同一把锁），`query_mydb`、MCP 快速通道/合并路径、research_store 迁移
+  路径全部改经加锁访问；`_mydb_rd` 初始化、`research_store._connect`、
+  `research_factory` 单例创建均入锁（消除双连接泄漏与双实例）
+- **records.recent 遇缺日 break** → continue：跨周末/节假日/失败日后面板历史记录
+  不再被截断到当天
+- **screen_stocks indicator_cross 显式 date 窗口退化单日** → start 恒为 date 前推
+  warmup_days（EMA/MACD/OBV 收敛窗口恢复，金叉/死叉信号不再失真/全无）
+- **SDK 单日区间 start==end 空区间**（开区间契约）：`_fullmarket_sdk_outcomes` end
+  顺延一日并客户端过滤——全市场单日快照不再整批空返回被静默判 SUSPENDED
+- **config/pybao_tools 环境变量坏值崩溃**：`STOCKDB_PORT`/`WEBUI_PORT`/
+  `STOCKDB_MAX_CONCURRENCY` 经 `_env_int` 回退告警（此前 import 即崩）；
+  pybao_tools 坏端口不再废掉整个 pybao 子系统
+
+**P2 健壮性/可观测性**
+
+- 清单键跨周末失配：明日清单写"下一交易日"键（周五写周一键，此前恒走全市场兜底）
+- 收口分位口径：rank 窗口 = 严格"此前 60 观测"（先算分位再 append，与竞价版一致，
+  消除 1/60 偏差与提前出 rank）
+- 序列读-改-写原子化（`_series_lock`）：收口 append 与回填整体覆盖互斥防丢更新
+- 回填单飞"检查+置位"持锁原子（防并发双份分钟级全市场回填）
+- 手动重跑采集不再抹掉当日已收口对账结论（reconciled 行保留）
+- 休市表覆盖护栏（2027+ 未收录年份拒绝任务/快速通道回退慢路径，防休市日全 None
+  指标行污染）
+- 调度时间补零规范化（`9:26` 此前使采集 10 点后永不触发）
+- handlers：请求体上限 16MB/负长度防护/socket 超时 30s（防读阻塞挂线程）、
+  `_read_json` 非 dict/非法 UTF-8 防护、`_log`/`_container_logs`/`days` int 防护、
+  `_hk_sync` 入参校验、`hot` 布尔显式解析、`_sync` 锁所有权移交防"假启动"、
+  BrokenPipe 短路、500 不回显内部异常
+- MCP：排序 key 容错（单条脏 date 不再中断整批 5000 只快照）、引擎通道仅补缺
+  （迁移期遗留数据不覆盖权威 store）、响应 NaN/Inf → null 清洗（合法 JSON 输出）
+- app：镜像日期失败也缓存（不再 7×24 无意义外呼）、data_coverage 全历史扫描单飞
+  （多标签页不再各跑一份 5 分钟扫描）、code_stats 补 hk 键、MCP 模块导入失败留痕
+- storage：mydb_read 复合键解析（`split(":", 1)` 保留代码段）、records.append
+  捕获 TypeError（坏记录不再击穿任务）、migrate 全失败不再误标已迁移、
+  backup 文件名唯一化 + SQL 引号转义
+- 熔断器计数加锁 + 仅探针路径复位；entrypoint 进程身份校验（readlink /proc/pid/exe，
+  防 stale pid 复用误判存活）；ops.log 写失败静默（不再炸调度线程）
+
+Python 295 全绿（含 test_research 基线红转绿）；脚本方式启动实测（webui 200、
+非法入参 400/回退、后台线程零 traceback）。
+
+## [0.9.10] — 2026-08-17（打板读取链路工程化收口：键契约修正 + 预计算快速通道）
+
+验收复盘（0.8.16 异源验收）：核心计算正确，但 HTTP MCP「能算、数也对，读取链路未
+收口」——每次查询全市场重扫约 37s、带分布 20s 超时、写入键与读取键不对齐、15 个
+空代码导致 `formal_usable=false`。本版按 P0/P1/P2 修复：
+
+**P0 正确性与快速读取**
+
+- **键契约统一（核心 bug）**：写入端（`打板指标:<YYYYMMDD>` 表 + `metrics` 键）与
+  读取端（曾用 `打板指标` 表 + `<YYYYMMDD>` 键）不对齐，预计算指标读不到、异常被
+  静默吞掉。读端改为双通道双键形：① research_store（0.9.5 抽象，写端同源，
+  默认 SqliteResearchStore / mydb 回滚适配）② 引擎 mydb rd 直读（新契约
+  `打板指标:<date>`/`metrics` 优先，旧契约 `打板指标`/`<date>` 回退，0.8.x 数据兼容）；
+  快照读取同步精确键形（`竞价快照:<date>`/`code`）
+- **预计算快速通道**：`query_board_open_effect_history` 在 `_HEAVY_LOCK` 之外先读
+  预计算结果——区间内每个交易日都有 daily 行 → 直读返回（`load_path=mydb`、
+  `cache_hit=true`，正常查询 <1s、带分布 <3s，不扫 5200 只）；任一交易日缺失才回退
+  全市场重算（`cache_hit=false` + `fallback_reason` 注明），当日段仍用预计算覆盖
+- **回归测试**：真实键形 mock（`打板指标:20260817`/`metrics`、`竞价快照:20260817`/
+  `<code>`），键契约/快速通道/双键形回退/慢路径覆盖全绿
+
+**P1 响应内容**
+
+- **完整日级结果持久化**：09:26 竞价版与 16:30 K线版写 `payload.daily` 子载荷——
+  样本数、正/平/负数量、均值、成功率、分位数、完整分布（open_return_pct +
+  sample_codes）、候选数/采集数/缺价数（coverage）、known_at、value_source
+  （`core.auction_metrics.build_daily_row`，与日K 行同构）
+- **`include_distribution` 语义兑现**：false → 摘要（快速通道直读，<1s）；
+  true → 直接读已持久化的样本分布（不再全市场扫描，<3s）
+
+**P2 质量审计**
+
+- **空代码分类**：15 个空代码不再一刀切——按 `query_point_snapshot` 时点判定分类为
+  停牌（EMPTY_SUSPENDED）/ 退市未上市（EMPTY_DELISTED_OR_NOT_LISTED）/ 未发布 /
+  无法分类（EMPTY_CODE_UNCLASSIFIED）；前两类不否决正式可用性，只有真实失败与
+  未分类才否决
+- **双覆盖率拆分**：`candidate_coverage`（候选识别完整性，决定 formal_usable）与
+  信封 `sample_coverage`（赚钱效应样本覆盖：候选数/采集数/缺价数）；`formal_usable`
+  不再被"区间无 bar 但分类为停牌/退市"的代码否决
+- **信封增强**：`load_path` / `cache_hit` / `precomputed_days` / `fallback_reason` /
+  `sample_coverage` / `empty_code_breakdown`；`source_contract_version` v4.1 → v4.2
+
+Python 239 全绿（MCP 120 + 采集/领域 119）。
+
 ## [0.9.9] — 2026-08-16（D11 落位：采集执行迁数据层 storage/providers/quote_sources.py）
 
 架构决策 D11 落地（采集执行归数据层、编排归服务层）：
