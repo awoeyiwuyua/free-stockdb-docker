@@ -102,10 +102,28 @@ except ImportError:  # 防御：与 pybao_tools=None 同语义，相关工具返
     query_mydb = None  # type: ignore[assignment]
     screen_stocks = None  # type: ignore[assignment]
 
+# 0.10.0 W5（D12）：仓库层门面（Parquet+DuckDB）。模块导入零成本（duckdb 惰性），
+# 运行时经 queries.availability 降级——duckdb 缺失（arm64 musl 镜像等）不伤既有工具。
+try:  # noqa: E402
+    from storage.warehouse import queries as warehouse_queries
+    from storage.warehouse.engine import (
+        GuardrailError as _warehouse_guardrail_error,
+        WarehouseUnavailable as _warehouse_unavailable,
+    )
+except Exception:  # noqa: BLE001 - 裁剪部署无 storage 包时优雅降级
+    warehouse_queries = None  # type: ignore[assignment]
+    _warehouse_guardrail_error = None  # type: ignore[assignment]
+    _warehouse_unavailable = None  # type: ignore[assignment]
+
+_WAREHOUSE_HINT = (
+    "仓库层（DuckDB+Parquet）不可用：本机需 uv sync 安装 duckdb；"
+    "arm64 alpine 镜像无 musllinux wheel 属预期（降级路径）"
+)
+
 PROTOCOL_VERSION = "2025-06-18"
 SERVER_NAME = "stockdb-native"
 # 0.8.16：与 WEBUI_VERSION 同步（此前硬编码 0.1.0，与仓库 tag 脱节）
-SERVER_VERSION = "0.8.16"
+SERVER_VERSION = "0.10.0"
 
 DEFAULT_HOST = "100.66.1.1"
 DEFAULT_PORT = 7899
@@ -207,10 +225,17 @@ def _timeout() -> float:
 
 
 def _http_get(cmd: str, table: str) -> object:
-    """Query free-stockdb HTTP API: /?cmd=<cmd>&t=<table>."""
-    url = f"{_base_url()}/?cmd={cmd}&t={urllib.parse.quote(table)}"
-    with urllib.request.urlopen(url, timeout=_timeout()) as resp:
-        raw = resp.read().decode("utf-8", errors="replace")
+    """Query free-stockdb HTTP API: /?cmd=<cmd>&t=<table>.
+
+    0.10.0 C1（双轨收敛）：传输统一走数据层闸口 storage.providers.free_stockdb.fetch
+    （信号量限并发 + 熔断治理全覆盖）；独立运行模式的默认 host（100.66.1.1）经
+    base 参数透传，行为与收敛前一致。urllib 仍保留给无 storage 包的裁剪场景。
+    """
+    from storage.providers import free_stockdb as _fs
+    path = f"/?cmd={cmd}&t={urllib.parse.quote(table)}"
+    # base 只传 host:port（闸口内部拼 http:// 前缀）；block=True：查询路径排队等槽
+    raw = _fs.fetch(path, timeout=_timeout(),
+                    base=_base_url().removeprefix("http://"), block=True)
     if not raw.strip():
         return None
     return json.loads(raw)
@@ -1594,6 +1619,46 @@ def query_point_snapshot(args: dict) -> dict:
     }
 
 
+# === 仓库层工具（0.10.0 W5，D12：warehouse 组 3 工具） ===
+
+def _warehouse_error_code(exc: Exception) -> str:
+    """仓库异常 → 契约错误码：护栏/参数类 INVALID_ARGUMENT；不可用 DEPENDENCY_UNAVAILABLE；
+    其余（含超时）INTERNAL_ERROR。"""
+    if _warehouse_unavailable is not None and isinstance(exc, _warehouse_unavailable):
+        return ERROR_DEPENDENCY_UNAVAILABLE
+    if _warehouse_guardrail_error is not None and isinstance(exc, _warehouse_guardrail_error):
+        return ERROR_INVALID_ARGUMENT
+    if isinstance(exc, TimeoutError):
+        return ERROR_INTERNAL_ERROR
+    try:
+        import duckdb as _duckdb
+        if isinstance(exc, (_duckdb.ParserException, _duckdb.ConversionException,
+                            _duckdb.BinderException, _duckdb.ConstraintException,
+                            _duckdb.InvalidInputException, _duckdb.SyntaxException,
+                            _duckdb.OutOfMemoryException)):
+            return ERROR_INVALID_ARGUMENT
+    except ImportError:
+        pass
+    return ERROR_INTERNAL_ERROR
+
+
+def _warehouse_tool_missing_error(tool_name: str) -> dict:
+    return _error_result(
+        f"{tool_name}: 仓库模块不可用（storage.warehouse 导入失败）",
+        ERROR_DEPENDENCY_UNAVAILABLE,
+        hint=_WAREHOUSE_HINT,
+    )
+
+
+def _warehouse_result_with_known_at(result: dict) -> dict:
+    """工具结果附加 known_at = 仓库 watermark（数据可信时点，D4 语义对齐）。"""
+    try:
+        ka = warehouse_queries.known_at()
+    except Exception:  # noqa: BLE001 - known_at 失败不阻塞查询结果
+        ka = None
+    return {**result, "known_at": ka}
+
+
 # === MCP 工具定义 ===
 
 
@@ -2001,6 +2066,45 @@ TOOLS: list[dict] = [
             "required": [],
         },
     },
+    {
+        "name": "warehouse_run_sql",
+        "description": (
+            "在本地列式仓库（DuckDB + Parquet，每日沉淀自引擎）上执行单条 SQL——读写均允许"
+            "（个人研究库：可 CREATE TABLE/INSERT 建自己的研究表，建议放 research schema）。"
+            "常用对象：v_daily（日K）、v_adjust（复权因子）、v_daily_fq（ASOF 复权拼接，"
+            "open_fq/high_fq/low_fq/close_fq 列）、v_codes（代码表）；指标宏 ta_ma(n)/"
+            "ta_rsi(n)/ta_macd(fast,slow,sig)（窗口按 code 分区、date 排序，窗口不满为 NULL，"
+            "RSI 为简单版非 Wilder）。示例：SELECT * FROM ta_ma(20) WHERE code='600000' "
+            "AND date>='2026-01-01'；横截面：SELECT code,close FROM v_daily WHERE "
+            "date=(SELECT max(date) FROM v_daily) ORDER BY close DESC LIMIT 20。"
+            "护栏：仅单条语句；结果超行数上限截断（truncated）；语句超时中断；"
+            "facts/ 不可变事实区只读（经视图访问）。known_at=仓库 watermark"
+            "（沉淀到的最新交易日，可能落后引擎当日）。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "sql": {"type": "string", "description": "单条 DuckDB SQL 语句（SELECT/DDL/DML 均可）"},
+            },
+            "required": ["sql"],
+        },
+    },
+    {
+        "name": "warehouse_list_tables",
+        "description": (
+            "列出仓库对象：表/视图（v_daily/v_adjust/v_daily_fq/v_codes/codes 及用户自建表）"
+            "与指标宏清单（名称+参数）。写 SQL 前先看本清单确认对象名与可用性。"
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "warehouse_status",
+        "description": (
+            "仓库状态：watermark（已沉淀最新交易日）、已沉淀天数、首/末日期、复权快照日、"
+            "代码数、duckdb 版本。用于判断仓库数据新鲜度（与引擎当日口径的差异）。"
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
+    },
 ]
 
 
@@ -2075,6 +2179,9 @@ BASE_TOOL_GROUPS: dict[str, str] = {
     "get_board_open_effect_history": "research", "get_mydb_data": "research",
     "get_indicators": "factor_analysis", "get_board_members": "factor_analysis",
     "screen_stocks": "factor_analysis", "get_data_status": "system_health",
+    # 0.10.0（D12）：仓库组——C2 收敛（仅 3 工具，指标一律 SQL 宏）
+    "warehouse_run_sql": "warehouse", "warehouse_list_tables": "warehouse",
+    "warehouse_status": "warehouse",
 }
 
 TOOL_GROUPS: dict[str, str] = {
@@ -2084,6 +2191,7 @@ TOOL_GROUPS: dict[str, str] = {
     "market_structure": "市场结构：板块/指数/期货",
     "research": "研究成果：mydb 私有存储/打板情绪指标",
     "system_health": "系统：数据状态/表查询",
+    "warehouse": "列式仓库：DuckDB SQL（读写）/指标宏/仓库状态（0.10.0 D12）",
 }
 
 for _tool_spec in TOOLS:
@@ -2169,6 +2277,10 @@ _CONTRACT_BY_TOOL: dict[str, tuple[str | None, str]] = {
     "get_trading_days": ("static", "calendar-v1"),
     "get_data_status": ("http", "status-v1"),
     "get_point_snapshot": ("http", "snapshot-v1"),
+    # 0.10.0（D12）：仓库组契约——known_at = watermark（派生规则见 _derive_known_at）
+    "warehouse_run_sql": ("warehouse", "warehouse-sql-v1"),
+    "warehouse_list_tables": ("warehouse", "warehouse-meta-v1"),
+    "warehouse_status": ("warehouse", "warehouse-status-v1"),
 }
 
 # 0.9.0 M4：SDK 41 工具族统一契约（source="sdk"，上游通道）
@@ -2231,6 +2343,9 @@ def _derive_known_at(tool_name: str, result: dict) -> str | None:
         return _known_at_str(result.get("latest_trade_date"))
     if tool_name == "get_board_open_effect_history":
         # 0.7.0 双源合并：当日段成功 → 快照采集证据标注；否则保持现语义（None）
+        return _known_at_str(result.get("known_at"))
+    if tool_name.startswith("warehouse_"):
+        # 0.10.0（D12）：仓库工具 known_at = watermark（沉淀到的最新交易日）
         return _known_at_str(result.get("known_at"))
     return None
 
@@ -2403,6 +2518,28 @@ def _call_tool(name: str, args: dict) -> dict:
             return _value_error_result(exc)
         except RuntimeError as exc:
             return _error_result(str(exc), ERROR_INTERNAL_ERROR)
+    elif name in ("warehouse_run_sql", "warehouse_list_tables", "warehouse_status"):
+        # 0.10.0（D12）：仓库组 3 工具——门面经 storage.warehouse.queries，
+        # 错误映射见 _warehouse_error_code；不可用 → DEPENDENCY_UNAVAILABLE（带 hint）
+        if warehouse_queries is None:
+            return _warehouse_tool_missing_error(name)
+        try:
+            if name == "warehouse_run_sql":
+                sql = str(args.get("sql") or "").strip()
+                if not sql:
+                    return _error_result("warehouse_run_sql: sql 不能为空",
+                                         ERROR_INVALID_ARGUMENT)
+                result = _warehouse_result_with_known_at(
+                    warehouse_queries.run_sql(sql))
+            elif name == "warehouse_list_tables":
+                result = _warehouse_result_with_known_at(
+                    warehouse_queries.list_objects())
+            else:
+                result = warehouse_queries.status()
+        except Exception as exc:  # noqa: BLE001 - 统一映射为契约错误码
+            hint = _WAREHOUSE_HINT if _warehouse_error_code(exc) == ERROR_DEPENDENCY_UNAVAILABLE else None
+            return _error_result(f"{name}: {exc}", _warehouse_error_code(exc),
+                                 hint=hint)
     else:
         # 未知工具同样按 INVALID_ARGUMENT（契约：未知工具 = 参数非法）
         return _error_result(f"未知工具: {name}", ERROR_INVALID_ARGUMENT)

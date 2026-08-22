@@ -147,7 +147,7 @@ npm run build      # 编译出 dist/
 - [x] 前端 Vitest 全绿（7 文件 / 56 例；M3 起逐页补组件/逻辑测试）
 - [x] `npx vite build` 通过（含手动分包：index 主包 16KB，vendor 三件独立缓存）
 - [x] Python 229 全绿（补位页契约以 test_ops.py 断言为准）
-- [x] 功能清单回归表 `docs/webui-spa/m2-regression-checklist.md` 通用要求 + 十页生成完成（逐项人工勾选随 NAS 实测）
+- [x] 功能清单回归表 `docs/history/m2-regression-checklist.md` 通用要求 + 十页生成完成（逐项人工勾选随 NAS 实测）
 - [x] 路由接线：`router/index.js` 10 个 path 懒加载指向对应视图，10 深链冒烟 200
 - [x] 端到端冒烟：本地 app.py 静态服务（+ vite dev 通道此前已验证）
 - [ ] NAS `pull && up -d` 后实测 + 新旧面板逐页并排核对（用户侧，Phase 5 收口时执行）

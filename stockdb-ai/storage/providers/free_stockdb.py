@@ -26,25 +26,31 @@ def _breaker_open() -> bool:
     return time.time() < _breaker["open_until"]
 
 
-def fetch(path: str, timeout: float = 10.0, breaker: bool = False) -> str:
+def fetch(path: str, timeout: float = 10.0, breaker: bool = False,
+          base: str | None = None, block: bool = False) -> str:
     """打 stockdb HTTP 的统一闸口。
 
-    - 信号量（全路径）：并发最多 STOCKDB_MAX_CONCURRENCY（默认 8），超出立即抛
-      RuntimeError 由调用方降级（不阻塞等待——等待会再次堆积线程）。
+    - 信号量（全路径）：并发最多 STOCKDB_MAX_CONCURRENCY（默认 8）。默认非阻塞：
+      满则立即抛 RuntimeError 由调用方降级（不等待——等待会堆积线程）；
+      block=True（MCP 查询路径，0.10.0 C1）：满则排队等待槽位——查询正确性
+      优先于快败，与收敛前直连行为一致。
     - 熔断器（breaker=True 的探针路径）：连续 threshold 次失败后 open_until 内
       快速失败，调用方降级取缓存，避免 stockdb 挂/忙时每路都等满超时。
+    - base（0.10.0 C1）：完整 host:port 覆盖（默认 None = config 单一配置源）。
+      唯一使用方是 MCP 接口层——其独立运行模式默认 host 与 config 不同
+      （100.66.1.1 vs 127.0.0.1），双轨收敛时经此参数保持既有行为不漂移。
     """
     if breaker and _breaker_open():
         raise RuntimeError(
             f"stockdb 熔断中（连续 {_breaker['fails']} 次失败，"
             f"降级至 {datetime.fromtimestamp(_breaker['open_until']).strftime('%H:%M:%S')}）")
-    if not _gate.acquire(blocking=False):
+    if not _gate.acquire(blocking=block):
         raise RuntimeError("stockdb 并发已满（信号量限流），本次降级")
     try:
         import urllib.request
+        host_port = base if base else f"{config.STOCKDB_HOST}:{config.STOCKDB_PORT}"
         with urllib.request.urlopen(
-                f"http://{config.STOCKDB_HOST}:{config.STOCKDB_PORT}{path}",
-                timeout=timeout) as resp:
+                f"http://{host_port}{path}", timeout=timeout) as resp:
             data = resp.read().decode("utf-8", "replace")
         _breaker["fails"] = 0  # 成功即复位
         return data

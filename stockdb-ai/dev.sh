@@ -17,7 +17,8 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 : "${STOCKDB_HOST:=100.66.1.1}"
 : "${STOCKDB_PORT:=7899}"
 : "${WEBUI_PORT:=8080}"
-: "${DATA_DIR:=$DIR/.dev-data}"
+# 0.10.0 治理批：数据落仓库根可见的 data/（gitignore；旧隐藏目录 .dev-data 已废）
+: "${DATA_DIR:=$(cd "$DIR/.." && pwd)/data}"
 
 mkdir -p "$DATA_DIR"
 export STOCKDB_HOST STOCKDB_PORT WEBUI_PORT DATA_DIR

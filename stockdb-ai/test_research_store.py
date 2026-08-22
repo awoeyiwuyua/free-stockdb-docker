@@ -51,6 +51,23 @@ class SqliteStoreTest(unittest.TestCase):
         self.addCleanup(self.store.close)
         research_factory.reset()
 
+    def test_default_path_uses_research_subdir(self):
+        """0.10.0 治理批：默认路径收纳进 DATA_DIR/research/（旧布局不存在时）。"""
+        from storage.research_store import resolve_backup_dir, resolve_db_path
+        self.assertEqual(resolve_db_path(), Path(self.tmp) / "research" / "research.db")
+        self.assertEqual(resolve_backup_dir(), Path(self.tmp) / "research" / "backups")
+        store = SqliteResearchStore()  # 默认路径
+        self.addCleanup(store.close)
+        store.write_metrics("20260822", {"x": 1})
+        self.assertTrue((Path(self.tmp) / "research" / "research.db").exists())
+
+    def test_legacy_root_path_sticky(self):
+        """旧布局 DATA_DIR/research.db 存在 → 粘性沿用（NAS 升级无缝，不自动搬移）。"""
+        from storage.research_store import resolve_backup_dir, resolve_db_path
+        (Path(self.tmp) / "research.db").touch()
+        self.assertEqual(resolve_db_path(), Path(self.tmp) / "research.db")
+        self.assertEqual(resolve_backup_dir(), Path(self.tmp) / "backups")
+
     def test_crud_roundtrip(self):
         payload = {"metrics": {"n_samples": 47}, "rank_60d": None}
         self.store.write_metrics("20260814", payload)

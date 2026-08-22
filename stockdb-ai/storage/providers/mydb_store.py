@@ -4,6 +4,10 @@
 （stockdb.abi3.so + stock_sdk.py，随发行包分发，PYTHONPATH 注入）。
 本机开发若未装 pybao，相关接口优雅降级（A 股功能不受影响）。
 行为与 app.py 搬迁前完全一致（0.8.10 起：锁 + 自愈重连 + 值归一化）。
+
+职责（0.9.5 研究成果迁自持 SQLite 后收窄）：hk日k 港股日K、用户自定义表
+（/api/data/write 开放命名空间）、RESEARCH_STORE=mydb 回滚写回——
+打板指标/序列/清单/竞价快照主线已迁 storage/research_store.py。
 """
 from __future__ import annotations
 
@@ -22,7 +26,7 @@ def _mydb_import():
     """惰性导入 pybao 客户端。未安装/加载失败时抛 ImportError（调用方降级）。
 
     候选路径：容器内 /opt/stockdb/pybao，本地开发 /tmp/pybao_mac 等；
-    本机开发经 PYTHONPATH 注入原生 pybao 目录（见 docs/DEVELOPMENT-GUIDE.md）。
+    本机开发经 PYTHONPATH 注入原生 pybao 目录（见 docs/development-guide.md）。
     """
     candidates = ["/opt/stockdb/pybao", "/tmp/pybao_mac"]
     for p in candidates:

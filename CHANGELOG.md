@@ -1,8 +1,54 @@
 # CHANGELOG
 
 本项目面板版本号 = `WEBUI_VERSION`（`stockdb-ai/config.py`，0.9.1 起收敛至 config），
-镜像 tag 跟随上游引擎版本。发布纪律见 `docs/webui-spa/release-policy.md`；
-部署记录见 `docs/DEPLOYMENTS.md`；本机目录关系与运行配方见 `docs/DEVELOPMENT-GUIDE.md`。
+镜像 tag 跟随上游引擎版本。发布纪律见 `docs/release-policy.md`；
+部署记录见 `docs/deployments.md`；本机目录关系与运行配方见 `docs/development-guide.md`。
+
+## [0.10.0] — 2026-08-22（D12：列式仓库层——Parquet 事实沉淀 + DuckDB 读写仓库）
+
+用户拍板的三层存储架构落地（设计 `docs/design/warehouse.md`；**显式推翻 0.9.4
+「Parquet/DuckDB 不做」**，决策存档 architecture.md D12）：
+
+- **存储持久层（W2）**：`storage/warehouse/{layout,sink,catalog}.py`——
+  facts/daily 按年/市场/日分区（只增不改：临时文件+原子 rename、已存在即跳过）；
+  adjust 版本化快照（snapshot 真实列，DuckDB 不解析文件名段 hive 分区——实测结论）；
+  watermark 只前进，元数据唯一存 warehouse.duckdb meta（C4）
+- **查询与计算层（W3）**：`engine.py/queries.py`——v_daily/v_adjust/v_daily_fq
+  （ASOF 复权拼接）/v_codes + 指标宏 ta_ma/ta_rsi/ta_macd（窗口按 code 分区、
+  窗口不满为 NULL）；`run_sql` 读写全开（用户拍板最大权限）+ 三护栏
+  （单语句/facts 只读/行数上限+超时）
+- **每日沉淀编排（W4）**：`services/warehouse_tasks.py` 第四条调度线程（16:40，
+  就绪门 data_latest>=今日，未就绪 10 分钟重试至 20:00）；TRADED 快照 → sink →
+  对账三板斧（行数/同源字段回读/异源开盘昨收）→ records+告警；services 经注入访问
+  （C3，层边界测试增补）；HTTP 运维口 `GET /api/warehouse/status` +
+  `POST /api/warehouse/run {"days":1-5}`（小范围测试通道，历史回填延后）
+- **MCP 工具面（W5）**：warehouse 组 3 工具（run_sql/list_tables/status，
+  工具数 53→56、组 6→7；C2 收敛：指标一律 SQL 宏不加单指标工具）；known_at=watermark；
+  降级 DEPENDENCY_UNAVAILABLE（duckdb 缺失/WAREHOUSE_ENABLED=0 不伤既有工具）
+- **依赖（uv 首次真正启用）**：duckdb 1.5.5 = 首个第三方依赖（不用 pyarrow）；
+  CI 换 setup-uv + `uv sync --frozen`；Dockerfile amd64 pip install（与 uv.lock
+  手动对齐），arm64 alpine 无 musllinux wheel → 不装走降级
+- **C1 双轨收敛**：MCP `_http_get` 收敛为数据层闸口薄委托（free_stockdb.fetch 增
+  base/block 参数——独立运行模式默认 host 透传、查询路径排队语义，行为保持）
+- 回滚演练开关：`WAREHOUSE_ENABLED=0`（调度线程不启动，全链路无感知）
+- **仓库治理批（代码/数据分区 + 文档重组）**：
+  - `data/` 可见化——dev 数据目录由隐藏 `stockdb-ai/.dev-data` 上提仓库根（gitignore；
+    dev.sh/gitignore/docker README 同步），仓库根四区自解释（代码 stockdb-ai/、数据 data/、
+    文档 docs/、部署 docker/）；`storage/` = 数据层**代码**、`data/` = 数据落盘的关系
+    写入 storage/__init__ 与 development-guide（消除语义误会）
+  - DATA_DIR 按存储类型收纳——research.db 迁 `DATA_DIR/research/`（备份随行；旧根路径
+    **粘性兼容**，NAS 升级无缝不自动搬移，避 WAL 伴生文件风险）；布局约定入 warehouse.md §2
+  - docs 重组——历史过程文档（SPA 计划/导读笔记×4/回归清单/0.6.1 验收/涨停 CSV×4）
+    归档 `docs/history/`；architecture/release-policy/runtime-model 上提 docs 根
+    （runtime-model 顺带修 0.9.2 已搬迁的落点引用）；命名统一小写连字符
+    （development-guide/data-source/deployments；ROADMAP 原名不动）；新增 `docs/README.md`
+    一页索引；全量交叉引用同步（docs + 代码注释）
+  - storage/ 代码层不动文件位置；__init__ 三处滞后修缮（补 warehouse/、删 0.9.1 状态行、
+    悬空的「统一接口随 M5」承诺改为如实描述）；mydb_store 职责注释更新（0.9.5 后收窄）
+- 发版门：310 测试全绿（W1→W5 每批验收通过 + 治理批路径测试）；**待实数据执行**：连续 ≥3 交易日
+  沉淀对账签字（首日实测已过，见 docs/acceptance/warehouse-live-20260822.md）+ 指标宏 vs
+  pybao 异源对账 + 性能下限回归（首日实测：横截面 1ms/单标的 2ms/自连接 3ms，大幅达标）
+- 文档：warehouse.md 新增；ROADMAP/README/architecture/development-guide 同步
 
 ## [0.9.9] — 2026-08-16（D11 落位：采集执行迁数据层 storage/providers/quote_sources.py）
 
@@ -206,12 +252,12 @@ stockdb_full_mcp.py + 冒烟回归（设计文档 §8）
 
 ## [0.8.18] — 2026-08-16（仓库治理：只留研究成果 + 原生模式为主线 + docker 降级可选）
 - 方向（用户拍板）：① 明确两个目录关系；② 精简仓库只保留研究成果；③ docker 镜像非主线
-- 新增 `docs/DEVELOPMENT-GUIDE.md`：本机两个目录（原生引擎运行时 vs 研究成果仓库）职责
+- 新增 `docs/development-guide.md`：本机两个目录（原生引擎运行时 vs 研究成果仓库）职责
   边界、数据流、运行配方（STOCKDB_HOST/PYBAO_DIR/NO_PROXY）、已知坑排查手册
 - 删除上游继承内容（git 历史可找回）：`cpp/`（引擎 C++ 源码）、`pybao/`（扩展拷贝，
   docker 构建从官方 release 下载不依赖）、`调用方式/`、`数据网页版.html`/`更新运行图.png`/
   `数据库运行图.png`/`网页版示范.png`/`先看！这个！！使用说明.txt`、顶层 `stockdb.conf`/
-  `sync_url.txt`；保留 LICENSE（上游 MIT，合规必需）与 `docs/DATA_SOURCE.md`（同步源机制说明）
+  `sync_url.txt`；保留 LICENSE（上游 MIT，合规必需）与 `docs/data-source.md`（同步源机制说明）
 - README 重写为研究成果仓库定位（native-first）；docker/README 的 `调用方式` 引用改上游链接
 - 发布纪律修订（release-policy.md）：主线 = 本机原生模式验证 + tag；镜像 = 可选发布物
   （仅成熟版本手动 build-image.yml）

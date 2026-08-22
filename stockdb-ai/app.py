@@ -117,6 +117,14 @@ from services.auction_tasks import (  # noqa: E402
     auction_scheduler_loop,
 )
 
+# 0.10.0 W4：仓库沉淀编排（注入点绑定见 _wire_warehouse_tasks；handlers 经 app 取用）
+import services.warehouse_tasks as _warehouse_tasks  # noqa: E402
+from services.warehouse_tasks import (  # noqa: E402
+    warehouse_run_async,
+    warehouse_scheduler_loop,
+    warehouse_status,
+)
+
 # ---- 0.9.2 批次 6：HTTP 路由表外置（interfaces/web/routes.py，0.9.8 收拢接口层） ----
 from interfaces.web.routes import (  # noqa: E402
     GET_ROUTES as _WEB_GET_ROUTES,
@@ -1037,7 +1045,7 @@ def run_sync(hot: bool = True, trigger: str = "manual", retry: bool = False) -> 
 
     hot=True（默认，热更新）：不停服务直接增量同步——同步器下载到 .part 临时文件、
     SHA256 校验后原子 rename 替换（Unix rename 对读进程无影响），服务端持续可查。
-    官方 DATA_SOURCE.md 保守要求"同步期间停止服务"，但实测与机制均支持热更新；
+    官方 data-source.md 保守要求"同步期间停止服务"，但实测与机制均支持热更新；
     上游多点数据源架构下增量下载进 data1/LevelDB，运行中的服务进程持旧快照，
     故检测到新数据文件（下载数>0）时同步完成后自动重启 stockdb 加载新快照，
     再自动做完整性验证，失败则再次重启止损。
@@ -1778,13 +1786,47 @@ def _wire_auction_tasks() -> None:
     _auction_tasks.research_store = _get_research_store()
 
 
+def _wire_warehouse_tasks() -> None:
+    """组合根装配（0.10.0 W4）：仓库层能力绑定到服务层注入点（C3：services 不直连
+    storage.warehouse，全部经注入）。duckdb 缺失/开关关闭时注入仍完成——availability
+    注入点负责运行时降级（镜像无 musllinux wheel 场景不拖垮 webui 启动）。
+    """
+    try:
+        from interfaces.mcp.stockdb_mcp_server import query_point_snapshot as _wh_snapshot
+    except Exception:  # noqa: BLE001 - MCP 缺失时沉淀任务整体降级
+        _wh_snapshot = None
+    _warehouse_tasks.query_snapshot = _wh_snapshot
+    _warehouse_tasks.data_latest = data_latest_date
+    _warehouse_tasks.is_trading_day = is_trading_day
+    try:
+        from storage import warehouse as _wh_pkg
+        from storage.warehouse import layout as _wh_layout
+        from storage.warehouse import reconcile as _wh_reconcile
+        from storage.warehouse import sink as _wh_sink
+        _warehouse_tasks.sink = _wh_sink
+        _warehouse_tasks.reconcile_daily = _wh_reconcile.reconcile_daily
+        _warehouse_tasks.warehouse_root = _wh_layout.root_dir
+        _warehouse_tasks.availability = _wh_pkg.availability
+
+        def _wh_refresh_views():
+            from storage.warehouse.engine import get_engine as _wh_get_engine
+            _wh_get_engine().refresh_views()
+
+        _warehouse_tasks.refresh_views = _wh_refresh_views
+    except Exception:  # noqa: BLE001 - duckdb 缺失（ImportError）等：注入点留 None 降级
+        pass
+
+
 def main():
     _wire_auction_tasks()  # 组合根：服务层依赖注入（0.9.2 批次 4）
+    _wire_warehouse_tasks()  # 组合根：仓库层注入（0.10.0 W4）
     print(f"webui listening on 0.0.0.0:{LISTEN_PORT}", file=sys.stderr)
     print(f"stockdb: {STOCKDB_HOST}:{STOCKDB_PORT}（同容器进程）| data: {DATA_DIR}", file=sys.stderr)
     threading.Thread(target=scheduler_loop, daemon=True).start()
     threading.Thread(target=ops_watchdog_loop, daemon=True).start()     # 运营支撑看门狗（告警生产接线）
     threading.Thread(target=auction_scheduler_loop, daemon=True).start()  # 打板竞价调度（2s 轮询，独立线程）
+    if config.WAREHOUSE_ENABLED:  # 0.10.0：仓库沉淀调度（5s 轮询；回滚演练 = WAREHOUSE_ENABLED=0）
+        threading.Thread(target=warehouse_scheduler_loop, daemon=True).start()
     ThreadingHTTPServer(("0.0.0.0", LISTEN_PORT), Handler).serve_forever()
 
 

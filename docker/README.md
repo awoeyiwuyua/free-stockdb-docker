@@ -100,7 +100,7 @@ WEBUI_PORT=18080 ./stockdb-ai/dev.sh           # 换本地端口
 # 浏览器打开 http://127.0.0.1:8080
 ```
 
-- 本地数据（同步历史/日志）落在 `stockdb-ai/.dev-data/`（已 gitignore），不碰 NAS 数据卷
+- 本地数据（同步历史/日志/仓库沉淀）落在仓库根 `data/`（已 gitignore，0.10.0 治理批；旧 stockdb-ai/.dev-data 已废），不碰 NAS 数据卷
 - 同步依赖容器内 `/opt/stockdb/数据更新`；本地无该二进制时同步接口自动降级为"不可用"提示——这些改动需推到 NAS 重建镜像后验证
 - 改完 `app.py` 后重新构建单镜像（GH Actions / `docker build` 流程，见上文），极空间上 `docker compose up -d stockdb` 拉新镜像重启
 
@@ -203,7 +203,7 @@ webui 容器已内嵌 `/mcp` 路由（无需单独 mcp 容器），走 8081：
 
 ## 二、日常数据更新（增量同步）
 
-官方要求**同步期间停止服务**（`docs/DATA_SOURCE.md`）。0.5.0 起三种方式任选：
+官方要求**同步期间停止服务**（`docs/data-source.md`）。0.5.0 起三种方式任选：
 
 **方式 1（推荐，网页一键热更新）**：浏览器打开 `http://<NAS_IP>:8081` → 点「立即热更新」。
 同步期间 stockdb 保持运行（reload 热重载零中断），同步失败自动重启进程兜底。
